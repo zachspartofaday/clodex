@@ -1,5 +1,12 @@
 # Changelog
 
+## [2.1.10](https://github.com/bman654/clodex/compare/v2.1.9...v2.1.10) (2026-08-05)
+
+
+### Bug Fixes
+
+* **deps:** bump undici to 7.29.0 ([#76](https://github.com/bman654/clodex/issues/76)) ([54621d1](https://github.com/bman654/clodex/commit/54621d1406c86c6b3dd14f799b2e933258057e0a))
+
 ## [2.1.9](https://github.com/bman654/clodex/compare/v2.1.8...v2.1.9) (2026-08-02)
 
 
