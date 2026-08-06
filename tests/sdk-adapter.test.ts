@@ -1,4 +1,4 @@
-import { describe, it, expect, vi } from 'vitest';
+import { describe, it, expect, vi, afterEach } from 'vitest';
 import {
   annotateToolNames,
   anthropicEffortFromRequest,
@@ -12,6 +12,8 @@ import {
   extractClaudeSessionId,
   claudeSessionPromptCacheKey,
   sdkTranslationErrorSignature,
+  upstreamMaxRetries,
+  resetUpstreamMaxRetriesWarningForTests,
 } from '../src/sdk-adapter.js';
 
 describe('sdkTranslationErrorSignature', () => {
@@ -1109,5 +1111,40 @@ describe('translateRequest openai promptCacheKey', () => {
 
   it('omits the key for non-OpenAI providers', () => {
     expect(keyOf(req(), '@ai-sdk/xai')).toBeUndefined();
+  });
+});
+
+describe('upstreamMaxRetries knob', () => {
+  afterEach(() => {
+    delete process.env.CLODEX_UPSTREAM_MAX_RETRIES;
+    resetUpstreamMaxRetriesWarningForTests();
+  });
+
+  it('returns undefined when unset so the SDK default is preserved', () => {
+    delete process.env.CLODEX_UPSTREAM_MAX_RETRIES;
+    expect(upstreamMaxRetries()).toBeUndefined();
+  });
+
+  it('parses a valid integer', () => {
+    process.env.CLODEX_UPSTREAM_MAX_RETRIES = '8';
+    expect(upstreamMaxRetries()).toBe(8);
+  });
+
+  it('accepts zero (retries disabled)', () => {
+    process.env.CLODEX_UPSTREAM_MAX_RETRIES = '0';
+    expect(upstreamMaxRetries()).toBe(0);
+  });
+
+  it('logs once and ignores malformed or out-of-range values', () => {
+    const logged: string[] = [];
+    process.env.CLODEX_UPSTREAM_MAX_RETRIES = 'many';
+    expect(upstreamMaxRetries(message => logged.push(message))).toBeUndefined();
+    expect(upstreamMaxRetries(message => logged.push(message))).toBeUndefined();
+    expect(logged).toHaveLength(1);
+    expect(logged[0]).toContain('CLODEX_UPSTREAM_MAX_RETRIES=many');
+    process.env.CLODEX_UPSTREAM_MAX_RETRIES = '101';
+    expect(upstreamMaxRetries()).toBeUndefined();
+    process.env.CLODEX_UPSTREAM_MAX_RETRIES = '2.5';
+    expect(upstreamMaxRetries()).toBeUndefined();
   });
 });

@@ -563,6 +563,36 @@ export function translateRequest(
   };
 }
 
+
+/**
+ * Upstream retry budget for AI SDK calls. The SDK default (maxRetries=2) is
+ * far too small for concurrent-subagent workloads, where a burst of upstream
+ * 429s outlasts two bounded backoffs, surfaces as AI_RetryError, and then
+ * exhausts the downstream client's own retry budget too — a transient rate
+ * limit becomes a dead agent. `CLODEX_UPSTREAM_MAX_RETRIES` follows the
+ * `CLODEX_WS_MAX_*` knob conventions: integer 0-100, malformed values are
+ * logged once and ignored, and the absence of the variable preserves the SDK
+ * default exactly.
+ */
+let warnedUpstreamMaxRetries = false;
+export function upstreamMaxRetries(log?: (message: string) => void): number | undefined {
+  const raw = process.env.CLODEX_UPSTREAM_MAX_RETRIES;
+  if (raw === undefined || raw.trim() === '') return undefined;
+  const value = Number(raw.trim());
+  if (!Number.isInteger(value) || value < 0 || value > 100) {
+    if (!warnedUpstreamMaxRetries) {
+      warnedUpstreamMaxRetries = true;
+      try { log?.(`ignoring CLODEX_UPSTREAM_MAX_RETRIES=${raw} (expected an integer between 0 and 100)`); } catch { /* ignore */ }
+    }
+    return undefined;
+  }
+  return value;
+}
+
+export function resetUpstreamMaxRetriesWarningForTests(): void {
+  warnedUpstreamMaxRetries = false;
+}
+
 // ── usage: SDK → Anthropic ────────────────────────────────────────────────────
 interface SdkUsage {
   inputTokens?: number;
@@ -877,6 +907,7 @@ export async function streamAnthropicResponse(
   const result = streamText({
     model,
     ...params,
+    ...(upstreamMaxRetries() !== undefined ? { maxRetries: upstreamMaxRetries() } : {}),
     abortSignal,
     onError: () => {},
   } as Parameters<typeof streamText>[0]);
@@ -946,6 +977,7 @@ export async function generateAnthropicResponse(
     const r = streamText({
       model,
       ...params,
+      ...(upstreamMaxRetries() !== undefined ? { maxRetries: upstreamMaxRetries() } : {}),
       abortSignal,
       onError: () => {},
     } as Parameters<typeof streamText>[0]);
@@ -1005,6 +1037,7 @@ export async function generateAnthropicResponse(
       const r = await generateText({
         model,
         ...params,
+        ...(upstreamMaxRetries() !== undefined ? { maxRetries: upstreamMaxRetries() } : {}),
         abortSignal: generateAbort.signal,
       } as Parameters<typeof generateText>[0]);
       ({ text, toolCalls, finishReason, usage } = r);
