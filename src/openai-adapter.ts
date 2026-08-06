@@ -2,6 +2,7 @@ import { tool, jsonSchema, streamText, generateText } from 'ai';
 import type { LanguageModel, ModelMessage } from 'ai';
 import { parseToolArguments } from './proxy-shared.js';
 import type { SdkCallParams } from './sdk-adapter.js';
+import { upstreamMaxRetries } from './sdk-adapter.js';
 
 // ── OpenAI request shapes ───────────────────────────────────────────────────
 
@@ -201,7 +202,7 @@ export async function generateOpenAiResponse(
     // Some upstreams (e.g. ChatGPT's Codex OAuth backend) only ever answer as a
     // stream. Request a real stream from the SDK and collect it into one
     // response instead of issuing a non-streaming request upstream.
-    const { stream } = streamText({ model, ...(params as any), onError: () => {} });
+    const { stream } = streamText({ model, ...(params as any), ...(upstreamMaxRetries() !== undefined ? { maxRetries: upstreamMaxRetries() } : {}), onError: () => {} });
     result = await collectOpenAiStream(stream);
   } else {
     result = (await generateText({ model, ...(params as any) })) as any;
@@ -236,7 +237,7 @@ export async function streamOpenAiResponse(
   responseModelId: string,
   onChunk: (chunk: string) => void,
 ): Promise<void> {
-  const { stream } = streamText({ model, ...(params as any) });
+  const { stream } = streamText({ model, ...(params as any), ...(upstreamMaxRetries() !== undefined ? { maxRetries: upstreamMaxRetries() } : {}) });
   const baseData = {
     id: `chatcmpl-${Date.now()}`,
     object: 'chat.completion.chunk',
