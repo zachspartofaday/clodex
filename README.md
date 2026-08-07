@@ -2,7 +2,7 @@
 
 [![npm version](https://img.shields.io/npm/v/%40bman654%2Fclodex.svg)](https://www.npmjs.com/package/@bman654/clodex)
 
-**clodex** lets you use your ChatGPT/Codex plan, OpenAI API models, or OpenCode Go models with Claude Code as first-class model choices.
+**clodex** lets you use your ChatGPT/Codex plan, OpenAI API models, OpenCode Go models, or Meta AI models with Claude Code as first-class model choices.
 You can use them anywhere you use Anthropic models like Opus and Sonnet — as the main session model, and in subagents, workflows, and agent teams. Clodex integrates them directly into Claude Code, using Claude Code's system prompt.
 It works with your existing Claude Code plan as well as your Codex plans WITHOUT violating Anthropic's ToS.
 No messing with CMUX or child codex processes or any of that stuff.
@@ -75,7 +75,7 @@ Both `clodex claude` and `clodex server` support two bridge modes. A mode flag a
 flowchart LR
     CC["Claude Code<br/>(own Anthropic login)"] -->|"HTTPS via HTTPS_PROXY,<br/>trusts the clodex CA"| MITM["clodex MITM proxy"]
     MITM --> DEC{"model is clodex:...<br/>or a saved alias?"}
-    DEC -->|"yes — routed request,<br/>clodex-managed provider credentials"| UP["Configured provider<br/>(OpenAI / OpenCode Go)"]
+    DEC -->|"yes — routed request,<br/>clodex-managed provider credentials"| UP["Configured provider<br/>(OpenAI / OpenCode Go / Meta AI)"]
     DEC -->|"no — passed through untouched,<br/>Claude Code's Anthropic credentials ride along"| ANT["api.anthropic.com"]
 ```
 
@@ -105,7 +105,7 @@ Launch Claude Code bridged to configured model providers. Unrecognized flags (an
 | `--save-mode` | With `--endpoint`/`--proxy`: save that mode as the `claude` default |
 | `--dry-run` | Run the wizard but print a launch preview instead of launching (never persists anything) |
 | `--trace` | Write debug logs to `~/.clodex/logs/` and show errors on exit |
-| `--provider <id>` | Boot provider id (`openai`, `openai-oauth`, or `opencode-go`); with `--model`, skips the wizard |
+| `--provider <id>` | Boot provider id (`openai`, `openai-oauth`, `opencode-go`, or `meta-ai`); with `--model`, skips the wizard |
 | `--model <id>` | Boot model id; with `--provider`, skips the wizard |
 | `--help`, `--version` | Help / version |
 
@@ -221,13 +221,13 @@ Manage favorite models (max 20) and short aliases. Favorites feed the endpoint-m
 | Subcommand | Effect |
 | --- | --- |
 | *(none)* | Provider hub wizard |
-| `add` | Add OpenAI or OpenCode Go with an API key, or sign in with ChatGPT |
+| `add` | Add OpenAI, OpenCode Go, or Meta AI with an API key, or sign in with ChatGPT |
 | `auth openai` | Sign in with ChatGPT/Codex-plan OAuth (device code) |
 | `list` | Show configured providers |
 | `remove <id>` | Remove a provider by id |
 | `refresh-models [id]` | Update cached model lists |
 
-Providers supported: `openai` (API key, platform.openai.com), `openai-oauth` (ChatGPT/Codex plan), and `opencode-go` (OpenCode Go API key). OpenCode Go exposes its Anthropic Messages and Chat Completions models; Responses-only entries are intentionally excluded. See [OpenCode Go provider](docs/opencode-go.md).
+Providers supported: `openai` (API key, platform.openai.com), `openai-oauth` (ChatGPT/Codex plan), `opencode-go` (OpenCode Go API key), and `meta-ai` (Meta AI Model API key, muse-spark models at 1M context). OpenCode Go exposes its Anthropic Messages and Chat Completions models; Responses-only entries are intentionally excluded. See [OpenCode Go provider](docs/opencode-go.md).
 
 ### Root
 
