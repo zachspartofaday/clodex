@@ -1732,6 +1732,10 @@ export async function main(args: string[] = process.argv.slice(2)): Promise<numb
   }
 
   if (parsed.command === 'profiles') {
+    if (parsed.showVersion) {
+      console.log(VERSION);
+      return 0;
+    }
     return runProfilesCommand(parsed.claudeArgs ?? []);
   }
 

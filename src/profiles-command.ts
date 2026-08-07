@@ -4,8 +4,8 @@
 // applying one replaces both in a single step. The alias NAMES are what agent
 // definitions and the Claude Code patch tables key on, so re-pointing the
 // models behind them (e.g. when a plan's usage runs out) never touches agent
-// config — the next `clodex claude` launch re-patches automatically because
-// the model-config hash changes.
+// config — the next `clodex claude` launch detects the changed model config
+// and offers to re-patch (or run `clodex patch` directly).
 
 import pc from 'picocolors';
 import * as p from '@clack/prompts';
@@ -73,8 +73,9 @@ ${pc.bold('Usage:')}
 
 ${pc.bold('Why:')} agent definitions pin alias names (sol, luna, ...). A profile
 re-points the models behind those names in one step — e.g. when a plan's
-usage runs out — and the next ${pc.bold('clodex claude')} launch re-patches
-automatically. Running sessions keep their old routing until relaunched.`;
+usage runs out. The next ${pc.bold('clodex claude')} launch detects the change
+and offers to re-patch — accept it, or run ${pc.bold('clodex patch')} directly.
+Running sessions keep their old routing until relaunched.`;
 }
 
 export async function runProfilesCommand(args: string[]): Promise<number> {
@@ -147,7 +148,7 @@ export async function runProfilesCommand(args: string[]): Promise<number> {
         activeModelProfile: name,
       });
       p.log.success(`Applied profile "${name}": ${aliasSummary(profile)}`);
-      p.log.info('New clodex claude launches use this routing (the patcher re-runs if the model config changed). Running sessions keep their old routing until relaunched.');
+      p.log.info('New clodex claude launches use this routing. The launcher will offer to re-patch for the changed model config — accept it, or run `clodex patch` now. Running sessions keep their old routing until relaunched.');
       return 0;
     }
 

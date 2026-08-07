@@ -63,6 +63,28 @@ describe('computeWrapperEnv', () => {
     expect(env['ANTHROPIC_DEFAULT_OPUS_MODEL']).toBeUndefined();
   });
 
+  it('clears inherited injections on the no-server and endpoint paths', () => {
+    const poisoned = {
+      ...baseEnv,
+      ANTHROPIC_DEFAULT_FABLE_MODEL: 'wjudge',
+      CLODEX_INJECTED_BUILTINS: 'fable',
+    };
+    // No live server: the stale alias must not go straight to Anthropic.
+    const noServer = computeWrapperEnv(poisoned, null);
+    expect(noServer['ANTHROPIC_DEFAULT_FABLE_MODEL']).toBeUndefined();
+    expect(noServer['CLODEX_INJECTED_BUILTINS']).toBeUndefined();
+    // Endpoint server: the alias may not exist in that catalog either.
+    const endpointState: ServerRuntimeState = {
+      mode: 'endpoint', port: 17646, pid: process.pid, startedAt: '2026-07-20T00:00:00.000Z',
+    };
+    const endpoint = computeWrapperEnv(poisoned, endpointState);
+    expect(endpoint['ANTHROPIC_DEFAULT_FABLE_MODEL']).toBeUndefined();
+    expect(endpoint['CLODEX_INJECTED_BUILTINS']).toBeUndefined();
+    // A genuinely user-set var (no sentinel claim) survives untouched.
+    const userSet = computeWrapperEnv({ ...baseEnv, ANTHROPIC_DEFAULT_OPUS_MODEL: 'user-pin' }, null);
+    expect(userSet['ANTHROPIC_DEFAULT_OPUS_MODEL']).toBe('user-pin');
+  });
+
   it('no live server leaves saved remaps unapplied — claude launches untouched', () => {
     const env = computeWrapperEnv(baseEnv, null, { fable: 'wjudge' });
     expect(env['ANTHROPIC_DEFAULT_FABLE_MODEL']).toBeUndefined();
