@@ -28,6 +28,7 @@ function snapshotOf(prefs: UserPreferences): Omit<ModelProfile, 'savedAt'> {
   return {
     favoriteModels: structuredClone(prefs.favoriteModels ?? []),
     modelAliases: structuredClone(prefs.modelAliases ?? []),
+    builtinModelOverrides: structuredClone(prefs.builtinModelOverrides ?? {}),
   };
 }
 
@@ -42,7 +43,8 @@ function ownProfiles(prefs: UserPreferences): Record<string, ModelProfile> {
 function sameSnapshot(a: Omit<ModelProfile, 'savedAt'>, b: Omit<ModelProfile, 'savedAt'>): boolean {
   const canonical = (value: unknown): string => JSON.stringify(value ?? []);
   return canonical(a.favoriteModels) === canonical(b.favoriteModels)
-    && canonical(a.modelAliases) === canonical(b.modelAliases);
+    && canonical(a.modelAliases) === canonical(b.modelAliases)
+    && JSON.stringify(a.builtinModelOverrides ?? {}) === JSON.stringify(b.builtinModelOverrides ?? {});
 }
 
 function aliasSummary(profile: ModelProfile): string {
@@ -134,6 +136,7 @@ export async function runProfilesCommand(args: string[]): Promise<number> {
       savePreferences({
         favoriteModels: structuredClone(profile.favoriteModels),
         modelAliases: structuredClone(profile.modelAliases),
+        builtinModelOverrides: structuredClone(profile.builtinModelOverrides ?? {}),
         activeModelProfile: name,
       });
       p.log.success(`Applied profile "${name}": ${aliasSummary(profile)}`);
@@ -148,6 +151,9 @@ export async function runProfilesCommand(args: string[]): Promise<number> {
       }
       for (const favorite of profile.favoriteModels) {
         console.log(`  favorite ${String(favorite.providerId)}:${String(favorite.modelId)}`);
+      }
+      for (const [builtin, target] of Object.entries(profile.builtinModelOverrides ?? {})) {
+        console.log(`  built-in ${pc.bold(builtin)} → ${String(target)}`);
       }
       console.log('');
       return 0;

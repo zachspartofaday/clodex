@@ -726,6 +726,15 @@ async function runAliasConfigurator(
       };
     });
     options.push({ value: '__add__', label: pc.cyan('+ Add an alias'), hint: 'name a favorite for /model and agent frontmatter' });
+    const builtinOverrides = prefs.builtinModelOverrides ?? {};
+    for (const name of ['sonnet', 'opus', 'haiku', 'fable'] as const) {
+      const target = builtinOverrides[name];
+      options.push({
+        value: `builtin-${name}`,
+        label: `${pc.bold(name)} ${pc.dim('(built-in)')} → ${target ? pc.yellow(target) : pc.dim('native default')}`,
+        hint: 'remap Claude Code\'s built-in alias at launch',
+      });
+    }
     options.push({ value: '__back__', label: 'Done', hint: '' });
 
     const choice = await p.select<string>({
@@ -734,6 +743,40 @@ async function runAliasConfigurator(
       initialValue: '__back__',
     });
     if (p.isCancel(choice) || choice === '__back__') return;
+
+    if (choice.startsWith('builtin-')) {
+      const builtin = choice.slice('builtin-'.length) as 'sonnet' | 'opus' | 'haiku' | 'fable';
+      const current = prefs.builtinModelOverrides ?? {};
+      const routable: Array<{ value: string; label: string; hint: string }> = [
+        { value: '__native__', label: 'Native default', hint: 'remove the remap' },
+        ...aliases.map(alias => ({
+          value: `use:${alias.name}`,
+          label: `alias ${pc.bold(alias.name)}`,
+          hint: `clodex:${String(alias.providerId)}:${String(alias.modelId)}`,
+        })),
+        ...favorites.map(favorite => {
+          const entry = modelLookup.get(`${favorite.providerId}:${favorite.modelId}`);
+          return {
+            value: `use:clodex:${favorite.providerId}:${favorite.modelId}`,
+            label: entry ? `${fmtModel(entry.modelName)} ${pc.dim(`(${entry.providerName})`)}` : String(favorite.modelId),
+            hint: `clodex:${favorite.providerId}:${favorite.modelId}`,
+          };
+        }),
+      ];
+      const picked = await p.select<string>({
+        message: `Route built-in "${builtin}" to`,
+        options: routable,
+      });
+      if (p.isCancel(picked)) continue;
+      const next = { ...current };
+      if (picked === '__native__') delete next[builtin];
+      else next[builtin] = picked.slice('use:'.length);
+      savePreferences({ builtinModelOverrides: next });
+      p.log.success(picked === '__native__'
+        ? `Restored built-in ${builtin} to its native default.`
+        : `Built-in ${builtin} now launches as ${picked.slice('use:'.length)} (proxy mode; explicit env vars still win).`);
+      continue;
+    }
 
     if (choice === '__add__') {
       const rawName = await p.text({
@@ -1168,7 +1211,11 @@ async function runClaudeHttpProxyCommand(
     }
   }
 
-  const childEnv = buildHttpProxyChildEnv(handle.port, handle.caCertPath);
+  const childEnv = buildHttpProxyChildEnv(
+    handle.port,
+    handle.caCertPath,
+    loadPreferences().builtinModelOverrides,
+  );
   const debugLogPath = parsed.trace
     ? prepareClaudeTraceLog(getSessionLogPath('claude-debug'))
     : undefined;

@@ -80,6 +80,7 @@ export function loadPreferences(): UserPreferences {
     modelAliases: config.modelAliases,
     modelProfiles: config.modelProfiles,
     activeModelProfile: config.activeModelProfile,
+    builtinModelOverrides: config.builtinModelOverrides,
     claudeBridgeMode: config.claudeBridgeMode,
     serverBridgeMode: config.serverBridgeMode,
     appPathOverrides: config.appPathOverrides,
@@ -89,7 +90,7 @@ export function loadPreferences(): UserPreferences {
   };
 }
 
-export function savePreferences(prefs: Partial<Pick<UserPreferences, 'lastModel' | 'lastProvider' | 'recentModelsByProvider' | 'favoriteModels' | 'modelAliases' | 'modelProfiles' | 'activeModelProfile' | 'claudeBridgeMode' | 'serverBridgeMode' | 'appPathOverrides' | 'localPatchesEnabled' | 'recentLaunchFolders'>>): void {
+export function savePreferences(prefs: Partial<Pick<UserPreferences, 'lastModel' | 'lastProvider' | 'recentModelsByProvider' | 'favoriteModels' | 'modelAliases' | 'modelProfiles' | 'activeModelProfile' | 'builtinModelOverrides' | 'claudeBridgeMode' | 'serverBridgeMode' | 'appPathOverrides' | 'localPatchesEnabled' | 'recentLaunchFolders'>>): void {
   updateConfig(config => {
     if (prefs.lastModel !== undefined) config.lastModel = prefs.lastModel;
     if (prefs.lastProvider !== undefined) config.lastProvider = prefs.lastProvider;
@@ -97,6 +98,10 @@ export function savePreferences(prefs: Partial<Pick<UserPreferences, 'lastModel'
     if (prefs.favoriteModels !== undefined) config.favoriteModels = prefs.favoriteModels;
     if (prefs.modelAliases !== undefined) config.modelAliases = prefs.modelAliases;
     if (prefs.modelProfiles !== undefined) config.modelProfiles = prefs.modelProfiles;
+    if (prefs.builtinModelOverrides !== undefined) {
+      if (Object.keys(prefs.builtinModelOverrides).length === 0) delete config.builtinModelOverrides;
+      else config.builtinModelOverrides = prefs.builtinModelOverrides;
+    }
     if (prefs.activeModelProfile !== undefined) {
       if (prefs.activeModelProfile === '') delete config.activeModelProfile;
       else config.activeModelProfile = prefs.activeModelProfile;
