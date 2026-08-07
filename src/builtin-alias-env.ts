@@ -49,13 +49,18 @@ export function routableBuiltinOverrides(
   routableNames: Iterable<string>,
   warn?: (message: string) => void,
 ): Partial<Record<BuiltinAliasName, string>> {
-  const routable = new Set<string>();
-  for (const name of routableNames) routable.add(name.trim().toLowerCase());
+  // Map lowercased → canonical spelling: matching is case-insensitive, but
+  // the INJECTED value must be the exact routable name — the MITM route
+  // lookup is case-sensitive, so injecting the saved spelling ("WJudge")
+  // would pass this filter yet miss the route and go upstream unknown.
+  const routable = new Map<string, string>();
+  for (const name of routableNames) routable.set(name.trim().toLowerCase(), name.trim());
   const out: Partial<Record<BuiltinAliasName, string>> = {};
   for (const [alias, target] of Object.entries(overrides ?? {}) as Array<[BuiltinAliasName, string]>) {
     const trimmed = typeof target === 'string' ? target.trim() : '';
-    if (trimmed && routable.has(trimmed.toLowerCase())) {
-      out[alias] = target;
+    const canonical = trimmed ? routable.get(trimmed.toLowerCase()) : undefined;
+    if (canonical !== undefined) {
+      out[alias] = canonical;
     } else if (trimmed) {
       warn?.(`Built-in remap ${alias} → ${trimmed} is not routable by this proxy; ${alias} reverts to the native default for this launch.`);
     }
@@ -93,13 +98,14 @@ function inheritedInjections(baseEnv: NodeJS.ProcessEnv): Map<string, string | n
       map.set(trimmed, null);
     } else {
       // The sentinel is untrusted provenance: a corrupted percent escape must
-      // never throw a launch-killing URIError. A value that cannot be decoded
-      // degrades to the bare-alias match-any claim.
+      // never throw a launch-killing URIError, and it must not be GRANTED a
+      // match-any ownership claim either — that would delete a var the user
+      // set explicitly. An undecodable entry is simply ignored; the worst
+      // case is a stale injection surviving one launch, never a destroyed
+      // explicit value.
       try {
         map.set(trimmed.slice(0, eq), decodeURIComponent(trimmed.slice(eq + 1)));
-      } catch {
-        map.set(trimmed.slice(0, eq), null);
-      }
+      } catch { /* ignore the malformed entry */ }
     }
   }
   return map;
