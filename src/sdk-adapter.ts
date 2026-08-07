@@ -559,8 +559,8 @@ export function translateRequest(
  * 7th attempt (126s) is aborted mid-backoff — there the ceiling is 5, and a
  * budget above it trades a fast, actionable 429 for a 120s stall ending in a
  * generic idle-timeout error. Paths bounded only by the ten-minute total
- * timer (the generateText branch, and the OpenAI-compat adapter, which has
- * no clodex timer of its own) can still complete later attempts: with 2s
+ * timer (the generateText branch, and the OpenAI-compat adapter, whose call
+ * sites carry the same total deadline) can still complete later attempts: with 2s
  * doubling backoff the 9th attempt starts at 510s and the 10th at 1022s, so
  * their ceiling is 8. Values above the applicable ceiling clamp with a
  * one-time stderr warning; malformed values warn once and keep the SDK
@@ -649,7 +649,7 @@ export interface AnthropicStreamObserver {
 }
 
 const SDK_STREAM_IDLE_TIMEOUT_MS = 120_000;
-const SDK_TOTAL_TIMEOUT_MS = 10 * 60_000;
+export const SDK_TOTAL_TIMEOUT_MS = 10 * 60_000;
 
 function streamAbortError(signal?: AbortSignal): Error {
   if (signal?.reason instanceof Error) return signal.reason;
