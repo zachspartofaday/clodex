@@ -573,27 +573,22 @@ export function translateRequest(
  * `CLODEX_WS_MAX_*` knob conventions; absence of the variable preserves the
  * SDK default exactly.
  *
- * The ceiling is per-clock, not what an unbounded backoff would allow. On
- * the idle-timed streaming paths the binding clock is the 120s stream idle
- * timer, armed before streamText and reset only by arriving stream parts:
- * retry backoff yields no parts, so attempts land at 0/2/6/14/30/62s and a
- * 7th attempt (126s) is aborted mid-backoff — there the ceiling is 5, and a
- * budget above it trades a fast, actionable 429 for a 120s stall ending in a
- * generic idle-timeout error. Paths bounded only by the ten-minute total
- * timer (the generateText branch, and the OpenAI-compat adapter, whose call
- * sites carry the same total deadline) can still complete later attempts: with 2s
- * doubling backoff the 9th attempt starts at 510s and the 10th at 1022s, so
- * their ceiling is 8. Values above the applicable ceiling clamp with a
- * one-time stderr warning; malformed values warn once and keep the SDK
- * default.
+ * The configured budget is HONORED, not clamped. A retry-count ceiling can
+ * only be derived from an assumed backoff schedule, and the schedule is not
+ * fixed: a provider retry-after / retry-after-ms header drives the SDK's
+ * backoff directly, so a short header packs many attempts inside even the
+ * 120s stream idle window while the default 2s-doubling schedule exhausts it
+ * by the 7th attempt. Discarding operator-requested retries on a schedule
+ * guess silently converts an explicit configuration into a smaller one. The
+ * deadlines still bound worst-case wall clock — the idle timer on the
+ * streaming paths and the 10-minute total timer everywhere — so an
+ * over-generous budget costs a stall, never an unbounded hang. Values above
+ * 5 get a one-time advisory warning about that trade; malformed values warn
+ * once and keep the SDK default.
  */
-const UPSTREAM_MAX_RETRIES_IDLE_CEILING = 5;
-export const UPSTREAM_MAX_RETRIES_TOTAL_CEILING = 8;
+const UPSTREAM_MAX_RETRIES_ADVISORY = 5;
 let warnedUpstreamMaxRetries = false;
-export function upstreamMaxRetries(
-  log?: (message: string) => void,
-  ceiling: number = UPSTREAM_MAX_RETRIES_IDLE_CEILING,
-): number | undefined {
+export function upstreamMaxRetries(log?: (message: string) => void): number | undefined {
   const raw = process.env.CLODEX_UPSTREAM_MAX_RETRIES;
   if (raw === undefined || raw.trim() === '') return undefined;
   const value = Number(raw.trim());
@@ -607,11 +602,8 @@ export function upstreamMaxRetries(
     warnOnce(`ignoring CLODEX_UPSTREAM_MAX_RETRIES=${raw} (expected a non-negative integer)`);
     return undefined;
   }
-  if (value > ceiling) {
-    warnOnce(ceiling === UPSTREAM_MAX_RETRIES_IDLE_CEILING
-      ? `clamping CLODEX_UPSTREAM_MAX_RETRIES=${raw} to ${ceiling} on stream-idle-timed paths (the 120s idle timer aborts any later retry attempt; paths with only the 10-minute total timer allow up to ${UPSTREAM_MAX_RETRIES_TOTAL_CEILING})`
-      : `clamping CLODEX_UPSTREAM_MAX_RETRIES=${raw} to ${ceiling} (the 10-minute request timeout aborts any later retry attempt)`);
-    return ceiling;
+  if (value > UPSTREAM_MAX_RETRIES_ADVISORY) {
+    warnOnce(`CLODEX_UPSTREAM_MAX_RETRIES=${raw} is honored, but under default exponential backoff attempts past ~5 can be cut off by the 120s stream idle timer or the 10-minute request timeout and end as timeout errors instead of an actionable 429; short provider retry-after headers make more attempts fit.`);
   }
   return value;
 }
@@ -1064,10 +1056,7 @@ export async function generateAnthropicResponse(
       const r = await generateText({
         model,
         ...params,
-        // Only the 10-minute total timer binds here — the higher ceiling applies.
-        ...(upstreamMaxRetries(undefined, UPSTREAM_MAX_RETRIES_TOTAL_CEILING) !== undefined
-          ? { maxRetries: upstreamMaxRetries(undefined, UPSTREAM_MAX_RETRIES_TOTAL_CEILING) }
-          : {}),
+        ...(upstreamMaxRetries() !== undefined ? { maxRetries: upstreamMaxRetries() } : {}),
         abortSignal: generateAbort.signal,
       } as Parameters<typeof generateText>[0]);
       ({ text, toolCalls, finishReason, usage } = r);
