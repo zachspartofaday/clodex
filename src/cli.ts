@@ -951,6 +951,18 @@ export async function runModelsCommand(opts: FavoritesCommandOptions = {}): Prom
   if (favoriteProviders.length === 0) {
     p.log.warn('No providers found.');
     p.log.info(`${pc.dim('Add a provider with ')}${pc.cyan('clodex providers')}${pc.dim('.')}`);
+    // The alias configurator must stay reachable with zero providers: it is
+    // the only interactive home of the "Native default" reset, and a saved
+    // built-in remap would otherwise be stuck until a provider is repaired.
+    const savedAliases = (loadPreferences().modelAliases ?? []).length;
+    const savedRemaps = Object.keys(loadPreferences().builtinModelOverrides ?? {}).length;
+    if (savedAliases > 0 || savedRemaps > 0) {
+      const open = await p.confirm({
+        message: `Configure saved aliases/remaps anyway? (${savedAliases} alias${savedAliases === 1 ? '' : 'es'}, ${savedRemaps} built-in remap${savedRemaps === 1 ? '' : 's'})`,
+        initialValue: savedRemaps > 0,
+      });
+      if (!p.isCancel(open) && open) await runAliasConfigurator(new Map());
+    }
     relayOutro('Done');
     return 0;
   }
