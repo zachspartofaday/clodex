@@ -43,8 +43,10 @@ describe('routableBuiltinOverrides', () => {
     expect(warnings[0]).toContain('haiku → gone-alias');
   });
 
-  it('matches routable names case-insensitively and trims targets', () => {
-    expect(routableBuiltinOverrides({ opus: '  WJudge ' }, ['wjudge'])).toEqual({ opus: '  WJudge ' });
+  it('matches case-insensitively but injects the canonical routable spelling', () => {
+    // The MITM route lookup is case-sensitive: injecting the saved "WJudge"
+    // would pass the filter yet miss the route and go upstream unknown.
+    expect(routableBuiltinOverrides({ opus: '  WJudge ' }, ['wjudge'])).toEqual({ opus: 'wjudge' });
   });
 
   it('returns empty for undefined overrides', () => {
@@ -85,16 +87,18 @@ describe('applyBuiltinModelOverridesWithProvenance', () => {
     expect(env[WRAPPER_INJECTED_BUILTINS_ENV]).toBeUndefined();
   });
 
-  it('a corrupted sentinel never breaks the launch — malformed values degrade to match-any', () => {
+  it('a corrupted sentinel neither breaks the launch nor claims explicit values', () => {
     const baseEnv: NodeJS.ProcessEnv = {
-      ANTHROPIC_DEFAULT_FABLE_MODEL: 'old-injected',
+      ANTHROPIC_DEFAULT_FABLE_MODEL: 'user-explicit',
       [WRAPPER_INJECTED_BUILTINS_ENV]: 'fable=%',
     };
     const env: NodeJS.ProcessEnv = { ...baseEnv };
-    // decodeURIComponent('%') throws URIError; the parser must treat the
-    // entry as untrusted provenance instead of killing the launch.
+    // decodeURIComponent('%') throws URIError; the malformed entry is
+    // ignored — never granted a match-any claim that would delete a var the
+    // user set explicitly. Explicit env keeps winning over the snapshot.
     expect(() => applyBuiltinModelOverridesWithProvenance(env, { fable: 'snapshot' }, baseEnv)).not.toThrow();
-    expect(env.ANTHROPIC_DEFAULT_FABLE_MODEL).toBe('snapshot');
+    expect(env.ANTHROPIC_DEFAULT_FABLE_MODEL).toBe('user-explicit');
+    expect(env[WRAPPER_INJECTED_BUILTINS_ENV]).toBeUndefined();
   });
 
   it('a user who replaced an injected var made it explicit — it survives and wins', () => {
