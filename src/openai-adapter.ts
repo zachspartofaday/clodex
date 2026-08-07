@@ -2,7 +2,7 @@ import { tool, jsonSchema, streamText, generateText } from 'ai';
 import type { LanguageModel, ModelMessage } from 'ai';
 import { parseToolArguments } from './proxy-shared.js';
 import type { SdkCallParams } from './sdk-adapter.js';
-import { UPSTREAM_MAX_RETRIES_TOTAL_CEILING, upstreamMaxRetries } from './sdk-adapter.js';
+import { SDK_TOTAL_TIMEOUT_MS, UPSTREAM_MAX_RETRIES_TOTAL_CEILING, upstreamMaxRetries } from './sdk-adapter.js';
 
 // ── OpenAI request shapes ───────────────────────────────────────────────────
 
@@ -202,10 +202,10 @@ export async function generateOpenAiResponse(
     // Some upstreams (e.g. ChatGPT's Codex OAuth backend) only ever answer as a
     // stream. Request a real stream from the SDK and collect it into one
     // response instead of issuing a non-streaming request upstream.
-    const { stream } = streamText({ model, ...(params as any), ...(upstreamMaxRetries(undefined, UPSTREAM_MAX_RETRIES_TOTAL_CEILING) !== undefined ? { maxRetries: upstreamMaxRetries(undefined, UPSTREAM_MAX_RETRIES_TOTAL_CEILING) } : {}), onError: () => {} });
+    const { stream } = streamText({ model, ...(params as any), ...(upstreamMaxRetries(undefined, UPSTREAM_MAX_RETRIES_TOTAL_CEILING) !== undefined ? { maxRetries: upstreamMaxRetries(undefined, UPSTREAM_MAX_RETRIES_TOTAL_CEILING) } : {}), abortSignal: AbortSignal.timeout(SDK_TOTAL_TIMEOUT_MS), onError: () => {} });
     result = await collectOpenAiStream(stream);
   } else {
-    result = (await generateText({ model, ...(params as any), ...(upstreamMaxRetries(undefined, UPSTREAM_MAX_RETRIES_TOTAL_CEILING) !== undefined ? { maxRetries: upstreamMaxRetries(undefined, UPSTREAM_MAX_RETRIES_TOTAL_CEILING) } : {}) })) as any;
+    result = (await generateText({ model, ...(params as any), ...(upstreamMaxRetries(undefined, UPSTREAM_MAX_RETRIES_TOTAL_CEILING) !== undefined ? { maxRetries: upstreamMaxRetries(undefined, UPSTREAM_MAX_RETRIES_TOTAL_CEILING) } : {}), abortSignal: AbortSignal.timeout(SDK_TOTAL_TIMEOUT_MS) })) as any;
   }
   const message: Record<string, any> = { role: 'assistant', content: result.text || null };
 
@@ -237,7 +237,7 @@ export async function streamOpenAiResponse(
   responseModelId: string,
   onChunk: (chunk: string) => void,
 ): Promise<void> {
-  const { stream } = streamText({ model, ...(params as any), ...(upstreamMaxRetries(undefined, UPSTREAM_MAX_RETRIES_TOTAL_CEILING) !== undefined ? { maxRetries: upstreamMaxRetries(undefined, UPSTREAM_MAX_RETRIES_TOTAL_CEILING) } : {}) });
+  const { stream } = streamText({ model, ...(params as any), ...(upstreamMaxRetries(undefined, UPSTREAM_MAX_RETRIES_TOTAL_CEILING) !== undefined ? { maxRetries: upstreamMaxRetries(undefined, UPSTREAM_MAX_RETRIES_TOTAL_CEILING) } : {}), abortSignal: AbortSignal.timeout(SDK_TOTAL_TIMEOUT_MS) });
   const baseData = {
     id: `chatcmpl-${Date.now()}`,
     object: 'chat.completion.chunk',
