@@ -110,13 +110,19 @@ describe('applyBuiltinModelOverridesWithProvenance', () => {
 });
 
 describe('insideSessionProxy', () => {
-  it('detects the per-session proxy shape and nothing else', () => {
+  it('requires the explicit marker to agree with the live proxy var', () => {
+    // Path heuristics fail for custom CLODEX_HOMEs and combined-ca bundles,
+    // so detection rests on the marker the session launcher stamps.
     expect(insideSessionProxy({
       HTTPS_PROXY: 'http://127.0.0.1:17645',
-      NODE_EXTRA_CA_CERTS: '/home/u/.clodex/http-proxy/clodex-ca.pem',
+      CLODEX_SESSION_PROXY: '17645',
     })).toBe(true);
-    expect(insideSessionProxy({ HTTPS_PROXY: 'http://corp-proxy:8080' })).toBe(false);
+    // Marker without a matching proxy (stale), proxy without marker, corp
+    // proxies, and empty envs are all non-sessions.
+    expect(insideSessionProxy({ CLODEX_SESSION_PROXY: '17645' })).toBe(false);
     expect(insideSessionProxy({ HTTPS_PROXY: 'http://127.0.0.1:17645' })).toBe(false);
+    expect(insideSessionProxy({ HTTPS_PROXY: 'http://127.0.0.1:9999', CLODEX_SESSION_PROXY: '17645' })).toBe(false);
+    expect(insideSessionProxy({ HTTPS_PROXY: 'http://corp-proxy:8080', CLODEX_SESSION_PROXY: '8080' })).toBe(false);
     expect(insideSessionProxy({})).toBe(false);
   });
 });

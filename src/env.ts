@@ -1,6 +1,6 @@
 // src/env.ts
 import { CONFLICTING_ENV_VARS } from './constants.js';
-import { applyBuiltinModelOverridesWithProvenance } from './builtin-alias-env.js';
+import { applyBuiltinModelOverridesWithProvenance, SESSION_PROXY_ENV } from './builtin-alias-env.js';
 export { BUILTIN_ALIAS_ENV, applyBuiltinModelOverrides } from './builtin-alias-env.js';
 import {
   createCipheriv,
@@ -116,6 +116,9 @@ export function buildHttpProxyChildEnv(
   env['HTTP_PROXY'] = proxyUrl;
   env['https_proxy'] = proxyUrl;
   env['http_proxy'] = proxyUrl;
+  // Explicit session marker: nested wrappers must recognize this env as a
+  // live session proxy without path heuristics (see insideSessionProxy).
+  env[SESSION_PROXY_ENV] = String(proxyPort);
   env['NODE_EXTRA_CA_CERTS'] = caCertPath;
   removeAnthropicProxyBypass(env);
   return env;

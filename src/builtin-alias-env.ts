@@ -140,15 +140,25 @@ export function applyBuiltinModelOverridesWithProvenance(
 }
 
 /**
+ * Explicit marker a per-session proxy launch stamps into its child env: the
+ * proxy's port. Path heuristics (a "clodex" substring in the CA path) fail
+ * for custom CLODEX_HOMEs and combined-ca bundles, so session-proxy
+ * detection uses this marker cross-checked against the live proxy var.
+ */
+export const SESSION_PROXY_ENV = 'CLODEX_SESSION_PROXY';
+
+/**
  * True when the environment still routes through a live per-session clodex
  * proxy: `clodex claude --proxy` deliberately publishes no runtime record,
  * so a wrapper invoked inside that session sees state=null while the
- * inherited HTTP(S)_PROXY + clodex CA still point at the running proxy.
- * Clearing the session's remap there would break the very routing the
- * session set up.
+ * inherited HTTP(S)_PROXY still points at the running proxy. Clearing the
+ * session's remap there would break the very routing the session set up.
+ * The marker must AGREE with the proxy var — a stale marker whose port no
+ * longer matches the live proxy is not a session.
  */
 export function insideSessionProxy(baseEnv: NodeJS.ProcessEnv): boolean {
+  const port = (baseEnv[SESSION_PROXY_ENV] ?? '').trim();
+  if (!/^\d+$/.test(port)) return false;
   const proxy = baseEnv['HTTPS_PROXY'] ?? baseEnv['https_proxy'] ?? '';
-  return /^http:\/\/127\.0\.0\.1:\d+\/?$/.test(proxy)
-    && (baseEnv['NODE_EXTRA_CA_CERTS'] ?? '').includes('clodex');
+  return proxy === `http://127.0.0.1:${port}`;
 }
