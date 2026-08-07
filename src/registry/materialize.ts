@@ -100,6 +100,40 @@ function isLegacyAnonymousCustomEndpoint(
     && credential === 'local';
 }
 
+export const OAUTH_ACCOUNT_ENV = 'CLODEX_OAUTH_ACCOUNT';
+
+/**
+ * Resolve the launch-selected OAuth account slot for a provider.
+ * CLODEX_OAUTH_ACCOUNT=<name> swaps the provider's authRef for the named
+ * slot's, so every downstream consumer — credential resolution, OAuth
+ * metadata, token refresh persistence — transparently uses that account.
+ * Providers without slots ignore the selector (it only chooses among slots
+ * where slots exist); naming a missing slot on a provider that has slots is
+ * a hard error, because silently falling back to the default account would
+ * run the session as the wrong identity.
+ */
+export function applySelectedOAuthAccount(
+  provider: RegistryProvider,
+  selected: string | undefined = process.env[OAUTH_ACCOUNT_ENV],
+): RegistryProvider {
+  const name = selected?.trim();
+  if (!name) return provider;
+  // A disabled provider cannot participate in the launch, so a stale selector
+  // aimed at it must not throw and take the whole catalog load down.
+  if (!provider.enabled) return provider;
+  if (provider.authType !== 'oauth') return provider;
+  const slots = provider.authAccounts;
+  if (!slots || Object.keys(slots).length === 0) return provider;
+  if (!Object.prototype.hasOwnProperty.call(slots, name)) {
+    const available = Object.keys(slots).sort().join(', ');
+    throw new Error(
+      `CLODEX_OAUTH_ACCOUNT=${name}: provider "${provider.id}" has no account named "${name}" (available: ${available}). `
+      + 'Add it with: clodex providers auth openai --account ' + name,
+    );
+  }
+  return { ...provider, authRef: slots[name]!.authRef };
+}
+
 function materializeOne(
   provider: RegistryProvider,
   resolveCredential: CredentialResolver,

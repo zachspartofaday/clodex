@@ -17,7 +17,7 @@ import {
 import { dirname } from 'node:path';
 import { getAppHome, getProvidersPath } from '../paths.js';
 import type { ProviderRegistry, RegistryProvider } from './types.js';
-import { REGISTRY_SCHEMA_VERSION } from './types.js';
+import { OAUTH_ACCOUNT_NAME_RE, REGISTRY_SCHEMA_VERSION, REGISTRY_SCHEMA_VERSION_WITH_ACCOUNT_SLOTS } from './types.js';
 import {
   assertRegistryWriteOwnership,
   withRegistryWriteLockSync,
@@ -107,6 +107,11 @@ function parseProvider(raw: unknown): RegistryProvider | null {
   if (p.authType === 'api' || p.authType === 'oauth' || p.authType === 'none') {
     provider.authType = p.authType;
   }
+  if (hasOwn(p, 'authAccounts')) {
+    const slots = parseAuthAccounts(p.authAccounts);
+    if (slots === null) return null;
+    provider.authAccounts = slots;
+  }
   if (typeof p.refreshedAt === 'string') provider.refreshedAt = p.refreshedAt;
   if (p.modelsCache && typeof p.modelsCache === 'object') {
     const cache = p.modelsCache as { fetchedAt?: string; models?: unknown[] };
@@ -124,6 +129,34 @@ function parseProvider(raw: unknown): RegistryProvider | null {
 
 function hasOwn(record: Record<string, unknown>, key: string): boolean {
   return Object.prototype.hasOwnProperty.call(record, key);
+}
+
+/**
+ * Named OAuth account slots must survive a registry load intact and are
+ * fail-closed: a silently dropped slot would revert a CLODEX_OAUTH_ACCOUNT
+ * launch to the default identity and let credential reconciliation delete the
+ * slot's tokens as unreferenced. A malformed slot therefore invalidates the
+ * whole provider record instead of being skipped.
+ */
+function parseAuthAccounts(raw: unknown): RegistryProvider['authAccounts'] | null {
+  if (!raw || typeof raw !== 'object' || Array.isArray(raw)) return null;
+  const out: NonNullable<RegistryProvider['authAccounts']> = {};
+  for (const [name, value] of Object.entries(raw as Record<string, unknown>)) {
+    if (!OAUTH_ACCOUNT_NAME_RE.test(name)) return null;
+    if (!value || typeof value !== 'object' || Array.isArray(value)) return null;
+    const slot = value as Record<string, unknown>;
+    if (typeof slot.authRef !== 'string' || !slot.authRef) return null;
+    if (typeof slot.addedAt !== 'string' || !slot.addedAt) return null;
+    if (hasOwn(slot, 'oauthAccountId') && (typeof slot.oauthAccountId !== 'string' || !slot.oauthAccountId)) {
+      return null;
+    }
+    out[name] = {
+      authRef: slot.authRef,
+      addedAt: slot.addedAt,
+      ...(typeof slot.oauthAccountId === 'string' ? { oauthAccountId: slot.oauthAccountId } : {}),
+    };
+  }
+  return out;
 }
 
 function hasValidStrictProviderFields(raw: unknown): boolean {
@@ -144,6 +177,9 @@ function hasValidStrictProviderFields(raw: unknown): boolean {
     return false;
   }
   if (hasOwn(provider, 'refreshedAt') && typeof provider.refreshedAt !== 'string') {
+    return false;
+  }
+  if (hasOwn(provider, 'authAccounts') && parseAuthAccounts(provider.authAccounts) === null) {
     return false;
   }
   if (hasOwn(provider, 'modelsCache')) {
@@ -186,7 +222,10 @@ function parseRegistryStrict(raw: unknown): ProviderRegistry {
     throw new Error('Provider registry must be a JSON object.');
   }
   const data = raw as Record<string, unknown>;
-  if (data.schemaVersion !== REGISTRY_SCHEMA_VERSION) {
+  if (
+    data.schemaVersion !== REGISTRY_SCHEMA_VERSION
+    && data.schemaVersion !== REGISTRY_SCHEMA_VERSION_WITH_ACCOUNT_SLOTS
+  ) {
     throw new Error('Provider registry has an unsupported schema version.');
   }
   if (!Array.isArray(data.providers)) {
@@ -245,7 +284,13 @@ export function loadRegistryStrict(path = getProvidersPath()): ProviderRegistry 
 
 export function saveRegistry(registry: ProviderRegistry, path = getProvidersPath()): void {
   assertRegistryWriteOwnership(path);
-  const payload = `${JSON.stringify(registry, null, 2)}\n`;
+  // Slot state fences older writers via the schema version (see types.ts);
+  // slot-free registries return to v1 so old builds interoperate again.
+  const hasSlots = registry.providers.some(
+    provider => provider.authAccounts && Object.keys(provider.authAccounts).length > 0,
+  );
+  const schemaVersion = hasSlots ? REGISTRY_SCHEMA_VERSION_WITH_ACCOUNT_SLOTS : REGISTRY_SCHEMA_VERSION;
+  const payload = `${JSON.stringify({ ...registry, schemaVersion }, null, 2)}\n`;
   const backup = `${path}.bak`;
   if (existsSync(path)) {
     try {
