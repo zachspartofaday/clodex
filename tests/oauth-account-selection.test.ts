@@ -1,5 +1,5 @@
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
-import { mkdtempSync, rmSync, writeFileSync } from 'node:fs';
+import { mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { applySelectedOAuthAccount } from '../src/registry/materialize.js';
@@ -128,6 +128,24 @@ describe('authAccounts registry persistence', () => {
     };
     writeFileSync(path, registryWith(malformed));
     expect(loadRegistry(path).providers).toHaveLength(0);
+  });
+
+  it('fences older writers: slot registries persist at schema v2, slot-free at v1', () => {
+    writeFileSync(path, registryWith(withSlots));
+    const loaded = loadRegistry(path);
+    withRegistryWriteLockSync(() => saveRegistry(loaded, path), { lockPath: `${path}.lock` });
+    // Older builds throw on an unknown schema version in every mutating path,
+    // so they cannot strip the slots and save the providers back slot-less.
+    expect(JSON.parse(readFileSync(path, 'utf8')).schemaVersion).toBe(2);
+    expect(loadRegistryStrict(path).providers[0]!.authAccounts).toEqual(withSlots.authAccounts);
+
+    const slotFree = { ...loaded, providers: [{ ...loaded.providers[0]!, authAccounts: undefined }] };
+    delete (slotFree.providers[0] as Record<string, unknown>).authAccounts;
+    withRegistryWriteLockSync(() => saveRegistry(slotFree, path), { lockPath: `${path}.lock` });
+    expect(JSON.parse(readFileSync(path, 'utf8')).schemaVersion).toBe(1);
+
+    writeFileSync(path, `${JSON.stringify({ schemaVersion: 3, providers: [] })}\n`);
+    expect(() => loadRegistryStrict(path)).toThrow(/unsupported schema version/);
   });
 
   it('slot credentials count as live references for reconciliation', () => {
