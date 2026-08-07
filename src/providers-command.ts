@@ -179,9 +179,13 @@ async function runProvidersAuthWithCleanupState(
 ): Promise<number> {
   try {
     const result = await authenticateProvider(providerId, { method, account });
+    // Print the NORMALIZED slot name: the credential is stored under it, and
+    // applySelectedOAuthAccount does not normalize the env value, so echoing
+    // the raw spelling ("Work") would recommend a selector that fails.
+    const slot = account === undefined ? undefined : validateOAuthAccountName(account);
     p.log.success(
-      account
-        ? `Signed in to ${result.registryProvider.name} (account "${account}") — select it at launch with CLODEX_OAUTH_ACCOUNT=${account}.`
+      slot
+        ? `Signed in to ${result.registryProvider.name} (account "${slot}") — select it at launch with CLODEX_OAUTH_ACCOUNT=${slot}.`
         : `Signed in to ${result.registryProvider.name} — credential saved to the credential store.`,
     );
     reportCredentialCleanup(result.credentialCleanupPending, cleanupState, true);

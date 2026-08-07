@@ -6,6 +6,7 @@ import { applySelectedOAuthAccount } from '../src/registry/materialize.js';
 import { emptyRegistry, loadRegistry, loadRegistryStrict, saveRegistry } from '../src/registry/io.js';
 import { credentialIsReferenced } from '../src/registry/credential-lifecycle.js';
 import { withRegistryWriteLockSync } from '../src/registry/lock.js';
+import { oauthProviderIdFromAccount } from '../src/env.js';
 import type { RegistryProvider } from '../src/registry/types.js';
 
 const base: RegistryProvider = {
@@ -123,5 +124,17 @@ describe('authAccounts registry persistence', () => {
     expect(credentialIsReferenced(registry, withSlots.authAccounts!.alt!.authRef)).toBe(true);
     expect(credentialIsReferenced(registry, base.authRef)).toBe(true);
     expect(credentialIsReferenced(registry, 'keyring:oauth:provider:openai-oauth:account:gone::credential::v1:x')).toBe(false);
+  });
+});
+
+describe('oauthProviderIdFromAccount', () => {
+  it('collapses a named slot to the base provider id used by token refresh', () => {
+    // refreshStoredOAuthCredential supports exact provider ids only; a slot
+    // suffix leaking through meant named accounts failed with "OAuth refresh
+    // not implemented" the first time their access token expired.
+    expect(oauthProviderIdFromAccount('oauth:provider:openai-oauth:account:work::credential::v1:w')).toBe('openai-oauth');
+    expect(oauthProviderIdFromAccount('oauth:provider:openai-oauth:account:work')).toBe('openai-oauth');
+    expect(oauthProviderIdFromAccount('oauth:provider:openai-oauth')).toBe('openai-oauth');
+    expect(oauthProviderIdFromAccount('provider:openai')).toBeNull();
   });
 });

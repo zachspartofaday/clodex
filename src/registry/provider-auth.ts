@@ -306,6 +306,19 @@ export async function authenticateProvider(
     );
   }
 
+  if (accountName) {
+    // Fail before the interactive device-code ceremony, not after: authorizing
+    // an account only to learn the default sign-in is missing wastes the whole
+    // flow. The locked check inside persistNativeOAuthCredential remains
+    // authoritative against concurrent removals.
+    const existing = loadRegistryStrict().providers.find(provider => provider.id === registryId);
+    if (!existing) {
+      throw new Error(
+        `Provider "${registryId}" is not configured yet — run the default sign-in first: clodex providers auth openai`,
+      );
+    }
+  }
+
   const cred = await runNativeDeviceCode(providerId);
   const persisted = await persistNativeOAuthCredential(providerId, cred, accountName);
 

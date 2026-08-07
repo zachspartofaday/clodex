@@ -194,6 +194,14 @@ describe('authenticateProvider', () => {
     rmSync(home, { recursive: true, force: true });
   });
 
+  it('rejects a named account before the device ceremony when no default sign-in exists', async () => {
+    await expect(authenticateProvider('openai', { account: 'work' }))
+      .rejects.toThrow(/run the default sign-in first/);
+    // The check must fire BEFORE the interactive flow: authorizing an account
+    // and waiting for tokens only to be rejected afterward wastes the ceremony.
+    expect(runOpenAiDeviceCodeFlow).not.toHaveBeenCalled();
+  });
+
   it('stores a named account slot without touching the default credential', async () => {
     await authenticateProvider('openai');
     const defaultRef = registryState.current.providers[0]!.authRef;

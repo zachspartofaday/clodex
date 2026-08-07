@@ -189,10 +189,17 @@ export function oauthProviderKeyringAccount(providerId: string): string {
   return `oauth:provider:${providerId}`;
 }
 
-function oauthProviderIdFromAccount(account: string): string | null {
+export function oauthProviderIdFromAccount(account: string): string | null {
   const prefix = 'oauth:provider:';
   const baseAccount = credentialAccountBase(account);
-  return baseAccount.startsWith(prefix) ? baseAccount.slice(prefix.length) : null;
+  if (!baseAccount.startsWith(prefix)) return null;
+  const id = baseAccount.slice(prefix.length);
+  // A named account slot (oauth:provider:<id>:account:<name>) shares the base
+  // provider's refresh identity — refreshStoredOAuthCredential supports exact
+  // provider ids only, and per-slot cache keys already come from the full
+  // account string, so collapsing here changes refresh routing, not caching.
+  const slot = id.indexOf(':account:');
+  return slot === -1 ? id : id.slice(0, slot);
 }
 
 const oauthRefreshInflight = new Map<string, Promise<string | null>>();
