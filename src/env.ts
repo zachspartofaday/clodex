@@ -118,7 +118,7 @@ export function buildHttpProxyChildEnv(
   env['http_proxy'] = proxyUrl;
   // Explicit session marker: nested wrappers must recognize this env as a
   // live session proxy without path heuristics (see insideSessionProxy).
-  env[SESSION_PROXY_ENV] = String(proxyPort);
+  env[SESSION_PROXY_ENV] = `${proxyPort}:${process.pid}`;
   env['NODE_EXTRA_CA_CERTS'] = caCertPath;
   removeAnthropicProxyBypass(env);
   return env;
