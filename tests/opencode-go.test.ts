@@ -1,4 +1,4 @@
-import { describe, expect, it } from 'vitest';
+import { afterEach, describe, expect, it, vi } from 'vitest';
 import {
   buildOpenCodeGoModels,
   OPENCODE_GO_ANTHROPIC_BASE_URL,
@@ -6,7 +6,7 @@ import {
   OPENCODE_GO_SOURCE_REF,
 } from '../src/data/opencode-go-models.js';
 import { buildHttpProxyRoutes } from '../src/http-proxy/routes.js';
-import { getTemplateById } from '../src/provider-templates.js';
+import { getTemplateById, verifyOpenCodeGoCredential } from '../src/provider-templates.js';
 import { applyTemplateModelMetadata } from '../src/registry/fetch-template-models.js';
 import { materializeRegistry } from '../src/registry/materialize.js';
 import type { CachedModel, ProviderRegistry } from '../src/registry/types.js';
@@ -151,5 +151,40 @@ describe('OpenCode Go catalog', () => {
     const first = buildOpenCodeGoModels();
     first[0]!.name = 'mutated';
     expect(buildOpenCodeGoModels()[0]!.name).not.toBe('mutated');
+  });
+});
+
+describe('verifyOpenCodeGoCredential', () => {
+  afterEach(() => {
+    vi.unstubAllGlobals();
+  });
+
+  it('rejects a key the upstream answers with 401', async () => {
+    const fetchMock = vi.fn(async () => new Response('{"error":"unauthorized"}', { status: 401 }));
+    vi.stubGlobal('fetch', fetchMock);
+    const error = await verifyOpenCodeGoCredential('bad-key', OPENCODE_GO_COMPLETIONS_BASE_URL);
+    expect(error).toContain('authentication failed');
+    const [url, init] = fetchMock.mock.calls[0]! as [string, RequestInit];
+    expect(url).toBe(`${OPENCODE_GO_COMPLETIONS_BASE_URL}/chat/completions`);
+    expect((init.headers as Record<string, string>).Authorization).toBe('Bearer bad-key');
+  });
+
+  it('rejects on 403 as well', async () => {
+    vi.stubGlobal('fetch', vi.fn(async () => new Response('forbidden', { status: 403 })));
+    expect(await verifyOpenCodeGoCredential('bad-key', OPENCODE_GO_COMPLETIONS_BASE_URL)).not.toBeNull();
+  });
+
+  it('accepts a key whose empty-body probe fails ordinary request validation', async () => {
+    vi.stubGlobal('fetch', vi.fn(async () => new Response('{"error":"messages required"}', { status: 400 })));
+    expect(await verifyOpenCodeGoCredential('good-key', OPENCODE_GO_COMPLETIONS_BASE_URL)).toBeNull();
+  });
+
+  it('treats an unreachable upstream as inconclusive', async () => {
+    vi.stubGlobal('fetch', vi.fn(async () => { throw new Error('ECONNREFUSED'); }));
+    expect(await verifyOpenCodeGoCredential('any-key', OPENCODE_GO_COMPLETIONS_BASE_URL)).toBeNull();
+  });
+
+  it('is wired on the template so the add flow probes before persisting', () => {
+    expect(getTemplateById('opencode-go')?.verifyCredential).toBe(verifyOpenCodeGoCredential);
   });
 });

@@ -35,10 +35,50 @@ export interface ProviderTemplate {
   staticModelPolicy?: ProviderStaticModelPolicy;
   /** Keep provider/curated costs instead of replacing them with the global pricing cache. */
   preserveModelPricing?: boolean;
+  /**
+   * Authenticated probe run before a pasted key is persisted. Required when the
+   * provider's models endpoint answers without authentication (so a models
+   * fetch cannot validate the credential). Returns an error message to reject
+   * the key, or null when the key is accepted or the probe is inconclusive —
+   * only a definite auth rejection may block the add.
+   */
+  verifyCredential?: (apiKey: string, baseUrl: string) => Promise<string | null>;
   supported: boolean;
   addable?: boolean;
   hidden?: boolean;
   unsupportedReason?: string;
+}
+
+/**
+ * OpenCode Go's /models endpoint is availability data and answers without
+ * authentication, so the shared api-list flow's models fetch cannot validate a
+ * pasted key. Probe the authenticated chat-completions endpoint with a
+ * deliberately empty body: authentication is evaluated before request
+ * validation, so a bad key yields 401/403 while a good key yields an ordinary
+ * request-validation error. Every other outcome — including an unreachable
+ * upstream — is inconclusive and passes, so the probe can only ever reject
+ * keys the upstream itself rejected.
+ */
+export async function verifyOpenCodeGoCredential(apiKey: string, baseUrl: string): Promise<string | null> {
+  try {
+    const response = await fetch(`${baseUrl.replace(/\/+$/, '')}/chat/completions`, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        Authorization: `Bearer ${apiKey}`,
+      },
+      body: JSON.stringify({}),
+    });
+    try {
+      await response.body?.cancel?.();
+    } catch { /* the status is all the probe needs */ }
+    if (response.status === 401 || response.status === 403) {
+      return 'OpenCode Go rejected this API key (authentication failed). Check the key and try again.';
+    }
+  } catch {
+    // Unreachable probe is inconclusive; the models fetch surfaces network errors.
+  }
+  return null;
 }
 
 /** Built-in providers available through `clodex providers add` or OAuth authentication. */
@@ -62,6 +102,9 @@ export const PROVIDER_TEMPLATES: ProviderTemplate[] = [
     modelsPath: '/models',
     signupUrl: 'https://opencode.ai',
     modelSource: 'api-list',
+    // /models is availability data (answers without auth), so the shared
+    // api-list validation cannot catch a bad key; probe before persisting.
+    verifyCredential: verifyOpenCodeGoCredential,
     staticModels: buildOpenCodeGoModels(),
     staticModelPolicy: 'allowlist',
     preserveModelPricing: true,
