@@ -1,6 +1,6 @@
 import { describe, expect, it } from 'vitest';
 import { applyBuiltinModelOverrides, BUILTIN_ALIAS_ENV } from '../src/env.js';
-import { routableBuiltinOverrides } from '../src/builtin-alias-env.js';
+import { applyBuiltinModelOverridesWithProvenance, routableBuiltinOverrides, WRAPPER_INJECTED_BUILTINS_ENV } from '../src/builtin-alias-env.js';
 import { CONFLICTING_ENV_VARS } from '../src/constants.js';
 
 describe('applyBuiltinModelOverrides', () => {
@@ -59,5 +59,39 @@ describe('conflict sweep coverage', () => {
       // survived buildChildEnv and reached the local endpoint unswept.
       expect(CONFLICTING_ENV_VARS).toContain(envName);
     }
+  });
+});
+
+describe('applyBuiltinModelOverridesWithProvenance', () => {
+  it('a previous launch\'s injection never outranks the new snapshot', () => {
+    const baseEnv: NodeJS.ProcessEnv = {
+      ANTHROPIC_DEFAULT_FABLE_MODEL: 'old-injected',
+      [WRAPPER_INJECTED_BUILTINS_ENV]: 'fable',
+    };
+    const env: NodeJS.ProcessEnv = { ...baseEnv };
+    applyBuiltinModelOverridesWithProvenance(env, { fable: 'new-target' }, baseEnv);
+    expect(env.ANTHROPIC_DEFAULT_FABLE_MODEL).toBe('new-target');
+    expect(env[WRAPPER_INJECTED_BUILTINS_ENV]).toBe('fable');
+  });
+
+  it('clears a stale inherited injection the new launch does not re-issue', () => {
+    const baseEnv: NodeJS.ProcessEnv = {
+      ANTHROPIC_DEFAULT_FABLE_MODEL: 'old-injected',
+      [WRAPPER_INJECTED_BUILTINS_ENV]: 'fable',
+    };
+    const env: NodeJS.ProcessEnv = { ...baseEnv };
+    applyBuiltinModelOverridesWithProvenance(env, {}, baseEnv);
+    expect(env.ANTHROPIC_DEFAULT_FABLE_MODEL).toBeUndefined();
+    expect(env[WRAPPER_INJECTED_BUILTINS_ENV]).toBeUndefined();
+  });
+
+  it('a true user-set env var still outranks everything and is never claimed', () => {
+    const baseEnv: NodeJS.ProcessEnv = { ANTHROPIC_DEFAULT_SONNET_MODEL: 'user-pinned' };
+    const env: NodeJS.ProcessEnv = { ...baseEnv };
+    applyBuiltinModelOverridesWithProvenance(env, { sonnet: 'snapshot', fable: 'wjudge' }, baseEnv);
+    expect(env.ANTHROPIC_DEFAULT_SONNET_MODEL).toBe('user-pinned');
+    expect(env.ANTHROPIC_DEFAULT_FABLE_MODEL).toBe('wjudge');
+    // Only what THIS launch injected is claimed by the sentinel.
+    expect(env[WRAPPER_INJECTED_BUILTINS_ENV]).toBe('fable');
   });
 });

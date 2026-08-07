@@ -7,7 +7,7 @@
 
 import type { ServerRuntimeState } from './server-runtime.js';
 import type { BuiltinAliasName } from './types.js';
-import { applyBuiltinModelOverrides } from './builtin-alias-env.js';
+import { applyBuiltinModelOverridesWithProvenance } from './builtin-alias-env.js';
 
 const PROXY_ENV_VARS = ['HTTPS_PROXY', 'HTTP_PROXY', 'https_proxy', 'http_proxy'] as const;
 export const REQUIRE_SERVER_ENV = 'CLODEX_REQUIRE_SERVER';
@@ -73,7 +73,7 @@ export function computeWrapperEnv(
     // reach a claude launched through a discovered standalone server, or the
     // remap silently depends on how claude was started. An env var the user
     // set explicitly still wins.
-    applyBuiltinModelOverrides(env, builtinOverrides, baseEnv);
+    applyBuiltinModelOverridesWithProvenance(env, builtinOverrides, baseEnv);
     removeAnthropicProxyBypass(env);
     return env;
   }

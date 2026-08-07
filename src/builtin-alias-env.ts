@@ -62,3 +62,42 @@ export function routableBuiltinOverrides(
   }
   return out;
 }
+
+/** Names the aliases a clodex launcher itself injected into a child env. */
+export const WRAPPER_INJECTED_BUILTINS_ENV = 'CLODEX_INJECTED_BUILTINS';
+
+/**
+ * Apply remaps while distinguishing a USER's explicit env var from one a
+ * previous clodex launch injected. Claude Code spawns nested processes with
+ * the injected ANTHROPIC_DEFAULT_* values still in the environment; treating
+ * those as explicit would let a stale injection from an older server or
+ * profile permanently outrank every newer route-bound snapshot. Inherited
+ * injections (named in the provenance sentinel) are cleared first, the
+ * current overrides applied with true user env winning, and the sentinel
+ * rewritten to exactly what THIS launch injected.
+ */
+export function applyBuiltinModelOverridesWithProvenance(
+  env: NodeJS.ProcessEnv,
+  overrides: Partial<Record<BuiltinAliasName, string>> | undefined,
+  baseEnv: NodeJS.ProcessEnv,
+): void {
+  const inherited = new Set(
+    (baseEnv[WRAPPER_INJECTED_BUILTINS_ENV] ?? '').split(',').map(name => name.trim()).filter(Boolean),
+  );
+  const explicit: NodeJS.ProcessEnv = { ...baseEnv };
+  for (const alias of inherited) {
+    const envName = BUILTIN_ALIAS_ENV[alias as BuiltinAliasName];
+    if (envName) {
+      delete explicit[envName];
+      // A stale injection not re-issued by this launch must not linger.
+      delete env[envName];
+    }
+  }
+  applyBuiltinModelOverrides(env, overrides, explicit);
+  const injected = (Object.entries(BUILTIN_ALIAS_ENV) as Array<[BuiltinAliasName, string]>)
+    .filter(([alias, envName]) => explicit[envName] === undefined && env[envName] !== undefined
+      && String(overrides?.[alias] ?? '').trim() !== '')
+    .map(([alias]) => alias);
+  if (injected.length > 0) env[WRAPPER_INJECTED_BUILTINS_ENV] = injected.join(',');
+  else delete env[WRAPPER_INJECTED_BUILTINS_ENV];
+}
