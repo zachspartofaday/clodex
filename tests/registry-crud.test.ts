@@ -171,6 +171,33 @@ describe('registry provider removal', () => {
     ].sort());
   });
 
+  it('reports pending cleanup when a slot credential fails to delete after the default succeeded', async () => {
+    registryState.current.providers[0] = {
+      ...registryState.current.providers[0]!,
+      authType: 'oauth',
+      authRef: 'keyring:oauth:provider:openai-oauth::credential::v1:default',
+      authAccounts: {
+        work: { authRef: 'keyring:oauth:provider:openai-oauth:account:work::credential::v1:w', addedAt: '2026-08-07T00:00:00.000Z' },
+      },
+    };
+    vi.mocked(deleteProviderCredential).mockImplementation(async authRef =>
+      authRef === 'keyring:oauth:provider:openai-oauth::credential::v1:default');
+
+    const result = await removeProviderFromRegistry('openai');
+
+    // Status derives from the COMPLETE queued set: the surviving slot
+    // credential must surface as pending, not be masked by the default
+    // credential's clean deletion.
+    expect(result).toMatchObject({
+      removed: true,
+      credentialDeleted: false,
+      credentialCleanupPending: true,
+      credentialCleanupReconciled: true,
+    });
+    expect(journalState.pending.has('keyring:oauth:provider:openai-oauth:account:work::credential::v1:w')).toBe(true);
+    expect(journalState.pending.has('keyring:oauth:provider:openai-oauth::credential::v1:default')).toBe(false);
+  });
+
   it('commits the registry mutation before deleting the credential outside the lock', async () => {
     const result = await removeProviderFromRegistry('openai');
 

@@ -23,7 +23,8 @@ export interface RemoveProviderResult {
 
 interface PendingProviderRemoval {
   result: RemoveProviderResult;
-  authRef: string | null;
+  /** Every credential ref queued for cleanup: the default plus each named slot. */
+  queuedRefs: string[];
 }
 
 /** Remove a provider from the registry; delete its stored credential when safe. */
@@ -42,20 +43,22 @@ async function removeProviderWithinLifecycle(
           credentialDeleted: false,
           error: `Provider not found: ${id}`,
         },
-        authRef: null,
+        queuedRefs: [],
       };
     }
 
     const [removedProvider] = registry.providers.splice(index, 1);
-    const cleanupQueued = opts?.deleteCredential !== false
-      ? await queueCredentialDelete(removedProvider.authRef)
-      : false;
+    const queuedRefs: string[] = [];
     if (opts?.deleteCredential !== false) {
+      if (await queueCredentialDelete(removedProvider.authRef)) {
+        queuedRefs.push(removedProvider.authRef);
+      }
       // Named OAuth account slots own disjoint credential lineages; removing
       // the provider must not orphan them in the credential store.
       for (const slot of Object.values(removedProvider.authAccounts ?? {})) {
-        if (slot.authRef && slot.authRef !== removedProvider.authRef) {
-          await queueCredentialDelete(slot.authRef);
+        if (slot.authRef && slot.authRef !== removedProvider.authRef
+          && await queueCredentialDelete(slot.authRef)) {
+          queuedRefs.push(slot.authRef);
         }
       }
     }
@@ -68,16 +71,22 @@ async function removeProviderWithinLifecycle(
         name: removedProvider.name,
         credentialDeleted: false,
       },
-      authRef: cleanupQueued ? removedProvider.authRef : null,
+      queuedRefs,
     };
   });
 
-  if (removal.authRef) {
+  if (removal.queuedRefs.length > 0) {
+    // Deletion and pending status derive from the COMPLETE queued set: a
+    // failed slot deletion must surface as pending even when the default
+    // credential deleted cleanly, or the pending-cleanup warning is
+    // suppressed while credentials remain queued in the store.
     try {
       const cleanup = await reconcilePendingCredentialDeletes();
-      removal.result.credentialDeleted = cleanup.deleted.includes(removal.authRef);
+      removal.result.credentialDeleted =
+        removal.queuedRefs.every(ref => cleanup.deleted.includes(ref));
       removal.result.credentialCleanupPending =
-        cleanup.pending.includes(removal.authRef) || cleanup.persistenceError !== undefined;
+        removal.queuedRefs.some(ref => cleanup.pending.includes(ref))
+        || cleanup.persistenceError !== undefined;
     } catch {
       removal.result.credentialCleanupPending = true;
     }
