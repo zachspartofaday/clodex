@@ -48,17 +48,22 @@ export function routableBuiltinOverrides(
   overrides: Partial<Record<BuiltinAliasName, string>> | undefined,
   routableNames: Iterable<string>,
   warn?: (message: string) => void,
+  // Callers pass the MITM's normalizeRouteLookupId so a saved remap matches
+  // across context-suffix variants ([1m]) the way routing itself does. A
+  // parameter, not an import: pulling that helper here would drag node:fs
+  // into this leaf module and the wrapper's hot path.
+  normalizeId: (id: string) => string = id => id,
 ): Partial<Record<BuiltinAliasName, string>> {
-  // Map lowercased → canonical spelling: matching is case-insensitive, but
-  // the INJECTED value must be the exact routable name — the MITM route
-  // lookup is case-sensitive, so injecting the saved spelling ("WJudge")
-  // would pass this filter yet miss the route and go upstream unknown.
+  // Map normalized+lowercased → canonical CURRENT spelling: matching is
+  // case- and suffix-insensitive, but the INJECTED value must be the exact
+  // route name as loaded — the MITM lookup is case-sensitive, and the
+  // current spelling carries the context hint ([1m]) auto-compaction needs.
   const routable = new Map<string, string>();
-  for (const name of routableNames) routable.set(name.trim().toLowerCase(), name.trim());
+  for (const name of routableNames) routable.set(normalizeId(name.trim()).toLowerCase(), name.trim());
   const out: Partial<Record<BuiltinAliasName, string>> = {};
   for (const [alias, target] of Object.entries(overrides ?? {}) as Array<[BuiltinAliasName, string]>) {
     const trimmed = typeof target === 'string' ? target.trim() : '';
-    const canonical = trimmed ? routable.get(trimmed.toLowerCase()) : undefined;
+    const canonical = trimmed ? routable.get(normalizeId(trimmed).toLowerCase()) : undefined;
     if (canonical !== undefined) {
       out[alias] = canonical;
     } else if (trimmed) {

@@ -43,6 +43,20 @@ describe('routableBuiltinOverrides', () => {
     expect(warnings[0]).toContain('haiku → gone-alias');
   });
 
+  it('matches across context-suffix variants and injects the CURRENT spelling', () => {
+    const normalize = (id: string) => id.replace(/\[1m\]$/i, '');
+    // Provider metadata moved the model across the 1M threshold: the saved
+    // remap has the old spelling, the loaded route the new one. Both
+    // directions must match, and the injected value must be the current
+    // route spelling so the context hint reaches auto-compaction.
+    expect(routableBuiltinOverrides(
+      { fable: 'clodex:opencode-go:kimi-k3' }, ['clodex:opencode-go:kimi-k3[1m]'], undefined, normalize,
+    )).toEqual({ fable: 'clodex:opencode-go:kimi-k3[1m]' });
+    expect(routableBuiltinOverrides(
+      { fable: 'clodex:opencode-go:kimi-k3[1m]' }, ['clodex:opencode-go:kimi-k3'], undefined, normalize,
+    )).toEqual({ fable: 'clodex:opencode-go:kimi-k3' });
+  });
+
   it('matches case-insensitively but injects the canonical routable spelling', () => {
     // The MITM route lookup is case-sensitive: injecting the saved "WJudge"
     // would pass the filter yet miss the route and go upstream unknown.
