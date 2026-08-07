@@ -406,6 +406,7 @@ async function handleAnthropicMessages(
         supportedParameters: model.supportedParameters,
         reasoning: model.reasoning,
         interleavedReasoningField: model.interleavedReasoningField,
+        compatibility: model.compatibility,
         upstreamModelId: upstreamModelId(model),
       },
       maxTools: npmMaxTools,
@@ -725,6 +726,7 @@ async function getOrInitLanguageModel(
       headers: model.headers,
       useResponsesLite: model.useResponsesLite,
       preferWebSockets: model.preferWebSockets,
+      compatibility: model.compatibility,
       onWebSocketDiagnostic: webSocketDiagnosticsLogPath
         ? event => writeWebSocketDiagnosticLog(webSocketDiagnosticsLogPath, event)
         : undefined,
