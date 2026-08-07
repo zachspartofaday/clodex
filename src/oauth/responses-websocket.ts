@@ -116,12 +116,12 @@ interface ConnectionEntry {
   requestInput?: unknown[];
   expectedAssistant?: unknown[];
   /**
-   * Per-tool required sets from the request that created this head. The
-   * echoed call was sanitized under THIS schema, so the canary must compare
-   * with it — a tool whose schema changed on a later turn would otherwise
-   * mis-classify a genuine strip-rule fork.
+   * The per-tool `required` sets that were in force when `expectedAssistant`
+   * was snapshotted. The strip rule's outcome depends on them, so a later turn
+   * that declares different tools must not be used to re-derive what this head
+   * stripped — that flips the gap verdict with no code change at all.
    */
-  requiredToolProps?: Map<string, Set<string>>;
+  headRequiredToolProps?: Map<string, Set<string>>;
   /** Memoized canonical form of the stored prefix; cleared whenever it changes. */
   canonicalPrefix?: string[];
   canonicalEchoablePrefix?: string[];
@@ -514,25 +514,33 @@ export function resetReasoningGapWarningsForTests(): void {
  *
  * `call_id` is the tool call's identity. Claude Code echoes back the call it was
  * handed, so when both sides are a `function_call` carrying the SAME `call_id`
- * and `name` yet different `arguments`, the two objects describe the same call
- * and the continuation should have been accepted — the remaining difference is a
+ * and `name` yet comparing unequal, the two objects describe the same call and
+ * the continuation should have been accepted — the remaining difference is a
  * normalization gap on our side. A genuine rewind or branch regenerates the call
  * and produces a NEW `call_id`, so those never reach here and the signal stays
  * clean.
  *
- * `equalAfterStrip` separates the two mechanisms. When applying the shared
- * filler-strip rule to both sides makes them equal, the rule has forked between
- * the translation layer and the chain-head snapshot — that is #84 returning, and
- * it is the case worth shouting about. When they still differ, the arguments took
- * a shape `sanitizedCallArguments` deliberately passes through untouched (a
- * scalar, an array, or malformed JSON), which is worth counting but is not a
- * regression.
+ * `equalAfterStrip` separates the two mechanisms. It re-compares the WHOLE
+ * items with the shared filler-strip rule applied to `arguments` — not the
+ * arguments alone, or a divergence in any other field would be reported as a
+ * strip-rule gap the code never examined. When that makes them equal, the only
+ * thing standing between the head and its own echo is filler the shared rule
+ * removes, which is the shape #84 had. When they still differ, the difference
+ * is one the strip rule cannot explain — arguments in a shape
+ * `sanitizedCallArguments` deliberately passes through untouched (a scalar, an
+ * array, or malformed JSON), a genuinely re-sent value, or a divergence
+ * elsewhere in the item — which is worth counting but is not a regression.
+ *
+ * `requiredProps` must describe the turn that SNAPSHOTTED the head, because
+ * that is the schema the head was stripped under. Reading the current turn's
+ * tools instead lets an unrelated schema change flip the verdict in either
+ * direction. It is a thunk so the tools array is only walked once the cheap
+ * identity guards above have passed.
  */
 function toolArgumentNormalizationGap(
   expected: unknown,
   actual: unknown,
-  payload: JsonObject,
-  headRequiredProps?: Map<string, Set<string>>,
+  requiredProps: () => Map<string, Set<string>>,
 ): Record<string, unknown> | undefined {
   if (conversationItemKind(expected) !== 'function_call') return undefined;
   if (conversationItemKind(actual) !== 'function_call') return undefined;
@@ -546,43 +554,26 @@ function toolArgumentNormalizationGap(
   if (canonicalJson(normalizeToolCallJson(left)) === canonicalJson(normalizeToolCallJson(right))) {
     return undefined;
   }
-  // Only ARGUMENT differences are this canary's subject. Two calls that agree
-  // on normalized arguments but differ in some other field would strip-equal
-  // below and emit a misleading #84 warning about a rule that agrees on both
-  // sides — classify those as ordinary mismatches instead.
-  const normalizedArguments = (item: JsonObject): unknown =>
-    (normalizeToolCallJson(item) as JsonObject).arguments;
-  if (canonicalJson(normalizedArguments(left)) === canonicalJson(normalizedArguments(right))) {
-    return undefined;
-  }
-  // The head's schema is authoritative: the echo was sanitized under it.
-  const required = (headRequiredProps ?? requiredToolProps(payload)).get(left.name);
-  // Deliberately re-derives the parse/blank-string semantics instead of
-  // calling sanitizedCallArguments: a canary that shares code with the path
-  // it monitors goes blind to forks in that shared wrapper. Do not
-  // "deduplicate" this into the snapshot helper.
+  const required = requiredProps().get(left.name);
   const stripped = (item: JsonObject): string | undefined => {
     if (typeof item.arguments !== 'string') return undefined;
     const raw = item.arguments.trim();
     try {
       const parsed: unknown = raw === '' ? {} : JSON.parse(raw);
       if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) return undefined;
-      return canonicalJson(sanitizeToolInput(parsed as Record<string, unknown>, required));
+      // Carry the rest of the item along, so a difference somewhere other than
+      // `arguments` cannot be reported as the filler-strip rule having forked.
+      return canonicalJson({
+        ...(normalizeToolCallJson(item) as JsonObject),
+        arguments: canonicalJson(sanitizeToolInput(parsed as Record<string, unknown>, required)),
+      });
     } catch { return undefined; }
   };
   const leftStripped = stripped(left);
   const rightStripped = stripped(right);
-  // The rule-forked verdict requires the WHOLE calls to agree once the
-  // stripped arguments are substituted back: arguments differing only by
-  // filler while some other field also differs is a mismatch stripping
-  // cannot repair, and blaming the rule for it would be false.
-  const wholeAfterStrip = (item: JsonObject, args: string): string =>
-    canonicalJson(normalizeToolCallJson({ ...item, arguments: args }));
   return {
     tool: left.name,
-    equalAfterStrip: leftStripped !== undefined && rightStripped !== undefined
-      && leftStripped === rightStripped
-      && wholeAfterStrip(left, leftStripped) === wholeAfterStrip(right, rightStripped),
+    equalAfterStrip: leftStripped !== undefined && leftStripped === rightStripped,
   };
 }
 
@@ -603,10 +594,18 @@ function warnToolArgumentNormalizationGap(
 ): void {
   const tool = typeof gap.tool === 'string' ? gap.tool : 'unknown';
   const signature = `${tool}:filler`;
+  // States what was observed, not why. `equalAfterStrip` proves the two sides
+  // agree once today's shared rule runs; it does not prove which side stopped
+  // applying it, and a first false positive is what teaches a user to ignore
+  // the one warning whose value depends on being believed.
+  // `--trace` is the diagnostic a `clodex claude` user can actually produce; the
+  // richer per-head JSONL is `clodex server --ws-diagnostics`, which is a server
+  // flag only, so naming it here would send most users after a flag their command
+  // does not accept and silently forwards to the claude binary.
   const message = `clodex: warning: tool call "${tool}" failed the continuation match, but both `
-    + 'sides are identical once the filler-strip rule is applied. That rule has diverged between '
-    + 'the translation layer and the chain-head snapshot (a regression of #84). Prompt caching is '
-    + 'degraded for this turn — please report it at https://github.com/bman654/clodex/issues';
+    + "sides are identical once clodex's filler-strip rule is applied, so the head should have "
+    + 'matched. Prompt caching is degraded for this turn — please report it, with the adapter debug '
+    + 'log from --trace if you can, at https://github.com/bman654/clodex/issues';
   try { log?.(`tool argument normalization gap: ${signature}`); } catch { /* ignore */ }
   if (warnedToolArgumentGaps.has(signature)) return;
   if (warnedToolArgumentGaps.size >= MAX_TOOL_ARGUMENT_GAP_WARNINGS) return;
@@ -647,32 +646,31 @@ function continuationMismatchDetails(
   const actual = mismatch < full.length ? full[mismatch] : undefined;
   const reasoningGap = reasoningNormalizationGap(expected, actual);
   if (reasoningGap && warnOnGap) warnReasoningNormalizationGap(reasoningGap, log);
-  // Claude may legitimately omit stored reasoning items (continuationMatch's
-  // omitted_reasoning mode), which shifts the exact-prefix divergence onto a
-  // reasoning-vs-call pair and would hide a forked strip rule sitting on the
-  // very next call. Align the canary to the first non-reasoning stored item
-  // in that case; everything else still uses the exact divergence pair.
-  let gapExpected = expected;
-  if (conversationItemKind(expected) === 'reasoning' && conversationItemKind(actual) === 'function_call') {
-    for (let index = mismatch; index < prefix.length; index += 1) {
-      if (conversationItemKind(prefix[index]) !== 'reasoning') {
-        gapExpected = prefix[index];
-        break;
-      }
-    }
-  }
-  const toolArgumentGap = toolArgumentNormalizationGap(gapExpected, actual, payload, entry.requiredToolProps);
+  let toolArgumentGap: Record<string, unknown> | undefined;
+  // Detection is pure bookkeeping on top of a request that already succeeded, so
+  // it must not be able to reject one. No throw is reachable today; this is here
+  // so the next person editing the predicate cannot make one fatal.
+  try {
+    toolArgumentGap = toolArgumentNormalizationGap(
+      expected,
+      actual,
+      // The head's own schema when it has one; the current turn's tools are only a
+      // fallback for a head that predates the snapshot (see headRequiredToolProps).
+      () => entry.headRequiredToolProps ?? requiredToolProps(payload),
+    );
+  } catch { /* a diagnostic must never break a request */ }
   // Only the provably-ours case reaches stderr. `equalAfterStrip === false` means
   // the arguments differ for a reason the strip rule cannot explain, and a client
   // that genuinely re-sent a different value under the same call_id is
   // indistinguishable from a defect — warning there would cry wolf in a terminal
-  // shared with Claude Code's UI. Those are still recorded on the diagnostic.
-  // Attribution caveat: a client that ADDED filler to its echo would also
-  // strip-equal and be blamed on the rule. No known Claude Code path does
-  // that, so the message keeps the direct wording; if such a client appears,
-  // this is the assumption that broke.
-  if (toolArgumentGap?.equalAfterStrip === true && warnOnGap) {
-    warnToolArgumentNormalizationGap(toolArgumentGap, log);
+  // shared with Claude Code's UI. Those are still recorded on the diagnostic, and
+  // traced here so --trace alone shows a counted-but-not-warned gap.
+  if (toolArgumentGap?.equalAfterStrip === true) {
+    if (warnOnGap) warnToolArgumentNormalizationGap(toolArgumentGap, log);
+  } else if (toolArgumentGap && warnOnGap) {
+    // Same gating as the warner: only the head clodex gave up on is described,
+    // so the per-candidate loop cannot turn one mismatch into a trace stream.
+    try { log?.(`tool argument mismatch beyond the strip rule: ${String(toolArgumentGap.tool)}`); } catch { /* ignore */ }
   }
   return {
     fullItems: full.length,
@@ -1649,7 +1647,7 @@ function handleSocketMessage(entry: ConnectionEntry, data: RawData): void {
       entry.responseId = ctx.responseId;
       entry.requestInput = inputArray(ctx.originalPayload);
       entry.expectedAssistant = expectedAssistantItems(ctx);
-      entry.requiredToolProps = requiredToolProps(ctx.originalPayload);
+      entry.headRequiredToolProps = requiredToolProps(ctx.originalPayload);
       // The stored prefix just changed, so the memoized canonical form is stale.
       entry.canonicalPrefix = undefined;
       entry.canonicalEchoablePrefix = undefined;
@@ -1925,15 +1923,6 @@ export function createResponsesWebSocketFetch(
         `history mismatch starting an additional chain; retained ${candidates.length} existing head(s) `
         + `(${continuationMismatchSummary(diagnosticEntry, payload, debug, mismatchDump)})`,
       );
-      // No head matched, so clodex abandoned EVERY candidate this turn — a
-      // normalization gap on any of them is a give-up-shaped gap. Warning only
-      // for the most recently used head let a strip-rule regression on an
-      // older head go silent behind a newer head's ordinary mismatch. The
-      // dedup + hard cap in the warn helpers keep this from becoming a stream.
-      for (const candidate of candidates) {
-        if (candidate === diagnosticEntry || candidate.inFlight) continue;
-        continuationMismatchDetails(candidate, payload, debug, true);
-      }
       decision = 'history_mismatch_new_head';
     } else if (partitionKey) {
       decision = 'new_partition_head';
