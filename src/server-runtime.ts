@@ -35,6 +35,7 @@ import {
   writeFileSync,
 } from 'node:fs';
 import { dirname, join } from 'node:path';
+import type { BuiltinAliasName } from './types.js';
 import { getAppHome } from './paths.js';
 
 export interface ServerRuntimeState {
@@ -43,6 +44,13 @@ export interface ServerRuntimeState {
   pid: number;
   /** Proxy mode only: absolute path to the CA bundle a client must trust. */
   caPath?: string;
+  /**
+   * Proxy mode only: built-in alias remaps ALREADY validated against the
+   * route table this server loaded at startup. Wrappers must apply these —
+   * never current preferences — so a remap saved after the server started
+   * cannot inject a name the running server never loaded.
+   */
+  builtinModelOverrides?: Partial<Record<BuiltinAliasName, string>>;
   startedAt: string;
 }
 

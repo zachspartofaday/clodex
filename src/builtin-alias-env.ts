@@ -34,3 +34,31 @@ export function applyBuiltinModelOverrides(
     if (value !== undefined && String(value).trim() !== '') env[envName] = String(value).trim();
   }
 }
+
+/**
+ * Keep only remaps the CURRENT proxy route table can serve. A saved override
+ * can go stale after selection — its alias removed-then-readded with a
+ * conflict, its favorite dropped, or a profile restoring routing that no
+ * longer resolves — and injecting a non-routable name through
+ * ANTHROPIC_DEFAULT_*_MODEL turns every request for that built-in into the
+ * proxy's route-unavailable 400. Stale entries revert to the native default
+ * for the launch and are reported through `warn`.
+ */
+export function routableBuiltinOverrides(
+  overrides: Partial<Record<BuiltinAliasName, string>> | undefined,
+  routableNames: Iterable<string>,
+  warn?: (message: string) => void,
+): Partial<Record<BuiltinAliasName, string>> {
+  const routable = new Set<string>();
+  for (const name of routableNames) routable.add(name.trim().toLowerCase());
+  const out: Partial<Record<BuiltinAliasName, string>> = {};
+  for (const [alias, target] of Object.entries(overrides ?? {}) as Array<[BuiltinAliasName, string]>) {
+    const trimmed = typeof target === 'string' ? target.trim() : '';
+    if (trimmed && routable.has(trimmed.toLowerCase())) {
+      out[alias] = target;
+    } else if (trimmed) {
+      warn?.(`Built-in remap ${alias} → ${trimmed} is not routable by this proxy; ${alias} reverts to the native default for this launch.`);
+    }
+  }
+  return out;
+}
