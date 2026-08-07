@@ -25,11 +25,14 @@ import type { ParsedArgs, FavoriteModel, LocalProvider, LocalProviderModel } fro
 import { addFavorite, removeFavorite, isFavorite } from './favorites.js';
 import {
   canonicalModelAliasName,
+  isReservedModelAlias,
+  isModelAliasNameSyntax,
   modelAliasMatchesName,
   modelAliasMatchesStoredName,
   modelAliasTarget,
   parseModelAliasAssignment,
 } from './model-aliases.js';
+import type { ModelAlias } from './types.js';
 import {
   browseByProviderChoice,
   buildGlobalFavoriteIndex,
@@ -677,6 +680,110 @@ interface FavoritesCommandOptions {
   unalias?: string;
 }
 
+/**
+ * Interactive alias configurator inside `clodex models`: list saved aliases,
+ * re-point one at a different favorite, add, or remove — the picker
+ * equivalent of `clodex models --alias name=clodex:<provider>:<model>`.
+ * Aliases only resolve to saved favorites, so the target picker offers
+ * exactly the favorites list.
+ */
+async function runAliasConfigurator(
+  modelLookup: Map<string, { modelName: string; providerName: string }>,
+): Promise<void> {
+  const pickTarget = async (favorites: FavoriteModel[], message: string): Promise<FavoriteModel | null> => {
+    if (favorites.length === 0) {
+      p.log.warn('No favorites saved — add favorites first; aliases only route to favorited models.');
+      return null;
+    }
+    const choice = await p.select<string>({
+      message,
+      options: favorites.map((favorite, index) => {
+        const entry = modelLookup.get(`${favorite.providerId}:${favorite.modelId}`);
+        return {
+          value: `target-${index}`,
+          label: entry ? `${fmtModel(entry.modelName)} ${pc.dim(`(${entry.providerName})`)}` : String(favorite.modelId),
+          hint: `clodex:${favorite.providerId}:${favorite.modelId}`,
+        };
+      }),
+    });
+    if (p.isCancel(choice)) return null;
+    return favorites[Number(choice.slice('target-'.length))] ?? null;
+  };
+
+  while (true) {
+    const prefs = loadPreferences();
+    const aliases = Array.isArray(prefs.modelAliases) ? prefs.modelAliases : [];
+    const favorites = prefs.favoriteModels ?? [];
+    const options: Array<{ value: string; label: string; hint: string }> = aliases.map((alias, index) => {
+      const entry = modelLookup.get(`${alias.providerId}:${alias.modelId}`);
+      const target = entry
+        ? `${entry.modelName} ${pc.dim(`(${entry.providerName})`)}`
+        : pc.dim(`clodex:${String(alias.providerId)}:${String(alias.modelId)}`);
+      return {
+        value: `alias-${index}`,
+        label: `${pc.bold(alias.name)} → ${target}`,
+        hint: 'change target or remove',
+      };
+    });
+    options.push({ value: '__add__', label: pc.cyan('+ Add an alias'), hint: 'name a favorite for /model and agent frontmatter' });
+    options.push({ value: '__back__', label: 'Done', hint: '' });
+
+    const choice = await p.select<string>({
+      message: aliases.length === 0 ? 'Aliases (none saved)' : `Aliases (${aliases.length})`,
+      options,
+      initialValue: '__back__',
+    });
+    if (p.isCancel(choice) || choice === '__back__') return;
+
+    if (choice === '__add__') {
+      const rawName = await p.text({
+        message: 'Alias name (what /model and agent model: fields will use)',
+        placeholder: 'wjudge',
+        validate: value => {
+          const name = canonicalModelAliasName(String(value ?? ''));
+          if (!isModelAliasNameSyntax(name)) return 'Use 1-64 letters, numbers, dots, underscores, or hyphens.';
+          if (isReservedModelAlias(name)) return 'That name is reserved by the client.';
+          return undefined;
+        },
+      });
+      if (p.isCancel(rawName)) continue;
+      const name = canonicalModelAliasName(String(rawName));
+      const target = await pickTarget(favorites, `Route "${name}" to which favorite?`);
+      if (!target) continue;
+      const next: ModelAlias[] = aliases.filter(alias => !modelAliasMatchesName(alias, name));
+      next.push({ name, providerId: target.providerId, modelId: target.modelId });
+      savePreferences({ modelAliases: next });
+      p.log.success(`Saved alias ${name} → clodex:${target.providerId}:${target.modelId}.`);
+      continue;
+    }
+
+    const index = Number(choice.slice('alias-'.length));
+    const alias = aliases[index];
+    if (!alias) continue;
+    const action = await p.select<string>({
+      message: `${alias.name} → clodex:${String(alias.providerId)}:${String(alias.modelId)}`,
+      options: [
+        { value: 'retarget', label: 'Change target', hint: 'pick a different favorite' },
+        { value: 'remove', label: 'Remove alias', hint: '' },
+        { value: 'back', label: 'Cancel', hint: '' },
+      ],
+    });
+    if (p.isCancel(action) || action === 'back') continue;
+    if (action === 'remove') {
+      savePreferences({ modelAliases: aliases.filter((_, i) => i !== index) });
+      p.log.success(`Removed alias ${alias.name}.`);
+      continue;
+    }
+    const target = await pickTarget(favorites, `Route "${alias.name}" to which favorite?`);
+    if (!target) continue;
+    const next = aliases.map((entry, i) => i === index
+      ? { name: entry.name, providerId: target.providerId, modelId: target.modelId }
+      : entry);
+    savePreferences({ modelAliases: next });
+    p.log.success(`Saved alias ${alias.name} → clodex:${target.providerId}:${target.modelId}.`);
+  }
+}
+
 export async function runModelsCommand(opts: FavoritesCommandOptions = {}): Promise<number> {
   const changesAlias = opts.alias !== undefined || opts.unalias !== undefined;
   if (changesAlias && (opts.list || (opts.alias !== undefined && opts.unalias !== undefined))) {
@@ -801,6 +908,12 @@ export async function runModelsCommand(opts: FavoritesCommandOptions = {}): Prom
         ? 'Remove a favorite first to make room'
         : `${allProviders.length} provider${allProviders.length !== 1 ? 's' : ''} available`,
     });
+    const aliasCount = (loadPreferences().modelAliases ?? []).length;
+    options.push({
+      value: '__aliases__',
+      label: pc.cyan('⇢ Configure aliases'),
+      hint: aliasCount ? `${aliasCount} saved — name → model routing` : 'name → model routing for /model and agents',
+    });
     options.push({ value: '__done__', label: 'Done', hint: '' });
 
     const header = favorites.length === 0
@@ -814,6 +927,15 @@ export async function runModelsCommand(opts: FavoritesCommandOptions = {}): Prom
     });
 
     if (p.isCancel(choice) || choice === '__done__') break;
+
+    if (choice === '__aliases__') {
+      if (favoritesDirty) {
+        savePreferences({ favoriteModels: favorites });
+        favoritesDirty = false;
+      }
+      await runAliasConfigurator(modelLookup);
+      continue;
+    }
 
     if (choice === '__add__') {
       if (atCap) {
