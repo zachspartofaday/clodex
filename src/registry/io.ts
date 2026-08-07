@@ -17,7 +17,7 @@ import {
 import { dirname } from 'node:path';
 import { getAppHome, getProvidersPath } from '../paths.js';
 import type { ProviderRegistry, RegistryProvider } from './types.js';
-import { OAUTH_ACCOUNT_NAME_RE, REGISTRY_SCHEMA_VERSION } from './types.js';
+import { OAUTH_ACCOUNT_NAME_RE, REGISTRY_SCHEMA_VERSION, REGISTRY_SCHEMA_VERSION_WITH_ACCOUNT_SLOTS } from './types.js';
 import {
   assertRegistryWriteOwnership,
   withRegistryWriteLockSync,
@@ -222,7 +222,10 @@ function parseRegistryStrict(raw: unknown): ProviderRegistry {
     throw new Error('Provider registry must be a JSON object.');
   }
   const data = raw as Record<string, unknown>;
-  if (data.schemaVersion !== REGISTRY_SCHEMA_VERSION) {
+  if (
+    data.schemaVersion !== REGISTRY_SCHEMA_VERSION
+    && data.schemaVersion !== REGISTRY_SCHEMA_VERSION_WITH_ACCOUNT_SLOTS
+  ) {
     throw new Error('Provider registry has an unsupported schema version.');
   }
   if (!Array.isArray(data.providers)) {
@@ -281,7 +284,13 @@ export function loadRegistryStrict(path = getProvidersPath()): ProviderRegistry 
 
 export function saveRegistry(registry: ProviderRegistry, path = getProvidersPath()): void {
   assertRegistryWriteOwnership(path);
-  const payload = `${JSON.stringify(registry, null, 2)}\n`;
+  // Slot state fences older writers via the schema version (see types.ts);
+  // slot-free registries return to v1 so old builds interoperate again.
+  const hasSlots = registry.providers.some(
+    provider => provider.authAccounts && Object.keys(provider.authAccounts).length > 0,
+  );
+  const schemaVersion = hasSlots ? REGISTRY_SCHEMA_VERSION_WITH_ACCOUNT_SLOTS : REGISTRY_SCHEMA_VERSION;
+  const payload = `${JSON.stringify({ ...registry, schemaVersion }, null, 2)}\n`;
   const backup = `${path}.bak`;
   if (existsSync(path)) {
     try {
