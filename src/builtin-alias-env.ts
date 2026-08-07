@@ -76,23 +76,40 @@ export const WRAPPER_INJECTED_BUILTINS_ENV = 'CLODEX_INJECTED_BUILTINS';
  * current overrides applied with true user env winning, and the sentinel
  * rewritten to exactly what THIS launch injected.
  */
+function inheritedInjectedAliases(baseEnv: NodeJS.ProcessEnv): string[] {
+  return (baseEnv[WRAPPER_INJECTED_BUILTINS_ENV] ?? '').split(',').map(name => name.trim()).filter(Boolean);
+}
+
+/**
+ * Remove every remap a PREVIOUS launch injected (per the provenance
+ * sentinel), plus the sentinel itself. Every launch mode needs this — a
+ * stale injection surviving into a no-server launch goes straight to
+ * Anthropic as an unknown model id, and into an endpoint launch as a name
+ * its catalog may not expose. Only a proxy launch re-applies a snapshot
+ * afterwards.
+ */
+export function clearInheritedBuiltinOverrides(
+  env: NodeJS.ProcessEnv,
+  baseEnv: NodeJS.ProcessEnv,
+): void {
+  for (const alias of inheritedInjectedAliases(baseEnv)) {
+    const envName = BUILTIN_ALIAS_ENV[alias as BuiltinAliasName];
+    if (envName) delete env[envName];
+  }
+  delete env[WRAPPER_INJECTED_BUILTINS_ENV];
+}
+
 export function applyBuiltinModelOverridesWithProvenance(
   env: NodeJS.ProcessEnv,
   overrides: Partial<Record<BuiltinAliasName, string>> | undefined,
   baseEnv: NodeJS.ProcessEnv,
 ): void {
-  const inherited = new Set(
-    (baseEnv[WRAPPER_INJECTED_BUILTINS_ENV] ?? '').split(',').map(name => name.trim()).filter(Boolean),
-  );
   const explicit: NodeJS.ProcessEnv = { ...baseEnv };
-  for (const alias of inherited) {
+  for (const alias of inheritedInjectedAliases(baseEnv)) {
     const envName = BUILTIN_ALIAS_ENV[alias as BuiltinAliasName];
-    if (envName) {
-      delete explicit[envName];
-      // A stale injection not re-issued by this launch must not linger.
-      delete env[envName];
-    }
+    if (envName) delete explicit[envName];
   }
+  clearInheritedBuiltinOverrides(env, baseEnv);
   applyBuiltinModelOverrides(env, overrides, explicit);
   const injected = (Object.entries(BUILTIN_ALIAS_ENV) as Array<[BuiltinAliasName, string]>)
     .filter(([alias, envName]) => explicit[envName] === undefined && env[envName] !== undefined
