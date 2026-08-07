@@ -353,6 +353,12 @@ async function handleAnthropicMessages(
       extraHeaders: model.headers,
       refreshToken,
       onTokenRefreshed: refreshed => { model.apiKey = refreshed; },
+      // Echo the exact requested id when it differs from the upstream id, so
+      // clients that key context windows on the response model still resolve.
+      responseModelOverride:
+        typeof body.model === 'string' && body.model !== upstreamModelId(model)
+          ? body.model
+          : undefined,
       onUpstreamError: options.inferenceLogPath
         ? (statusCode, errorContent) => writeInferenceResponseErrorLog(options.inferenceLogPath!, {
             requestId,

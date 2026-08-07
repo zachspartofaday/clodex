@@ -534,6 +534,13 @@ export async function startProxyCatalog(
             refreshToken: route.refreshToken,
             onTokenRefreshed: refreshed => { route.apiKey = refreshed; },
             signal: clientAbort.signal,
+            // A route selected through a clodex: id or short alias must echo the
+            // exact requested id back, or patched Claude Code misses the alias
+            // context-window key and can skip auto-compaction.
+            responseModelOverride:
+              typeof originalModel === 'string' && originalModel !== route.realModelId
+                ? originalModel
+                : undefined,
             onUpstreamError: inferenceLogPath
               ? (statusCode, errorContent) => writeInferenceResponseErrorLog(inferenceLogPath, {
                   modelId: originalModel,
