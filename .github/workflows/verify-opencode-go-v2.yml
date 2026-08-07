@@ -1,0 +1,109 @@
+name: Verify OpenCode Go provider final
+
+on:
+  push:
+    branches:
+      - agent/opencode-go-provider
+
+permissions:
+  contents: write
+  pull-requests: write
+
+jobs:
+  verify:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '24'
+      - run: corepack enable
+      - name: Preserve or recover provider layer
+        shell: bash
+        run: |
+          python <<'PY'
+          from pathlib import Path
+          import shutil
+          import textwrap
+
+          files = [
+              'src/data/opencode-go-models.json',
+              'src/data/opencode-go-models.ts',
+              'scripts/update-opencode-go-models.mjs',
+              'tests/opencode-go-provider.test.ts',
+              'src/provider-templates.ts',
+              'package.json',
+              'README.md',
+          ]
+          snapshot = Path('/tmp/opencode-layer')
+          snapshot.mkdir(parents=True, exist_ok=True)
+          if Path('src/data/opencode-go-models.json').exists():
+              for relative in files:
+                  source = Path(relative)
+                  if not source.exists():
+                      raise RuntimeError(f'missing provider-layer file: {relative}')
+                  target = snapshot / relative
+                  target.parent.mkdir(parents=True, exist_ok=True)
+                  shutil.copy2(source, target)
+              Path('/tmp/opencode-mode').write_text('snapshot')
+          else:
+              workflow = Path('.github/workflows/implement-opencode-go.yml')
+              if not workflow.exists():
+                  raise RuntimeError('OpenCode Go implementation and recovery source are unavailable')
+              source = workflow.read_text()
+              marker = "          python <<'PY'\n"
+              start = source.index(marker) + len(marker)
+              end = source.index("\n          PY\n", start)
+              Path('/tmp/opencode-impl.py').write_text(textwrap.dedent(source[start:end]))
+              Path('/tmp/opencode-mode').write_text('script')
+          PY
+      - name: Rebuild on the final infrastructure head
+        shell: bash
+        run: |
+          git fetch origin agent/mixed-provider-runtime
+          git reset --hard origin/agent/mixed-provider-runtime
+          if [ "$(cat /tmp/opencode-mode)" = snapshot ]; then
+            cp -a /tmp/opencode-layer/. .
+          else
+            python /tmp/opencode-impl.py
+          fi
+      - name: Verify provider and stack contract
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: bash
+        run: |
+          test -f src/model-profile.ts
+          test -f src/data/opencode-go-models.json
+          test -f scripts/update-opencode-go-models.mjs
+          test "$(node -e "const m=require('./src/data/opencode-go-models.json'); process.stdout.write(String(m.length))")" = "17"
+          test "$(node -e "const m=require('./src/data/opencode-go-models.json'); process.stdout.write(String(m.filter(x=>x.modelFormat==='anthropic').length))")" = "4"
+          test "$(node -e "const m=require('./src/data/opencode-go-models.json'); process.stdout.write(String(m.filter(x=>x.modelFormat==='openai').length))")" = "13"
+          ! grep -q '"id": "grok-4.5"' src/data/opencode-go-models.json
+          test "$(gh pr view agent/mixed-provider-runtime --repo "$GITHUB_REPOSITORY" --json baseRefName --jq .baseRefName)" = main
+          test "$(gh pr view agent/opencode-go-provider --repo "$GITHUB_REPOSITORY" --json baseRefName --jq .baseRefName)" = agent/mixed-provider-runtime
+      - run: pnpm install --frozen-lockfile
+      - run: pnpm typecheck
+      - run: pnpm test
+      - run: pnpm build
+      - name: Publish one clean verified provider commit
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: bash
+        run: |
+          rm -f .github/workflows/implement-opencode-go.yml
+          rm -f .github/workflows/finalize-opencode-go.yml
+          rm -f .github/workflows/restack-opencode-go.yml
+          rm -f .github/workflows/verify-opencode-go-stack.yml
+          rm -f .github/workflows/verify-opencode-go-v2.yml
+          git config user.name github-actions[bot]
+          git config user.email 41898282+github-actions[bot]@users.noreply.github.com
+          git reset --soft origin/agent/mixed-provider-runtime
+          git add -A
+          git diff --cached --check
+          git commit -m "feat: add OpenCode Go provider"
+          git push --force origin HEAD:agent/opencode-go-provider
+          gh pr edit agent/opencode-go-provider --repo "$GITHUB_REPOSITORY" --base agent/mixed-provider-runtime
+          git tag -f opencode-go-stack-verified HEAD
+          git push --force origin refs/tags/opencode-go-stack-verified
