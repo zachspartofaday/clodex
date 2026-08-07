@@ -2340,6 +2340,24 @@ describe('createResponsesWebSocketFetch', () => {
       .toMatchObject({ toolArgumentNormalizationGap: { equalAfterStrip: false } });
   });
 
+  it('does not blame the rule when filler AND another field both differ', async () => {
+    const { stderr, diagnostics } = await runToolArgumentMismatch({
+      accountId: 'acct-tool-gap-mixed',
+      responseId: 'resp_tool_mixed',
+      // Arguments differ only by strippable filler, but the echo also carries
+      // an extension field — stripping cannot make the whole calls equal, so
+      // a rule-forked stderr warning would be a false attribution.
+      storedArguments: '{"pattern":"x","glob":null}',
+      echoedArguments: '{"pattern":"x"}',
+      echoedExtra: { metadata: 'client-extension' },
+    });
+
+    expect(stderr.join('')).toBe('');
+    const decision = diagnostics.filter(event => event.event === 'ws_head_decision').at(-1)!;
+    expect((decision.heads as { mismatch: Record<string, unknown> }[])[0]!.mismatch)
+      .toMatchObject({ toolArgumentNormalizationGap: { tool: 'Grep', equalAfterStrip: false } });
+  });
+
   it('classifies a non-argument field difference as an ordinary mismatch', async () => {
     const { stderr, diagnostics } = await runToolArgumentMismatch({
       accountId: 'acct-tool-gap-otherfield',
