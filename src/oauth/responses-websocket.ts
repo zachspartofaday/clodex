@@ -13,6 +13,7 @@ import type { RawData, WebSocket as WsWebSocket } from 'ws';
 import { CODEX_RESPONSES_WEBSOCKETS_BETA } from '../constants.js';
 import { outboundWsProxyAgent } from '../outbound-proxy.js';
 import { anthropicErrorType, clampRetryAfterSeconds } from '../upstream-error.js';
+import { sanitizeToolInput } from '../tool-input-sanitize.js';
 
 const RESPONSES_LITE_HEADER = 'x-openai-internal-codex-responses-lite';
 const TERMINAL_EVENT_TYPES = new Set(['response.completed', 'response.failed', 'response.incomplete']);
@@ -114,6 +115,13 @@ interface ConnectionEntry {
   responseId?: string;
   requestInput?: unknown[];
   expectedAssistant?: unknown[];
+  /**
+   * Per-tool required sets from the request that created this head. The
+   * echoed call was sanitized under THIS schema, so the canary must compare
+   * with it — a tool whose schema changed on a later turn would otherwise
+   * mis-classify a genuine strip-rule fork.
+   */
+  requiredToolProps?: Map<string, Set<string>>;
   /** Memoized canonical form of the stored prefix; cleared whenever it changes. */
   canonicalPrefix?: string[];
   canonicalEchoablePrefix?: string[];
@@ -501,6 +509,121 @@ export function resetReasoningGapWarningsForTests(): void {
   warnedReasoningGaps.clear();
 }
 
+/**
+ * Detects a `function_call` that diverged for a reason that can only be ours.
+ *
+ * `call_id` is the tool call's identity. Claude Code echoes back the call it was
+ * handed, so when both sides are a `function_call` carrying the SAME `call_id`
+ * and `name` yet different `arguments`, the two objects describe the same call
+ * and the continuation should have been accepted — the remaining difference is a
+ * normalization gap on our side. A genuine rewind or branch regenerates the call
+ * and produces a NEW `call_id`, so those never reach here and the signal stays
+ * clean.
+ *
+ * `equalAfterStrip` separates the two mechanisms. When applying the shared
+ * filler-strip rule to both sides makes them equal, the rule has forked between
+ * the translation layer and the chain-head snapshot — that is #84 returning, and
+ * it is the case worth shouting about. When they still differ, the arguments took
+ * a shape `sanitizedCallArguments` deliberately passes through untouched (a
+ * scalar, an array, or malformed JSON), which is worth counting but is not a
+ * regression.
+ */
+function toolArgumentNormalizationGap(
+  expected: unknown,
+  actual: unknown,
+  payload: JsonObject,
+  headRequiredProps?: Map<string, Set<string>>,
+): Record<string, unknown> | undefined {
+  if (conversationItemKind(expected) !== 'function_call') return undefined;
+  if (conversationItemKind(actual) !== 'function_call') return undefined;
+  const left = expected as JsonObject;
+  const right = actual as JsonObject;
+  const callId = left.call_id;
+  if (typeof callId !== 'string' || !callId || callId !== right.call_id) return undefined;
+  if (typeof left.name !== 'string' || left.name !== right.name) return undefined;
+  // Same call, same tool, different bytes. Compare NORMALIZED arguments so the
+  // canonical-JSON reconciliation this file already applies is not re-reported.
+  if (canonicalJson(normalizeToolCallJson(left)) === canonicalJson(normalizeToolCallJson(right))) {
+    return undefined;
+  }
+  // Only ARGUMENT differences are this canary's subject. Two calls that agree
+  // on normalized arguments but differ in some other field would strip-equal
+  // below and emit a misleading #84 warning about a rule that agrees on both
+  // sides — classify those as ordinary mismatches instead.
+  const normalizedArguments = (item: JsonObject): unknown =>
+    (normalizeToolCallJson(item) as JsonObject).arguments;
+  if (canonicalJson(normalizedArguments(left)) === canonicalJson(normalizedArguments(right))) {
+    return undefined;
+  }
+  // The head's schema is authoritative: the echo was sanitized under it.
+  const required = (headRequiredProps ?? requiredToolProps(payload)).get(left.name);
+  // Deliberately re-derives the parse/blank-string semantics instead of
+  // calling sanitizedCallArguments: a canary that shares code with the path
+  // it monitors goes blind to forks in that shared wrapper. Do not
+  // "deduplicate" this into the snapshot helper.
+  const stripped = (item: JsonObject): string | undefined => {
+    if (typeof item.arguments !== 'string') return undefined;
+    const raw = item.arguments.trim();
+    try {
+      const parsed: unknown = raw === '' ? {} : JSON.parse(raw);
+      if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) return undefined;
+      return canonicalJson(sanitizeToolInput(parsed as Record<string, unknown>, required));
+    } catch { return undefined; }
+  };
+  const leftStripped = stripped(left);
+  const rightStripped = stripped(right);
+  // The rule-forked verdict requires the WHOLE calls to agree once the
+  // stripped arguments are substituted back: arguments differing only by
+  // filler while some other field also differs is a mismatch stripping
+  // cannot repair, and blaming the rule for it would be false.
+  const wholeAfterStrip = (item: JsonObject, args: string): string =>
+    canonicalJson(normalizeToolCallJson({ ...item, arguments: args }));
+  return {
+    tool: left.name,
+    equalAfterStrip: leftStripped !== undefined && rightStripped !== undefined
+      && leftStripped === rightStripped
+      && wholeAfterStrip(left, leftStripped) === wholeAfterStrip(right, rightStripped),
+  };
+}
+
+const warnedToolArgumentGaps = new Set<string>();
+const MAX_TOOL_ARGUMENT_GAP_WARNINGS = 3;
+
+/**
+ * Surfaces a forked filler-strip rule on stderr, for the same reason the
+ * reasoning one does: without it this failure is invisible without `--trace` or
+ * `--ws-diagnostics`, and it presents only as a quietly larger prompt. #84 cost
+ * real tokens for weeks and was found by mining 11k ledger records, not by anyone
+ * noticing. Same dedup + hard cap, because this shares a terminal with Claude
+ * Code's interactive UI and must never become a stream.
+ */
+function warnToolArgumentNormalizationGap(
+  gap: Record<string, unknown>,
+  log?: (message: string) => void,
+): void {
+  const tool = typeof gap.tool === 'string' ? gap.tool : 'unknown';
+  const signature = `${tool}:filler`;
+  const message = `clodex: warning: tool call "${tool}" failed the continuation match, but both `
+    + 'sides are identical once the filler-strip rule is applied. That rule has diverged between '
+    + 'the translation layer and the chain-head snapshot (a regression of #84). Prompt caching is '
+    + 'degraded for this turn — please report it at https://github.com/bman654/clodex/issues';
+  try { log?.(`tool argument normalization gap: ${signature}`); } catch { /* ignore */ }
+  if (warnedToolArgumentGaps.has(signature)) return;
+  if (warnedToolArgumentGaps.size >= MAX_TOOL_ARGUMENT_GAP_WARNINGS) return;
+  warnedToolArgumentGaps.add(signature);
+  try {
+    process.stderr.write(`${message}\n`);
+    if (warnedToolArgumentGaps.size === MAX_TOOL_ARGUMENT_GAP_WARNINGS) {
+      process.stderr.write('clodex: warning: further tool-argument normalization warnings suppressed.\n');
+    }
+  } catch { /* a warning must never break a request */ }
+}
+
+/** Test seam: the warning cap is process-wide and would leak between cases. */
+export function resetToolArgumentGapWarningsForTests(): void {
+  warnedToolArgumentGaps.clear();
+}
+
 function continuationMismatchDetails(
   entry: ConnectionEntry,
   payload: JsonObject,
@@ -524,6 +647,33 @@ function continuationMismatchDetails(
   const actual = mismatch < full.length ? full[mismatch] : undefined;
   const reasoningGap = reasoningNormalizationGap(expected, actual);
   if (reasoningGap && warnOnGap) warnReasoningNormalizationGap(reasoningGap, log);
+  // Claude may legitimately omit stored reasoning items (continuationMatch's
+  // omitted_reasoning mode), which shifts the exact-prefix divergence onto a
+  // reasoning-vs-call pair and would hide a forked strip rule sitting on the
+  // very next call. Align the canary to the first non-reasoning stored item
+  // in that case; everything else still uses the exact divergence pair.
+  let gapExpected = expected;
+  if (conversationItemKind(expected) === 'reasoning' && conversationItemKind(actual) === 'function_call') {
+    for (let index = mismatch; index < prefix.length; index += 1) {
+      if (conversationItemKind(prefix[index]) !== 'reasoning') {
+        gapExpected = prefix[index];
+        break;
+      }
+    }
+  }
+  const toolArgumentGap = toolArgumentNormalizationGap(gapExpected, actual, payload, entry.requiredToolProps);
+  // Only the provably-ours case reaches stderr. `equalAfterStrip === false` means
+  // the arguments differ for a reason the strip rule cannot explain, and a client
+  // that genuinely re-sent a different value under the same call_id is
+  // indistinguishable from a defect — warning there would cry wolf in a terminal
+  // shared with Claude Code's UI. Those are still recorded on the diagnostic.
+  // Attribution caveat: a client that ADDED filler to its echo would also
+  // strip-equal and be blamed on the rule. No known Claude Code path does
+  // that, so the message keeps the direct wording; if such a client appears,
+  // this is the assumption that broke.
+  if (toolArgumentGap?.equalAfterStrip === true && warnOnGap) {
+    warnToolArgumentNormalizationGap(toolArgumentGap, log);
+  }
   return {
     fullItems: full.length,
     expectedPrefixItems: prefix.length,
@@ -540,6 +690,7 @@ function continuationMismatchDetails(
           ),
         }
       : {}),
+    ...(toolArgumentGap ? { toolArgumentNormalizationGap: toolArgumentGap } : {}),
   };
 }
 
@@ -547,10 +698,38 @@ function continuationMismatchSummary(
   entry: ConnectionEntry,
   payload: JsonObject,
   log?: (message: string) => void,
+  mismatchDump = false,
 ): string {
   const details = continuationMismatchDetails(entry, payload, log, true);
-  return `full_items=${details.fullItems} expected_prefix_items=${details.expectedPrefixItems} `
+  let summary = `full_items=${details.fullItems} expected_prefix_items=${details.expectedPrefixItems} `
     + `first_mismatch=${details.firstMismatch} expected=${details.expectedKind} actual=${details.actualKind}`;
+  // The hashes make same-kind mismatches diagnosable from the log alone. With
+  // CLODEX_MISMATCH_DUMP=1 the canonical bytes of both divergent items land in
+  // the adapter debug log too. That file is written through the redacting
+  // trace logger at mode 0600 and is never re-printed to the terminal
+  // (`printTraceLog` reads the separate Claude Code debug log); the CLAUDE.md
+  // entry for the variable carries the privacy tradeoff.
+  if (details.expectedHash || details.actualHash) {
+    summary += ` expected_hash=${details.expectedHash ?? 'none'} actual_hash=${details.actualHash ?? 'none'}`;
+    if (mismatchDump && log) {
+      const full = inputArray(payload);
+      const prefix = [...(entry.requestInput ?? []), ...(entry.expectedAssistant ?? [])];
+      const index = details.firstMismatch as number;
+      log(`mismatch dump expected[${index}]: ${mismatchDumpLine(prefix, index)}`);
+      log(`mismatch dump actual[${index}]: ${mismatchDumpLine(full, index)}`);
+    }
+  }
+  return summary;
+}
+
+/** One side of a mismatch dump: canonical item bytes, capped, or `(absent)`
+ * when the divergence is one history simply ending before the other. */
+function mismatchDumpLine(items: unknown[], index: number): string {
+  if (index >= items.length) return '(absent)';
+  const line = canonicalJson(normalizeToolCallJson(items[index]));
+  const max = 2_000;
+  const marker = ' [truncated]';
+  return line.length <= max ? line : line.slice(0, max - marker.length) + marker;
 }
 
 /**
@@ -986,8 +1165,64 @@ function withoutEphemeralFields(item: JsonObject): JsonObject {
   return out;
 }
 
+/**
+ * Per-tool `required` property sets, read from the request's own `tools`
+ * array. The Responses provider passes each function tool's JSON schema
+ * through as `parameters` unmodified, so these are the same `required` sets
+ * the Anthropic translation layer consults when it sanitizes tool input on
+ * the way to the client (the shared `sanitizeToolInput` in tool-input-sanitize.ts).
+ */
+function requiredToolProps(payload: JsonObject): Map<string, Set<string>> {
+  const map = new Map<string, Set<string>>();
+  const add = (tool: unknown): void => {
+    if (!tool || typeof tool !== 'object') return;
+    const record = tool as JsonObject;
+    if (record.type === 'namespace' && Array.isArray(record.tools)) {
+      for (const nested of record.tools) add(nested);
+      return;
+    }
+    if (record.type !== 'function' || typeof record.name !== 'string') return;
+    const parameters = record.parameters;
+    const required = parameters && typeof parameters === 'object'
+      && Array.isArray((parameters as JsonObject).required)
+      ? (parameters as JsonObject).required as unknown[] : [];
+    map.set(record.name, new Set(required.filter((p): p is string => typeof p === 'string')));
+  };
+  if (Array.isArray(payload.tools)) for (const tool of payload.tools) add(tool);
+  return map;
+}
+
+/**
+ * The client never sees the raw upstream `arguments` string: the translation
+ * layer strips `null`-valued keys and non-required empty arrays from tool
+ * input before it reaches the client, and the client echoes that sanitized
+ * object back. A head that snapshots the raw upstream string can therefore
+ * never match its own echo, and the chain is lost on the next turn (#84).
+ * Snapshot the arguments in the same downstream shape instead, using the
+ * same shared strip rule the translation layer applies
+ * (`sanitizeToolInput` in tool-input-sanitize.ts). Compare-only: the payload
+ * actually sent upstream is untouched.
+ */
+function sanitizedCallArguments(item: JsonObject, requiredProps: Map<string, Set<string>>): JsonObject {
+  if (typeof item.arguments !== 'string') return item;
+  // The client-side SDK parses a blank arguments string as `{}` before the
+  // client ever sees it, so a zero-argument tool call is echoed back as
+  // `"{}"`. Mirror that here, or the raw-`""` snapshot loses the chain with
+  // the same tail-index signature as #84.
+  const raw = item.arguments.trim();
+  let parsed: unknown;
+  try { parsed = raw === '' ? {} : JSON.parse(raw); } catch { return item; }
+  if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) return item;
+  const required = requiredProps.get(typeof item.name === 'string' ? item.name : '');
+  return {
+    ...item,
+    arguments: JSON.stringify(sanitizeToolInput(parsed as Record<string, unknown>, required)),
+  };
+}
+
 function expectedAssistantItems(ctx: RequestContext): unknown[] {
   const output: unknown[] = [];
+  const requiredProps = requiredToolProps(ctx.originalPayload);
   for (const [, accumulator] of [...ctx.outputByIndex.entries()].sort(([left], [right]) => left - right)) {
       const done = accumulator.done ?? {};
       const type = accumulator.type ?? (typeof done.type === 'string' ? done.type : undefined);
@@ -1008,7 +1243,11 @@ function expectedAssistantItems(ctx: RequestContext): unknown[] {
         output.push({ ...withoutEphemeralFields(done), type: 'reasoning', summary });
         continue;
       }
-      if (type === 'function_call' || type === 'custom_tool_call') {
+      if (type === 'function_call') {
+        output.push({ ...sanitizedCallArguments(withoutEphemeralFields(done), requiredProps), type });
+        continue;
+      }
+      if (type === 'custom_tool_call') {
         output.push({ ...withoutEphemeralFields(done), type });
       }
   }
@@ -1410,6 +1649,7 @@ function handleSocketMessage(entry: ConnectionEntry, data: RawData): void {
       entry.responseId = ctx.responseId;
       entry.requestInput = inputArray(ctx.originalPayload);
       entry.expectedAssistant = expectedAssistantItems(ctx);
+      entry.requiredToolProps = requiredToolProps(ctx.originalPayload);
       // The stored prefix just changed, so the memoized canonical form is stale.
       entry.canonicalPrefix = undefined;
       entry.canonicalEchoablePrefix = undefined;
@@ -1576,6 +1816,9 @@ export function createResponsesWebSocketFetch(
   options: ResponsesWebSocketFetchOptions = {},
 ): FetchFunction {
   const debug = (message: string) => { try { log?.(`ws: ${message}`); } catch { /* ignore */ } };
+  // Resolved once per transport, like the connection caps: the dump is a
+  // diagnostic opt-in, not something to re-read per request.
+  const mismatchDump = process.env.CLODEX_MISMATCH_DUMP === '1';
   const resolvedOptions = {
     hardTtlMs: options.hardTtlMs ?? RESPONSES_WS_HARD_TTL_MS,
     idleTtlMs: options.idleTtlMs ?? RESPONSES_WS_IDLE_TTL_MS,
@@ -1680,8 +1923,17 @@ export function createResponsesWebSocketFetch(
       // head. Existing heads remain eligible for later exact-prefix matches.
       debug(
         `history mismatch starting an additional chain; retained ${candidates.length} existing head(s) `
-        + `(${continuationMismatchSummary(diagnosticEntry, payload, debug)})`,
+        + `(${continuationMismatchSummary(diagnosticEntry, payload, debug, mismatchDump)})`,
       );
+      // No head matched, so clodex abandoned EVERY candidate this turn — a
+      // normalization gap on any of them is a give-up-shaped gap. Warning only
+      // for the most recently used head let a strip-rule regression on an
+      // older head go silent behind a newer head's ordinary mismatch. The
+      // dedup + hard cap in the warn helpers keep this from becoming a stream.
+      for (const candidate of candidates) {
+        if (candidate === diagnosticEntry || candidate.inFlight) continue;
+        continuationMismatchDetails(candidate, payload, debug, true);
+      }
       decision = 'history_mismatch_new_head';
     } else if (partitionKey) {
       decision = 'new_partition_head';

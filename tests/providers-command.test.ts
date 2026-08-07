@@ -101,6 +101,12 @@ describe('parseProvidersArgs', () => {
   it('parses add, list, remove, refresh-models, auth', () => {
     expect(parseProvidersArgs(['add'])).toEqual({ subcommand: 'add', showHelp: false });
     expect(parseProvidersArgs(['list'])).toEqual({ subcommand: 'list', showHelp: false });
+    expect(parseProvidersArgs(['auth', 'openai', '--account', 'work'])).toEqual({
+      subcommand: 'auth', showHelp: false, removeId: 'openai', authMethod: undefined, authAccount: 'work',
+    });
+    expect(parseProvidersArgs(['auth', 'openai', '--account'])).toMatchObject({
+      subcommand: 'auth', error: expect.stringContaining('--account <name>'),
+    });
     expect(parseProvidersArgs(['remove', 'openai'])).toEqual({
       subcommand: 'remove',
       showHelp: false,
@@ -517,13 +523,13 @@ describe('providers add menu', () => {
     vi.restoreAllMocks();
   });
 
-  it('offers ChatGPT OAuth followed by OpenAI and OpenCode Go API keys', async () => {
+  it('offers ChatGPT OAuth followed by the API-key templates in name order', async () => {
     selectMock.mockResolvedValue('noop');
 
     await runProvidersAdd();
 
     const options = selectMock.mock.calls[0]?.[0].options.map((option: { value: string }) => option.value);
-    expect(options).toEqual(['oauth', 'api:openai', 'api:opencode-go']);
+    expect(options).toEqual(['oauth', 'api:meta-ai', 'api:openai', 'api:opencode-go']);
   });
 
   it('adds OpenCode Go through the shared API-key flow', async () => {

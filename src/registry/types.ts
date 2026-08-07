@@ -5,6 +5,25 @@ import type { ModelRuntimeCompatibility } from '../model-runtime-compatibility.j
 
 export const REGISTRY_SCHEMA_VERSION = 1;
 
+/**
+ * Written whenever any provider carries named OAuth account slots. Older
+ * builds fail closed on an unknown schema version in every MUTATING path
+ * (parseRegistryStrict throws), so a downgraded or second installation
+ * cannot load a slot-bearing registry, drop the unknown field, and save the
+ * providers back slot-less — which would orphan the slot credentials. A
+ * registry whose last slot is removed is written back at version 1, so
+ * old builds interoperate again the moment no slot state exists.
+ */
+export const REGISTRY_SCHEMA_VERSION_WITH_ACCOUNT_SLOTS = 2;
+
+/**
+ * Shape rule for a named OAuth account-slot name — the single home. Slot
+ * names land in credential-store scopes and env values, and the registry
+ * parser must accept exactly what `validateOAuthAccountName` admits, or a
+ * saved slot fails to survive a load.
+ */
+export const OAUTH_ACCOUNT_NAME_RE = /^[a-z0-9][a-z0-9_-]{0,31}$/;
+
 export type RegistrySubscriptionFilter = 'free';
 
 export interface CachedModel {
@@ -46,6 +65,13 @@ export interface RegistryProvider {
   enabled: boolean;
   authRef: string;
   authType?: 'api' | 'oauth' | 'none';
+  /**
+   * Named OAuth account slots beyond the default credential
+   * (`clodex providers auth openai --account <name>`). Each slot owns a
+   * disjoint credential-store lineage; CLODEX_OAUTH_ACCOUNT selects one at
+   * launch without touching the default `authRef`.
+   */
+  authAccounts?: Record<string, { authRef: string; addedAt: string; oauthAccountId?: string }>;
   subscriptionFilter?: RegistrySubscriptionFilter;
   /** Keep provider/curated costs instead of replacing them with the global pricing cache. */
   preserveModelPricing?: boolean;

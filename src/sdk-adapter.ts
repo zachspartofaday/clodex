@@ -18,6 +18,7 @@ import {
   type ReasoningMetadata,
 } from './provider-factory.js';
 import { resolveUpstreamTools } from './tool-search.js';
+import { sanitizeToolInput } from './tool-input-sanitize.js';
 import type { AnthropicRequestMessage, AnthropicToolDefinition } from './proxy-types.js';
 import { anthropicErrorType, upstreamHttpStatus } from './upstream-error.js';
 import { CLAUDE_CODE_BILLING_HEADER_PREFIX } from './oauth/claude-identity.js';
@@ -404,28 +405,6 @@ export function translateMessages(
   return out;
 }
 
-/**
- * Strip filler values GPT-family models emit for optional params instead of
- * omitting them: top-level `null` always, and empty arrays for properties the
- * tool's schema does not require. Claude Code forwards some tool inputs
- * verbatim into server-side API calls (e.g. WebSearch domain lists become the
- * `web_search` tool config, where an empty list is a 400), so filler must be
- * removed here. Required properties keep their empty arrays — there an empty
- * array is an intentional value (e.g. TodoWrite's `todos: []` clears the list).
- */
-function sanitizeToolInput(
-  input: Record<string, unknown>,
-  requiredProps?: ReadonlySet<string>,
-): Record<string, unknown> {
-  const out: Record<string, unknown> = {};
-  for (const [k, v] of Object.entries(input)) {
-    if (v === null) continue;
-    if (Array.isArray(v) && v.length === 0 && !requiredProps?.has(k)) continue;
-    out[k] = v;
-  }
-  return out;
-}
-
 /** Per-tool `required` property sets, read back out of the translated tool schemas. */
 function toolRequiredProps(tools?: SdkCallParams['tools']): Map<string, ReadonlySet<string>> {
   const map = new Map<string, ReadonlySet<string>>();
@@ -563,6 +542,55 @@ export function translateRequest(
   };
 }
 
+
+/**
+ * Upstream retry budget for AI SDK calls. The SDK default (maxRetries=2) is
+ * far too small for concurrent-subagent workloads, where a burst of upstream
+ * 429s outlasts two bounded backoffs, surfaces as AI_RetryError, and then
+ * exhausts the downstream client's own retry budget too — a transient rate
+ * limit becomes a dead agent. `CLODEX_UPSTREAM_MAX_RETRIES` follows the
+ * `CLODEX_WS_MAX_*` knob conventions; absence of the variable preserves the
+ * SDK default exactly.
+ *
+ * The configured budget is HONORED, not clamped. A retry-count ceiling can
+ * only be derived from an assumed backoff schedule, and the schedule is not
+ * fixed: a provider retry-after / retry-after-ms header drives the SDK's
+ * backoff directly, so a short header packs many attempts inside even the
+ * 120s stream idle window while the default 2s-doubling schedule exhausts it
+ * by the 7th attempt. Discarding operator-requested retries on a schedule
+ * guess silently converts an explicit configuration into a smaller one. The
+ * deadlines still bound worst-case wall clock — the idle timer on the
+ * streaming paths and the 10-minute total timer everywhere — so an
+ * over-generous budget costs a stall, never an unbounded hang. Values above
+ * 5 get a one-time advisory warning about that trade; malformed values warn
+ * once and keep the SDK default.
+ */
+const UPSTREAM_MAX_RETRIES_ADVISORY = 5;
+let warnedUpstreamMaxRetries = false;
+export function upstreamMaxRetries(log?: (message: string) => void): number | undefined {
+  const raw = process.env.CLODEX_UPSTREAM_MAX_RETRIES;
+  if (raw === undefined || raw.trim() === '') return undefined;
+  const value = Number(raw.trim());
+  const warnOnce = (message: string): void => {
+    if (warnedUpstreamMaxRetries) return;
+    warnedUpstreamMaxRetries = true;
+    console.error(`clodex: ${message}`);
+    try { log?.(message); } catch { /* ignore */ }
+  };
+  if (!Number.isInteger(value) || value < 0) {
+    warnOnce(`ignoring CLODEX_UPSTREAM_MAX_RETRIES=${raw} (expected a non-negative integer)`);
+    return undefined;
+  }
+  if (value > UPSTREAM_MAX_RETRIES_ADVISORY) {
+    warnOnce(`CLODEX_UPSTREAM_MAX_RETRIES=${raw} is honored, but under default exponential backoff attempts past ~5 can be cut off by the 120s stream idle timer or the 10-minute request timeout and end as timeout errors instead of an actionable 429; short provider retry-after headers make more attempts fit.`);
+  }
+  return value;
+}
+
+export function resetUpstreamMaxRetriesWarningForTests(): void {
+  warnedUpstreamMaxRetries = false;
+}
+
 // ── usage: SDK → Anthropic ────────────────────────────────────────────────────
 interface SdkUsage {
   inputTokens?: number;
@@ -613,7 +641,7 @@ export interface AnthropicStreamObserver {
 }
 
 const SDK_STREAM_IDLE_TIMEOUT_MS = 120_000;
-const SDK_TOTAL_TIMEOUT_MS = 10 * 60_000;
+export const SDK_TOTAL_TIMEOUT_MS = 10 * 60_000;
 
 function streamAbortError(signal?: AbortSignal): Error {
   if (signal?.reason instanceof Error) return signal.reason;
@@ -877,6 +905,7 @@ export async function streamAnthropicResponse(
   const result = streamText({
     model,
     ...params,
+    ...(upstreamMaxRetries() !== undefined ? { maxRetries: upstreamMaxRetries() } : {}),
     abortSignal,
     onError: () => {},
   } as Parameters<typeof streamText>[0]);
@@ -946,6 +975,7 @@ export async function generateAnthropicResponse(
     const r = streamText({
       model,
       ...params,
+      ...(upstreamMaxRetries() !== undefined ? { maxRetries: upstreamMaxRetries() } : {}),
       abortSignal,
       onError: () => {},
     } as Parameters<typeof streamText>[0]);
@@ -1005,6 +1035,7 @@ export async function generateAnthropicResponse(
       const r = await generateText({
         model,
         ...params,
+        ...(upstreamMaxRetries() !== undefined ? { maxRetries: upstreamMaxRetries() } : {}),
         abortSignal: generateAbort.signal,
       } as Parameters<typeof generateText>[0]);
       ({ text, toolCalls, finishReason, usage } = r);

@@ -24,6 +24,7 @@ vi.mock('ws', () => ({ WebSocket: FakeWebSocket, default: FakeWebSocket }));
 import {
   createResponsesWebSocketFetch,
   resetReasoningGapWarningsForTests,
+  resetToolArgumentGapWarningsForTests,
   resetResponsesWebSocketConnectionsForTests,
   responsesWebSocketPartitionKey,
   responsesWebSocketPromptFingerprint,
@@ -133,6 +134,7 @@ describe('createResponsesWebSocketFetch', () => {
   beforeEach(() => {
     resetResponsesWebSocketConnectionsForTests();
     resetReasoningGapWarningsForTests();
+    resetToolArgumentGapWarningsForTests();
     fakeSockets.length = 0;
   });
 
@@ -1575,6 +1577,320 @@ describe('createResponsesWebSocketFetch', () => {
     await readAll(second);
   });
 
+  it('continues a tool loop when the echoed arguments were sanitized of null filler', async () => {
+    const input = [{ role: 'user', content: [{ type: 'input_text', text: 'read it back' }] }];
+    const wsFetch = createResponsesWebSocketFetch(WS_URL, undefined, { accountId: 'acct-null-filler' });
+    const first = await wsFetch('https://x', {
+      method: 'POST', headers: {}, body: JSON.stringify(sessionPayload(input)),
+    });
+    const socket = lastSocket();
+    socket.emit('open');
+    socket.emit('message', Buffer.from(JSON.stringify({ type: 'response.created', response: { id: 'resp_null' } })));
+    socket.emit('message', Buffer.from(JSON.stringify({
+      type: 'response.output_item.done', output_index: 0,
+      item: { type: 'function_call', call_id: 'call_n', name: 'Read', arguments: '{"path":"file.ts","offset":null}' },
+    })));
+    socket.emit('message', Buffer.from(JSON.stringify({ type: 'response.completed', response: { id: 'resp_null' } })));
+    await readAll(first);
+
+    // The translation layer drops the null-valued `offset` before the call
+    // reaches the client, so the echo is strictly smaller than the raw
+    // upstream arguments. The snapshot must hold the sanitized shape or the
+    // head can never match its own echo.
+    const echoedCall = { type: 'function_call', call_id: 'call_n', name: 'Read', arguments: '{"path":"file.ts"}' };
+    const toolOutput = { type: 'function_call_output', call_id: 'call_n', output: 'contents' };
+    const second = await wsFetch('https://x', {
+      method: 'POST', headers: {}, body: JSON.stringify(sessionPayload([...input, echoedCall, toolOutput])),
+    });
+    const sent = JSON.parse(socket.send.mock.calls[1]![0] as string);
+    expect(sent.previous_response_id).toBe('resp_null');
+    expect(sent.input).toEqual([toolOutput]);
+    emitTextResponse(socket, 'resp_null_done', 'done');
+    await readAll(second);
+  });
+
+  it('continues when a non-required empty array was sanitized from the echoed arguments', async () => {
+    const tools = [{
+      type: 'function', name: 'WebSearch',
+      parameters: {
+        type: 'object',
+        properties: { query: { type: 'string' }, allowed_domains: { type: 'array' } },
+        required: ['query'],
+      },
+    }];
+    const input = [{ role: 'user', content: [{ type: 'input_text', text: 'search' }] }];
+    const wsFetch = createResponsesWebSocketFetch(WS_URL, undefined, { accountId: 'acct-empty-array' });
+    const first = await wsFetch('https://x', {
+      method: 'POST', headers: {}, body: JSON.stringify(sessionPayload(input, { tools })),
+    });
+    const socket = lastSocket();
+    socket.emit('open');
+    socket.emit('message', Buffer.from(JSON.stringify({ type: 'response.created', response: { id: 'resp_arr' } })));
+    socket.emit('message', Buffer.from(JSON.stringify({
+      type: 'response.output_item.done', output_index: 0,
+      item: { type: 'function_call', call_id: 'call_a', name: 'WebSearch', arguments: '{"query":"q","allowed_domains":[]}' },
+    })));
+    socket.emit('message', Buffer.from(JSON.stringify({ type: 'response.completed', response: { id: 'resp_arr' } })));
+    await readAll(first);
+
+    const echoedCall = { type: 'function_call', call_id: 'call_a', name: 'WebSearch', arguments: '{"query":"q"}' };
+    const toolOutput = { type: 'function_call_output', call_id: 'call_a', output: 'results' };
+    const second = await wsFetch('https://x', {
+      method: 'POST', headers: {}, body: JSON.stringify(sessionPayload([...input, echoedCall, toolOutput], { tools })),
+    });
+    const sent = JSON.parse(socket.send.mock.calls[1]![0] as string);
+    expect(sent.previous_response_id).toBe('resp_arr');
+    expect(sent.input).toEqual([toolOutput]);
+    emitTextResponse(socket, 'resp_arr_done', 'done');
+    await readAll(second);
+  });
+
+  it('keeps a required empty array in the snapshot and still continues', async () => {
+    const tools = [{
+      type: 'function', name: 'TodoWrite',
+      parameters: {
+        type: 'object',
+        properties: { todos: { type: 'array' } },
+        required: ['todos'],
+      },
+    }];
+    const input = [{ role: 'user', content: [{ type: 'input_text', text: 'clear todos' }] }];
+    const wsFetch = createResponsesWebSocketFetch(WS_URL, undefined, { accountId: 'acct-required-array' });
+    const first = await wsFetch('https://x', {
+      method: 'POST', headers: {}, body: JSON.stringify(sessionPayload(input, { tools })),
+    });
+    const socket = lastSocket();
+    socket.emit('open');
+    socket.emit('message', Buffer.from(JSON.stringify({ type: 'response.created', response: { id: 'resp_req' } })));
+    socket.emit('message', Buffer.from(JSON.stringify({
+      type: 'response.output_item.done', output_index: 0,
+      item: { type: 'function_call', call_id: 'call_r', name: 'TodoWrite', arguments: '{"todos":[]}' },
+    })));
+    socket.emit('message', Buffer.from(JSON.stringify({ type: 'response.completed', response: { id: 'resp_req' } })));
+    await readAll(first);
+
+    // A required empty array survives sanitization on the way to the client,
+    // so the echo carries it and the snapshot must keep it too.
+    const echoedCall = { type: 'function_call', call_id: 'call_r', name: 'TodoWrite', arguments: '{"todos":[]}' };
+    const toolOutput = { type: 'function_call_output', call_id: 'call_r', output: 'cleared' };
+    const second = await wsFetch('https://x', {
+      method: 'POST', headers: {}, body: JSON.stringify(sessionPayload([...input, echoedCall, toolOutput], { tools })),
+    });
+    const sent = JSON.parse(socket.send.mock.calls[1]![0] as string);
+    expect(sent.previous_response_id).toBe('resp_req');
+    expect(sent.input).toEqual([toolOutput]);
+    emitTextResponse(socket, 'resp_req_done', 'done');
+    await readAll(second);
+  });
+
+  it('starts a new chain when the echoed call differs in a meaningful argument value', async () => {
+    const input = [{ role: 'user', content: [{ type: 'input_text', text: 'read it back' }] }];
+    const wsFetch = createResponsesWebSocketFetch(WS_URL, undefined, { accountId: 'acct-real-diff' });
+    const first = await wsFetch('https://x', {
+      method: 'POST', headers: {}, body: JSON.stringify(sessionPayload(input)),
+    });
+    const socket = lastSocket();
+    socket.emit('open');
+    socket.emit('message', Buffer.from(JSON.stringify({ type: 'response.created', response: { id: 'resp_diff' } })));
+    socket.emit('message', Buffer.from(JSON.stringify({
+      type: 'response.output_item.done', output_index: 0,
+      item: { type: 'function_call', call_id: 'call_d', name: 'Read', arguments: '{"path":"file.ts"}' },
+    })));
+    socket.emit('message', Buffer.from(JSON.stringify({ type: 'response.completed', response: { id: 'resp_diff' } })));
+    await readAll(first);
+
+    // A genuinely different argument value is a divergent history, not a
+    // sanitized echo: it must be rejected, or the chain would silently
+    // continue a conversation the server never had.
+    const divergedCall = { type: 'function_call', call_id: 'call_d', name: 'Read', arguments: '{"path":"other.ts"}' };
+    const toolOutput = { type: 'function_call_output', call_id: 'call_d', output: 'contents' };
+    const fullInput = [...input, divergedCall, toolOutput];
+    const second = await wsFetch('https://x', {
+      method: 'POST', headers: {}, body: JSON.stringify(sessionPayload(fullInput)),
+    });
+    const isolated = lastSocket();
+    expect(isolated).not.toBe(socket);
+    isolated.emit('open');
+    const sent = JSON.parse(isolated.send.mock.calls[0]![0] as string);
+    expect(sent.previous_response_id).toBeUndefined();
+    expect(sent.input).toEqual(fullInput);
+    emitTextResponse(isolated, 'resp_diff_new', 'done');
+    await readAll(second);
+  });
+
+  it('starts a new chain when the echoed call carries a different call_id', async () => {
+    const input = [{ role: 'user', content: [{ type: 'input_text', text: 'read it back' }] }];
+    const wsFetch = createResponsesWebSocketFetch(WS_URL, undefined, { accountId: 'acct-callid-diff' });
+    const first = await wsFetch('https://x', {
+      method: 'POST', headers: {}, body: JSON.stringify(sessionPayload(input)),
+    });
+    const socket = lastSocket();
+    socket.emit('open');
+    socket.emit('message', Buffer.from(JSON.stringify({ type: 'response.created', response: { id: 'resp_cid' } })));
+    socket.emit('message', Buffer.from(JSON.stringify({
+      type: 'response.output_item.done', output_index: 0,
+      item: { type: 'function_call', call_id: 'call_c1', name: 'Read', arguments: '{"path":"file.ts"}' },
+    })));
+    socket.emit('message', Buffer.from(JSON.stringify({ type: 'response.completed', response: { id: 'resp_cid' } })));
+    await readAll(first);
+
+    const divergedCall = { type: 'function_call', call_id: 'call_c2', name: 'Read', arguments: '{"path":"file.ts"}' };
+    const toolOutput = { type: 'function_call_output', call_id: 'call_c2', output: 'contents' };
+    const fullInput = [...input, divergedCall, toolOutput];
+    const second = await wsFetch('https://x', {
+      method: 'POST', headers: {}, body: JSON.stringify(sessionPayload(fullInput)),
+    });
+    const isolated = lastSocket();
+    expect(isolated).not.toBe(socket);
+    isolated.emit('open');
+    const sent = JSON.parse(isolated.send.mock.calls[0]![0] as string);
+    expect(sent.previous_response_id).toBeUndefined();
+    expect(sent.input).toEqual(fullInput);
+    emitTextResponse(isolated, 'resp_cid_new', 'done');
+    await readAll(second);
+  });
+
+  it.each([['', 'empty'], ['   ', 'whitespace']])(
+    'continues a zero-argument tool call whose blank (%#) arguments string is echoed as {}',
+    async (blank, tag) => {
+      const input = [{ role: 'user', content: [{ type: 'input_text', text: 'ping' }] }];
+      const wsFetch = createResponsesWebSocketFetch(WS_URL, undefined, { accountId: `acct-blank-${tag}` });
+      const first = await wsFetch('https://x', {
+        method: 'POST', headers: {}, body: JSON.stringify(sessionPayload(input)),
+      });
+      const socket = lastSocket();
+      socket.emit('open');
+      socket.emit('message', Buffer.from(JSON.stringify({ type: 'response.created', response: { id: `resp_blank_${tag}` } })));
+      socket.emit('message', Buffer.from(JSON.stringify({
+        type: 'response.output_item.done', output_index: 0,
+        item: { type: 'function_call', call_id: `call_b_${tag}`, name: 'Ping', arguments: blank },
+      })));
+      socket.emit('message', Buffer.from(JSON.stringify({ type: 'response.completed', response: { id: `resp_blank_${tag}` } })));
+      await readAll(first);
+
+      // The client-side SDK parses a blank arguments string as `{}`, so the
+      // echo for a zero-argument tool (common for MCP tools) comes back as
+      // `"{}"`. A raw-`""` snapshot would lose the chain with the same
+      // tail-index signature as #84.
+      const echoedCall = { type: 'function_call', call_id: `call_b_${tag}`, name: 'Ping', arguments: '{}' };
+      const toolOutput = { type: 'function_call_output', call_id: `call_b_${tag}`, output: 'pong' };
+      const second = await wsFetch('https://x', {
+        method: 'POST', headers: {}, body: JSON.stringify(sessionPayload([...input, echoedCall, toolOutput])),
+      });
+      const sent = JSON.parse(socket.send.mock.calls[1]![0] as string);
+      expect(sent.previous_response_id).toBe(`resp_blank_${tag}`);
+      expect(sent.input).toEqual([toolOutput]);
+      emitTextResponse(socket, `resp_blank_${tag}_done`, 'done');
+      await readAll(second);
+    },
+  );
+
+  describe('mismatch diagnostics', () => {
+    /** Build a head, then replay a history that diverges at the tool call's
+     * argument value, and capture every debug line the transport emits. */
+    async function runValueMismatch(opts: {
+      accountId: string;
+      headArguments?: string;
+      replayItems?: (input: unknown[]) => unknown[];
+    }): Promise<string[]> {
+      const lines: string[] = [];
+      const input = [{ role: 'user', content: [{ type: 'input_text', text: 'read it back' }] }];
+      const wsFetch = createResponsesWebSocketFetch(WS_URL, message => lines.push(message), {
+        accountId: opts.accountId,
+      });
+      const first = await wsFetch('https://x', {
+        method: 'POST', headers: {}, body: JSON.stringify(sessionPayload(input)),
+      });
+      const socket = lastSocket();
+      socket.emit('open');
+      socket.emit('message', Buffer.from(JSON.stringify({ type: 'response.created', response: { id: 'resp_dump' } })));
+      socket.emit('message', Buffer.from(JSON.stringify({
+        type: 'response.output_item.done', output_index: 0,
+        item: {
+          type: 'function_call', call_id: 'call_dump', name: 'Read',
+          arguments: opts.headArguments ?? '{"path":"expected.ts"}',
+        },
+      })));
+      socket.emit('message', Buffer.from(JSON.stringify({ type: 'response.completed', response: { id: 'resp_dump' } })));
+      await readAll(first);
+
+      const replay = opts.replayItems
+        ? opts.replayItems(input)
+        : [
+            ...input,
+            { type: 'function_call', call_id: 'call_dump', name: 'Read', arguments: '{"path":"actual.ts"}' },
+            { type: 'function_call_output', call_id: 'call_dump', output: 'contents' },
+          ];
+      const second = await wsFetch('https://x', {
+        method: 'POST', headers: {}, body: JSON.stringify(sessionPayload(replay)),
+      });
+      const isolated = lastSocket();
+      expect(isolated).not.toBe(socket);
+      isolated.emit('open');
+      emitTextResponse(isolated, 'resp_dump_new', 'done');
+      await readAll(second);
+      return lines;
+    }
+
+    it('appends both item hashes to the mismatch summary line', async () => {
+      const lines = await runValueMismatch({ accountId: 'acct-diag-hashes' });
+      const summary = lines.find(line => line.includes('history mismatch starting an additional chain'));
+      expect(summary).toMatch(/expected_hash=[0-9a-f]{16} actual_hash=[0-9a-f]{16}/);
+    });
+
+    it('writes no dump lines unless CLODEX_MISMATCH_DUMP=1 is set', async () => {
+      const lines = await runValueMismatch({ accountId: 'acct-diag-gated' });
+      expect(lines.some(line => line.includes('mismatch dump'))).toBe(false);
+    });
+
+    it('dumps both divergent items in canonical bytes when opted in', async () => {
+      process.env.CLODEX_MISMATCH_DUMP = '1';
+      try {
+        const lines = await runValueMismatch({ accountId: 'acct-diag-dump' });
+        const expectedLine = lines.find(line => line.includes('mismatch dump expected['));
+        const actualLine = lines.find(line => line.includes('mismatch dump actual['));
+        expect(expectedLine).toContain('expected.ts');
+        expect(actualLine).toContain('actual.ts');
+      } finally {
+        delete process.env.CLODEX_MISMATCH_DUMP;
+      }
+    });
+
+    it('caps a dump line at 2000 characters with a truncation marker', async () => {
+      process.env.CLODEX_MISMATCH_DUMP = '1';
+      try {
+        const lines = await runValueMismatch({
+          accountId: 'acct-diag-cap',
+          headArguments: JSON.stringify({ path: 'expected.ts', blob: 'x'.repeat(5_000) }),
+        });
+        const expectedLine = lines.find(line => line.includes('mismatch dump expected['))!;
+        const dumped = expectedLine.slice(expectedLine.indexOf(']: ') + 3);
+        expect(dumped).toHaveLength(2_000);
+        expect(dumped.endsWith(' [truncated]')).toBe(true);
+      } finally {
+        delete process.env.CLODEX_MISMATCH_DUMP;
+      }
+    });
+
+    it('renders (absent) for a side whose history ends before the divergence', async () => {
+      process.env.CLODEX_MISMATCH_DUMP = '1';
+      try {
+        // The client replays a truncated history (a rewind): every comparable
+        // item matches, so the divergence is the head simply being longer.
+        const lines = await runValueMismatch({
+          accountId: 'acct-diag-absent',
+          replayItems: input => input,
+        });
+        const expectedLine = lines.find(line => line.includes('mismatch dump expected['));
+        const actualLine = lines.find(line => line.includes('mismatch dump actual['));
+        expect(expectedLine).toContain('expected.ts');
+        expect(actualLine).toContain('(absent)');
+      } finally {
+        delete process.env.CLODEX_MISMATCH_DUMP;
+      }
+    });
+  });
+
   it('validates encrypted reasoning and exact assistant text before continuing', async () => {
     const input = [{ role: 'user', content: [{ type: 'input_text', text: 'reason' }] }];
     const wsFetch = createResponsesWebSocketFetch(WS_URL, undefined, { accountId: 'acct-reasoning' });
@@ -1910,6 +2226,324 @@ describe('createResponsesWebSocketFetch', () => {
     const decision = diagnostics.filter(event => event.event === 'ws_head_decision').at(-1)!;
     expect((decision.heads as { mismatch: Record<string, unknown> }[])[0]!.mismatch)
       .not.toHaveProperty('reasoningNormalizationGap');
+  });
+
+  // Drives one mismatch between a stored function_call and the call Claude echoes
+  // back. The stored side rides in on the FIRST request's own input, which is how a
+  // forked strip rule presents: the head holds an unstripped call while the client
+  // echoes the stripped one.
+  async function runToolArgumentMismatch(options: {
+    accountId: string;
+    responseId: string;
+    storedArguments: string;
+    echoedArguments: string;
+    tools?: unknown[];
+    replayTools?: unknown[];
+    echoedExtra?: Record<string, unknown>;
+  }): Promise<{ stderr: string[]; diagnostics: ResponsesWebSocketDiagnosticEvent[] }> {
+    const stderr: string[] = [];
+    const spy = vi.spyOn(process.stderr, 'write')
+      .mockImplementation((chunk: unknown) => { stderr.push(String(chunk)); return true; });
+    try {
+      const diagnostics: ResponsesWebSocketDiagnosticEvent[] = [];
+      const extra = options.tools ? { tools: options.tools } : {};
+      const storedCall = {
+        type: 'function_call', call_id: 'call_g', name: 'Grep', arguments: options.storedArguments,
+      };
+      const storedOutput = { type: 'function_call_output', call_id: 'call_g', output: 'hits' };
+      const input = [
+        { role: 'user', content: [{ type: 'input_text', text: 'search it' }] },
+        storedCall,
+        storedOutput,
+      ];
+      const wsFetch = createResponsesWebSocketFetch(WS_URL, undefined, {
+        accountId: options.accountId,
+        onDiagnostic: event => diagnostics.push(event),
+      });
+      const first = await wsFetch('https://x', {
+        method: 'POST', headers: {}, body: JSON.stringify(sessionPayload(input, extra)),
+      });
+      const socket = lastSocket();
+      socket.emit('open');
+      emitTextResponse(socket, options.responseId, 'ok');
+      await readAll(first);
+
+      // Same call_id, same tool — only the argument bytes differ.
+      const echoed = [
+        input[0]!,
+        { type: 'function_call', call_id: 'call_g', name: 'Grep', arguments: options.echoedArguments, ...(options.echoedExtra ?? {}) },
+        storedOutput,
+        { role: 'user', content: [{ type: 'input_text', text: 'again' }] },
+      ];
+      const replayExtra = options.replayTools ? { tools: options.replayTools } : extra;
+      const second = await wsFetch('https://x', {
+        method: 'POST', headers: {}, body: JSON.stringify(sessionPayload(echoed, replayExtra)),
+      });
+      emitTextResponse(lastSocket(), `${options.responseId}_next`, 'done');
+      await readAll(second);
+      return { stderr, diagnostics };
+    } finally {
+      spy.mockRestore();
+    }
+  }
+
+  it('warns on stderr when the filler-strip rule has forked', async () => {
+    const { stderr, diagnostics } = await runToolArgumentMismatch({
+      accountId: 'acct-tool-gap-forked',
+      responseId: 'resp_tool_gap',
+      // Identical once the shared strip rule runs: the null is exactly what
+      // sanitizeToolInput removes, so this can only be the rule diverging.
+      storedArguments: '{"pattern":"x","glob":null}',
+      echoedArguments: '{"pattern":"x"}',
+    });
+
+    expect(stderr.join('')).toContain('filler-strip rule is applied');
+    expect(stderr.join('')).toContain('regression of #84');
+    expect(stderr.join('')).toContain('Grep');
+    const decision = diagnostics.filter(event => event.event === 'ws_head_decision').at(-1)!;
+    expect(decision.decision).toBe('history_mismatch_new_head');
+    expect((decision.heads as { mismatch: Record<string, unknown> }[])[0]!.mismatch)
+      .toMatchObject({ toolArgumentNormalizationGap: { tool: 'Grep', equalAfterStrip: true } });
+  });
+
+  it('records but does not warn when the arguments differ beyond filler', async () => {
+    const { stderr, diagnostics } = await runToolArgumentMismatch({
+      accountId: 'acct-tool-gap-value',
+      responseId: 'resp_tool_value',
+      // A real value change under the same call_id is indistinguishable from a
+      // client that genuinely re-sent something else, so stderr must stay quiet.
+      storedArguments: '{"pattern":"x"}',
+      echoedArguments: '{"pattern":"y"}',
+    });
+
+    expect(stderr.join('')).toBe('');
+    const decision = diagnostics.filter(event => event.event === 'ws_head_decision').at(-1)!;
+    expect((decision.heads as { mismatch: Record<string, unknown> }[])[0]!.mismatch)
+      .toMatchObject({ toolArgumentNormalizationGap: { tool: 'Grep', equalAfterStrip: false } });
+  });
+
+  it('respects the tool schema when deciding the rule forked', async () => {
+    const { stderr, diagnostics } = await runToolArgumentMismatch({
+      accountId: 'acct-tool-gap-required',
+      responseId: 'resp_tool_required',
+      // `matches` is REQUIRED, so its empty array is an intentional value that the
+      // strip rule keeps. Dropping it is a real difference, not filler.
+      tools: [{
+        type: 'function', name: 'Grep',
+        parameters: { type: 'object', properties: { matches: { type: 'array' } }, required: ['matches'] },
+      }],
+      storedArguments: '{"matches":[]}',
+      echoedArguments: '{}',
+    });
+
+    expect(stderr.join('')).toBe('');
+    const decision = diagnostics.filter(event => event.event === 'ws_head_decision').at(-1)!;
+    expect((decision.heads as { mismatch: Record<string, unknown> }[])[0]!.mismatch)
+      .toMatchObject({ toolArgumentNormalizationGap: { equalAfterStrip: false } });
+  });
+
+  it('compares under the schema that created the head, not the replay schema', async () => {
+    const { stderr, diagnostics } = await runToolArgumentMismatch({
+      accountId: 'acct-tool-gap-schema-drift',
+      responseId: 'resp_tool_drift',
+      // matches was OPTIONAL when the head was created, so the echo was
+      // sanitized without it. The replay marks it required — deriving the
+      // required set from the replay would call this unexplainable and
+      // suppress the genuine fork warning.
+      tools: [{
+        type: 'function', name: 'Grep',
+        parameters: { type: 'object', properties: { matches: { type: 'array' } }, required: [] },
+      }],
+      replayTools: [{
+        type: 'function', name: 'Grep',
+        parameters: { type: 'object', properties: { matches: { type: 'array' } }, required: ['matches'] },
+      }],
+      storedArguments: '{"pattern":"x","matches":[]}',
+      echoedArguments: '{"pattern":"x"}',
+    });
+
+    expect(stderr.join('')).toContain('regression of #84');
+    const decision = diagnostics.filter(event => event.event === 'ws_head_decision').at(-1)!;
+    expect((decision.heads as { mismatch: Record<string, unknown> }[])[0]!.mismatch)
+      .toMatchObject({ toolArgumentNormalizationGap: { tool: 'Grep', equalAfterStrip: true } });
+  });
+
+  it('warns for a gap on an older head even when a newer head mismatches ordinarily', async () => {
+    const stderr: string[] = [];
+    const spy = vi.spyOn(process.stderr, 'write')
+      .mockImplementation((chunk: unknown) => { stderr.push(String(chunk)); return true; });
+    try {
+      const user = { role: 'user', content: [{ type: 'input_text', text: 'search it' }] };
+      const gapOut = { type: 'function_call_output', call_id: 'call_m', output: 'hits' };
+      const wsFetch = createResponsesWebSocketFetch(WS_URL, undefined, { accountId: 'acct-tool-gap-multi' });
+      // Older head: carries the unstripped call (the forked-rule shape).
+      const first = await wsFetch('https://x', {
+        method: 'POST', headers: {},
+        body: JSON.stringify(sessionPayload([
+          user,
+          { type: 'function_call', call_id: 'call_m', name: 'Grep', arguments: '{"pattern":"x","glob":null}' },
+          gapOut,
+        ])),
+      });
+      lastSocket().emit('open');
+      emitTextResponse(lastSocket(), 'resp_multi_a', 'ok');
+      await readAll(first);
+      // Newer head: unrelated conversation — will mismatch ordinarily.
+      const second = await wsFetch('https://x', {
+        method: 'POST', headers: {},
+        body: JSON.stringify(sessionPayload([
+          { role: 'user', content: [{ type: 'input_text', text: 'something else' }] },
+        ])),
+      });
+      lastSocket().emit('open');
+      emitTextResponse(lastSocket(), 'resp_multi_b', 'ok');
+      await readAll(second);
+
+      // Replay echoes the OLDER head's call sanitized; the newest head (the
+      // diagnostic entry) mismatches ordinarily. The canary must still warn.
+      const third = await wsFetch('https://x', {
+        method: 'POST', headers: {},
+        body: JSON.stringify(sessionPayload([
+          user,
+          { type: 'function_call', call_id: 'call_m', name: 'Grep', arguments: '{"pattern":"x"}' },
+          gapOut,
+          { role: 'user', content: [{ type: 'input_text', text: 'again' }] },
+        ])),
+      });
+      emitTextResponse(lastSocket(), 'resp_multi_c', 'done');
+      await readAll(third);
+
+      expect(stderr.join('')).toContain('regression of #84');
+    } finally {
+      spy.mockRestore();
+    }
+  });
+
+  it('still catches a forked rule when Claude omits the stored reasoning item', async () => {
+    const stderr: string[] = [];
+    const spy = vi.spyOn(process.stderr, 'write')
+      .mockImplementation((chunk: unknown) => { stderr.push(String(chunk)); return true; });
+    try {
+      const diagnostics: ResponsesWebSocketDiagnosticEvent[] = [];
+      const storedOutput = { type: 'function_call_output', call_id: 'call_o', output: 'hits' };
+      // Reasoning precedes the call in the stored prefix; the echo omits it,
+      // shifting the exact divergence onto a reasoning-vs-call pair.
+      const input = [
+        { role: 'user', content: [{ type: 'input_text', text: 'search it' }] },
+        { type: 'reasoning', encrypted_content: 'enc_o', summary: [] },
+        { type: 'function_call', call_id: 'call_o', name: 'Grep', arguments: '{"pattern":"x","glob":null}' },
+        storedOutput,
+      ];
+      const wsFetch = createResponsesWebSocketFetch(WS_URL, undefined, {
+        accountId: 'acct-tool-gap-omitted', onDiagnostic: event => diagnostics.push(event),
+      });
+      const first = await wsFetch('https://x', {
+        method: 'POST', headers: {}, body: JSON.stringify(sessionPayload(input)),
+      });
+      lastSocket().emit('open');
+      emitTextResponse(lastSocket(), 'resp_omit', 'ok');
+      await readAll(first);
+
+      const second = await wsFetch('https://x', {
+        method: 'POST', headers: {},
+        body: JSON.stringify(sessionPayload([
+          input[0]!,
+          { type: 'function_call', call_id: 'call_o', name: 'Grep', arguments: '{"pattern":"x"}' },
+          storedOutput,
+          { role: 'user', content: [{ type: 'input_text', text: 'again' }] },
+        ])),
+      });
+      emitTextResponse(lastSocket(), 'resp_omit_next', 'done');
+      await readAll(second);
+
+      expect(stderr.join('')).toContain('regression of #84');
+      const decision = diagnostics.filter(event => event.event === 'ws_head_decision').at(-1)!;
+      expect(decision.decision).toBe('history_mismatch_new_head');
+      expect((decision.heads as { mismatch: Record<string, unknown> }[])[0]!.mismatch)
+        .toMatchObject({ toolArgumentNormalizationGap: { tool: 'Grep', equalAfterStrip: true } });
+    } finally {
+      spy.mockRestore();
+    }
+  });
+
+  it('does not blame the rule when filler AND another field both differ', async () => {
+    const { stderr, diagnostics } = await runToolArgumentMismatch({
+      accountId: 'acct-tool-gap-mixed',
+      responseId: 'resp_tool_mixed',
+      // Arguments differ only by strippable filler, but the echo also carries
+      // an extension field — stripping cannot make the whole calls equal, so
+      // a rule-forked stderr warning would be a false attribution.
+      storedArguments: '{"pattern":"x","glob":null}',
+      echoedArguments: '{"pattern":"x"}',
+      echoedExtra: { metadata: 'client-extension' },
+    });
+
+    expect(stderr.join('')).toBe('');
+    const decision = diagnostics.filter(event => event.event === 'ws_head_decision').at(-1)!;
+    expect((decision.heads as { mismatch: Record<string, unknown> }[])[0]!.mismatch)
+      .toMatchObject({ toolArgumentNormalizationGap: { tool: 'Grep', equalAfterStrip: false } });
+  });
+
+  it('classifies a non-argument field difference as an ordinary mismatch', async () => {
+    const { stderr, diagnostics } = await runToolArgumentMismatch({
+      accountId: 'acct-tool-gap-otherfield',
+      responseId: 'resp_tool_other',
+      // Arguments agree; the echo differs in an extension field. The strip
+      // rule agrees on both sides, so a #84 warning here would be misleading.
+      storedArguments: '{"pattern":"x"}',
+      echoedArguments: '{"pattern":"x"}',
+      echoedExtra: { metadata: 'client-extension' },
+    });
+
+    expect(stderr.join('')).toBe('');
+    const decision = diagnostics.filter(event => event.event === 'ws_head_decision').at(-1)!;
+    expect((decision.heads as { mismatch: Record<string, unknown> }[])[0]!.mismatch)
+      .not.toHaveProperty('toolArgumentNormalizationGap');
+  });
+
+  it('stays silent when a different call_id makes it a genuine branch', async () => {
+    const stderr: string[] = [];
+    const spy = vi.spyOn(process.stderr, 'write')
+      .mockImplementation((chunk: unknown) => { stderr.push(String(chunk)); return true; });
+    try {
+      const diagnostics: ResponsesWebSocketDiagnosticEvent[] = [];
+      const storedOutput = { type: 'function_call_output', call_id: 'call_g', output: 'hits' };
+      const input = [
+        { role: 'user', content: [{ type: 'input_text', text: 'search it' }] },
+        { type: 'function_call', call_id: 'call_g', name: 'Grep', arguments: '{"pattern":"x","glob":null}' },
+        storedOutput,
+      ];
+      const wsFetch = createResponsesWebSocketFetch(WS_URL, undefined, {
+        accountId: 'acct-tool-gap-branch',
+        onDiagnostic: event => diagnostics.push(event),
+      });
+      const first = await wsFetch('https://x', {
+        method: 'POST', headers: {}, body: JSON.stringify(sessionPayload(input)),
+      });
+      lastSocket().emit('open');
+      emitTextResponse(lastSocket(), 'resp_branch', 'ok');
+      await readAll(first);
+
+      // A regenerated call carries a NEW call_id — that is a branch, not our bug.
+      const second = await wsFetch('https://x', {
+        method: 'POST', headers: {},
+        body: JSON.stringify(sessionPayload([
+          input[0]!,
+          { type: 'function_call', call_id: 'call_h', name: 'Grep', arguments: '{"pattern":"x"}' },
+          { type: 'function_call_output', call_id: 'call_h', output: 'hits' },
+          { role: 'user', content: [{ type: 'input_text', text: 'again' }] },
+        ])),
+      });
+      emitTextResponse(lastSocket(), 'resp_branch_next', 'done');
+      await readAll(second);
+
+      expect(stderr.join('')).toBe('');
+      const decision = diagnostics.filter(event => event.event === 'ws_head_decision').at(-1)!;
+      expect((decision.heads as { mismatch: Record<string, unknown> }[])[0]!.mismatch)
+        .not.toHaveProperty('toolArgumentNormalizationGap');
+    } finally {
+      spy.mockRestore();
+    }
   });
 
   it('does not warn about a gap on a head that lost to a better match', async () => {
