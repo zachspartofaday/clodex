@@ -5,6 +5,14 @@ import type { ModelRuntimeCompatibility } from '../model-runtime-compatibility.j
 
 export const REGISTRY_SCHEMA_VERSION = 1;
 
+/**
+ * Shape rule for a named OAuth account-slot name — the single home. Slot
+ * names land in credential-store scopes and env values, and the registry
+ * parser must accept exactly what `validateOAuthAccountName` admits, or a
+ * saved slot fails to survive a load.
+ */
+export const OAUTH_ACCOUNT_NAME_RE = /^[a-z0-9][a-z0-9_-]{0,31}$/;
+
 export type RegistrySubscriptionFilter = 'free';
 
 export interface CachedModel {
@@ -46,6 +54,13 @@ export interface RegistryProvider {
   enabled: boolean;
   authRef: string;
   authType?: 'api' | 'oauth' | 'none';
+  /**
+   * Named OAuth account slots beyond the default credential
+   * (`clodex providers auth openai --account <name>`). Each slot owns a
+   * disjoint credential-store lineage; CLODEX_OAUTH_ACCOUNT selects one at
+   * launch without touching the default `authRef`.
+   */
+  authAccounts?: Record<string, { authRef: string; addedAt: string; oauthAccountId?: string }>;
   subscriptionFilter?: RegistrySubscriptionFilter;
   /** Keep provider/curated costs instead of replacing them with the global pricing cache. */
   preserveModelPricing?: boolean;

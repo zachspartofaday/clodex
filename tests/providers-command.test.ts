@@ -101,6 +101,12 @@ describe('parseProvidersArgs', () => {
   it('parses add, list, remove, refresh-models, auth', () => {
     expect(parseProvidersArgs(['add'])).toEqual({ subcommand: 'add', showHelp: false });
     expect(parseProvidersArgs(['list'])).toEqual({ subcommand: 'list', showHelp: false });
+    expect(parseProvidersArgs(['auth', 'openai', '--account', 'work'])).toEqual({
+      subcommand: 'auth', showHelp: false, removeId: 'openai', authMethod: undefined, authAccount: 'work',
+    });
+    expect(parseProvidersArgs(['auth', 'openai', '--account'])).toMatchObject({
+      subcommand: 'auth', error: expect.stringContaining('--account <name>'),
+    });
     expect(parseProvidersArgs(['remove', 'openai'])).toEqual({
       subcommand: 'remove',
       showHelp: false,

@@ -17,7 +17,7 @@ import {
 import { dirname } from 'node:path';
 import { getAppHome, getProvidersPath } from '../paths.js';
 import type { ProviderRegistry, RegistryProvider } from './types.js';
-import { REGISTRY_SCHEMA_VERSION } from './types.js';
+import { OAUTH_ACCOUNT_NAME_RE, REGISTRY_SCHEMA_VERSION } from './types.js';
 import {
   assertRegistryWriteOwnership,
   withRegistryWriteLockSync,
@@ -107,6 +107,11 @@ function parseProvider(raw: unknown): RegistryProvider | null {
   if (p.authType === 'api' || p.authType === 'oauth' || p.authType === 'none') {
     provider.authType = p.authType;
   }
+  if (hasOwn(p, 'authAccounts')) {
+    const slots = parseAuthAccounts(p.authAccounts);
+    if (slots === null) return null;
+    provider.authAccounts = slots;
+  }
   if (typeof p.refreshedAt === 'string') provider.refreshedAt = p.refreshedAt;
   if (p.modelsCache && typeof p.modelsCache === 'object') {
     const cache = p.modelsCache as { fetchedAt?: string; models?: unknown[] };
@@ -124,6 +129,34 @@ function parseProvider(raw: unknown): RegistryProvider | null {
 
 function hasOwn(record: Record<string, unknown>, key: string): boolean {
   return Object.prototype.hasOwnProperty.call(record, key);
+}
+
+/**
+ * Named OAuth account slots must survive a registry load intact and are
+ * fail-closed: a silently dropped slot would revert a CLODEX_OAUTH_ACCOUNT
+ * launch to the default identity and let credential reconciliation delete the
+ * slot's tokens as unreferenced. A malformed slot therefore invalidates the
+ * whole provider record instead of being skipped.
+ */
+function parseAuthAccounts(raw: unknown): RegistryProvider['authAccounts'] | null {
+  if (!raw || typeof raw !== 'object' || Array.isArray(raw)) return null;
+  const out: NonNullable<RegistryProvider['authAccounts']> = {};
+  for (const [name, value] of Object.entries(raw as Record<string, unknown>)) {
+    if (!OAUTH_ACCOUNT_NAME_RE.test(name)) return null;
+    if (!value || typeof value !== 'object' || Array.isArray(value)) return null;
+    const slot = value as Record<string, unknown>;
+    if (typeof slot.authRef !== 'string' || !slot.authRef) return null;
+    if (typeof slot.addedAt !== 'string' || !slot.addedAt) return null;
+    if (hasOwn(slot, 'oauthAccountId') && (typeof slot.oauthAccountId !== 'string' || !slot.oauthAccountId)) {
+      return null;
+    }
+    out[name] = {
+      authRef: slot.authRef,
+      addedAt: slot.addedAt,
+      ...(typeof slot.oauthAccountId === 'string' ? { oauthAccountId: slot.oauthAccountId } : {}),
+    };
+  }
+  return out;
 }
 
 function hasValidStrictProviderFields(raw: unknown): boolean {
@@ -144,6 +177,9 @@ function hasValidStrictProviderFields(raw: unknown): boolean {
     return false;
   }
   if (hasOwn(provider, 'refreshedAt') && typeof provider.refreshedAt !== 'string') {
+    return false;
+  }
+  if (hasOwn(provider, 'authAccounts') && parseAuthAccounts(provider.authAccounts) === null) {
     return false;
   }
   if (hasOwn(provider, 'modelsCache')) {
