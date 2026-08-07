@@ -1125,9 +1125,11 @@ describe('upstreamMaxRetries knob', () => {
     expect(upstreamMaxRetries()).toBeUndefined();
   });
 
-  it('parses a valid integer', () => {
-    process.env.CLODEX_UPSTREAM_MAX_RETRIES = '8';
-    expect(upstreamMaxRetries()).toBe(8);
+  it('parses a valid integer up to the ceiling', () => {
+    process.env.CLODEX_UPSTREAM_MAX_RETRIES = '3';
+    expect(upstreamMaxRetries()).toBe(3);
+    process.env.CLODEX_UPSTREAM_MAX_RETRIES = '5';
+    expect(upstreamMaxRetries()).toBe(5);
   });
 
   it('accepts zero (retries disabled)', () => {
@@ -1135,16 +1137,40 @@ describe('upstreamMaxRetries knob', () => {
     expect(upstreamMaxRetries()).toBe(0);
   });
 
-  it('logs once and ignores malformed or out-of-range values', () => {
-    const logged: string[] = [];
-    process.env.CLODEX_UPSTREAM_MAX_RETRIES = 'many';
-    expect(upstreamMaxRetries(message => logged.push(message))).toBeUndefined();
-    expect(upstreamMaxRetries(message => logged.push(message))).toBeUndefined();
-    expect(logged).toHaveLength(1);
-    expect(logged[0]).toContain('CLODEX_UPSTREAM_MAX_RETRIES=many');
-    process.env.CLODEX_UPSTREAM_MAX_RETRIES = '101';
+  it('treats a whitespace-only value as unset, not zero', () => {
+    process.env.CLODEX_UPSTREAM_MAX_RETRIES = '   ';
     expect(upstreamMaxRetries()).toBeUndefined();
-    process.env.CLODEX_UPSTREAM_MAX_RETRIES = '2.5';
-    expect(upstreamMaxRetries()).toBeUndefined();
+  });
+
+  it('clamps values above 5 to 5 with a one-time stderr warning', () => {
+    const stderr = vi.spyOn(console, 'error').mockImplementation(() => {});
+    try {
+      process.env.CLODEX_UPSTREAM_MAX_RETRIES = '8';
+      expect(upstreamMaxRetries()).toBe(5);
+      expect(upstreamMaxRetries()).toBe(5);
+      expect(stderr).toHaveBeenCalledTimes(1);
+      expect(String(stderr.mock.calls[0]![0])).toContain('120s stream idle timeout');
+    } finally {
+      stderr.mockRestore();
+    }
+  });
+
+  it('warns once on stderr and ignores malformed values', () => {
+    const stderr = vi.spyOn(console, 'error').mockImplementation(() => {});
+    try {
+      const logged: string[] = [];
+      process.env.CLODEX_UPSTREAM_MAX_RETRIES = 'many';
+      expect(upstreamMaxRetries(message => logged.push(message))).toBeUndefined();
+      expect(upstreamMaxRetries(message => logged.push(message))).toBeUndefined();
+      expect(logged).toHaveLength(1);
+      expect(logged[0]).toContain('CLODEX_UPSTREAM_MAX_RETRIES=many');
+      expect(stderr).toHaveBeenCalledTimes(1);
+      process.env.CLODEX_UPSTREAM_MAX_RETRIES = '2.5';
+      expect(upstreamMaxRetries()).toBeUndefined();
+      process.env.CLODEX_UPSTREAM_MAX_RETRIES = '-1';
+      expect(upstreamMaxRetries()).toBeUndefined();
+    } finally {
+      stderr.mockRestore();
+    }
   });
 });

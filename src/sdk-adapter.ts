@@ -570,21 +570,37 @@ export function translateRequest(
  * 429s outlasts two bounded backoffs, surfaces as AI_RetryError, and then
  * exhausts the downstream client's own retry budget too — a transient rate
  * limit becomes a dead agent. `CLODEX_UPSTREAM_MAX_RETRIES` follows the
- * `CLODEX_WS_MAX_*` knob conventions: integer 0-100, malformed values are
- * logged once and ignored, and the absence of the variable preserves the SDK
- * default exactly.
+ * `CLODEX_WS_MAX_*` knob conventions; absence of the variable preserves the
+ * SDK default exactly.
+ *
+ * The ceiling is 5, not what the ten-minute total timeout would allow: the
+ * binding clock on the streaming paths is the 120s stream idle timer, armed
+ * before streamText and reset only by arriving stream parts. Retry backoff
+ * yields no parts, so attempts land at 0/2/6/14/30/62s and a 7th attempt
+ * (126s) is aborted mid-backoff — a budget above 5 trades a fast, actionable
+ * 429 for a 120s stall ending in a generic idle-timeout error. Values above
+ * 5 clamp to 5 with a one-time stderr warning; malformed values warn once
+ * and keep the SDK default.
  */
+const UPSTREAM_MAX_RETRIES_CEILING = 5;
 let warnedUpstreamMaxRetries = false;
 export function upstreamMaxRetries(log?: (message: string) => void): number | undefined {
   const raw = process.env.CLODEX_UPSTREAM_MAX_RETRIES;
   if (raw === undefined || raw.trim() === '') return undefined;
   const value = Number(raw.trim());
-  if (!Number.isInteger(value) || value < 0 || value > 100) {
-    if (!warnedUpstreamMaxRetries) {
-      warnedUpstreamMaxRetries = true;
-      try { log?.(`ignoring CLODEX_UPSTREAM_MAX_RETRIES=${raw} (expected an integer between 0 and 100)`); } catch { /* ignore */ }
-    }
+  const warnOnce = (message: string): void => {
+    if (warnedUpstreamMaxRetries) return;
+    warnedUpstreamMaxRetries = true;
+    console.error(`clodex: ${message}`);
+    try { log?.(message); } catch { /* ignore */ }
+  };
+  if (!Number.isInteger(value) || value < 0) {
+    warnOnce(`ignoring CLODEX_UPSTREAM_MAX_RETRIES=${raw} (expected an integer between 0 and ${UPSTREAM_MAX_RETRIES_CEILING})`);
     return undefined;
+  }
+  if (value > UPSTREAM_MAX_RETRIES_CEILING) {
+    warnOnce(`clamping CLODEX_UPSTREAM_MAX_RETRIES=${raw} to ${UPSTREAM_MAX_RETRIES_CEILING} (the 120s stream idle timeout aborts any later retry attempt)`);
+    return UPSTREAM_MAX_RETRIES_CEILING;
   }
   return value;
 }

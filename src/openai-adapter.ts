@@ -205,7 +205,7 @@ export async function generateOpenAiResponse(
     const { stream } = streamText({ model, ...(params as any), ...(upstreamMaxRetries() !== undefined ? { maxRetries: upstreamMaxRetries() } : {}), onError: () => {} });
     result = await collectOpenAiStream(stream);
   } else {
-    result = (await generateText({ model, ...(params as any) })) as any;
+    result = (await generateText({ model, ...(params as any), ...(upstreamMaxRetries() !== undefined ? { maxRetries: upstreamMaxRetries() } : {}) })) as any;
   }
   const message: Record<string, any> = { role: 'assistant', content: result.text || null };
 
