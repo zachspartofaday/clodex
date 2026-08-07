@@ -638,7 +638,21 @@ function continuationMismatchDetails(
   const actual = mismatch < full.length ? full[mismatch] : undefined;
   const reasoningGap = reasoningNormalizationGap(expected, actual);
   if (reasoningGap && warnOnGap) warnReasoningNormalizationGap(reasoningGap, log);
-  const toolArgumentGap = toolArgumentNormalizationGap(expected, actual, payload);
+  // Claude may legitimately omit stored reasoning items (continuationMatch's
+  // omitted_reasoning mode), which shifts the exact-prefix divergence onto a
+  // reasoning-vs-call pair and would hide a forked strip rule sitting on the
+  // very next call. Align the canary to the first non-reasoning stored item
+  // in that case; everything else still uses the exact divergence pair.
+  let gapExpected = expected;
+  if (conversationItemKind(expected) === 'reasoning' && conversationItemKind(actual) === 'function_call') {
+    for (let index = mismatch; index < prefix.length; index += 1) {
+      if (conversationItemKind(prefix[index]) !== 'reasoning') {
+        gapExpected = prefix[index];
+        break;
+      }
+    }
+  }
+  const toolArgumentGap = toolArgumentNormalizationGap(gapExpected, actual, payload);
   // Only the provably-ours case reaches stderr. `equalAfterStrip === false` means
   // the arguments differ for a reason the strip rule cannot explain, and a client
   // that genuinely re-sent a different value under the same call_id is

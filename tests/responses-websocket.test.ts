@@ -2340,6 +2340,53 @@ describe('createResponsesWebSocketFetch', () => {
       .toMatchObject({ toolArgumentNormalizationGap: { equalAfterStrip: false } });
   });
 
+  it('still catches a forked rule when Claude omits the stored reasoning item', async () => {
+    const stderr: string[] = [];
+    const spy = vi.spyOn(process.stderr, 'write')
+      .mockImplementation((chunk: unknown) => { stderr.push(String(chunk)); return true; });
+    try {
+      const diagnostics: ResponsesWebSocketDiagnosticEvent[] = [];
+      const storedOutput = { type: 'function_call_output', call_id: 'call_o', output: 'hits' };
+      // Reasoning precedes the call in the stored prefix; the echo omits it,
+      // shifting the exact divergence onto a reasoning-vs-call pair.
+      const input = [
+        { role: 'user', content: [{ type: 'input_text', text: 'search it' }] },
+        { type: 'reasoning', encrypted_content: 'enc_o', summary: [] },
+        { type: 'function_call', call_id: 'call_o', name: 'Grep', arguments: '{"pattern":"x","glob":null}' },
+        storedOutput,
+      ];
+      const wsFetch = createResponsesWebSocketFetch(WS_URL, undefined, {
+        accountId: 'acct-tool-gap-omitted', onDiagnostic: event => diagnostics.push(event),
+      });
+      const first = await wsFetch('https://x', {
+        method: 'POST', headers: {}, body: JSON.stringify(sessionPayload(input)),
+      });
+      lastSocket().emit('open');
+      emitTextResponse(lastSocket(), 'resp_omit', 'ok');
+      await readAll(first);
+
+      const second = await wsFetch('https://x', {
+        method: 'POST', headers: {},
+        body: JSON.stringify(sessionPayload([
+          input[0]!,
+          { type: 'function_call', call_id: 'call_o', name: 'Grep', arguments: '{"pattern":"x"}' },
+          storedOutput,
+          { role: 'user', content: [{ type: 'input_text', text: 'again' }] },
+        ])),
+      });
+      emitTextResponse(lastSocket(), 'resp_omit_next', 'done');
+      await readAll(second);
+
+      expect(stderr.join('')).toContain('regression of #84');
+      const decision = diagnostics.filter(event => event.event === 'ws_head_decision').at(-1)!;
+      expect(decision.decision).toBe('history_mismatch_new_head');
+      expect((decision.heads as { mismatch: Record<string, unknown> }[])[0]!.mismatch)
+        .toMatchObject({ toolArgumentNormalizationGap: { tool: 'Grep', equalAfterStrip: true } });
+    } finally {
+      spy.mockRestore();
+    }
+  });
+
   it('does not blame the rule when filler AND another field both differ', async () => {
     const { stderr, diagnostics } = await runToolArgumentMismatch({
       accountId: 'acct-tool-gap-mixed',
