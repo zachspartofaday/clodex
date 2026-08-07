@@ -63,6 +63,22 @@ describe('computeWrapperEnv', () => {
     expect(env['ANTHROPIC_DEFAULT_OPUS_MODEL']).toBeUndefined();
   });
 
+  it('preserves a session proxy\'s remap when no runtime record exists', () => {
+    // clodex claude --proxy publishes no record, so state is null while the
+    // inherited proxy env still routes through the live session proxy —
+    // clearing the remap there would break the session's own routing.
+    const inSession = computeWrapperEnv({
+      ...baseEnv,
+      HTTPS_PROXY: 'http://127.0.0.1:17645',
+      https_proxy: 'http://127.0.0.1:17645',
+      NODE_EXTRA_CA_CERTS: '/home/u/.clodex/http-proxy/clodex-ca.pem',
+      ANTHROPIC_DEFAULT_FABLE_MODEL: 'wjudge',
+      CLODEX_INJECTED_BUILTINS: 'fable=wjudge',
+    }, null);
+    expect(inSession['ANTHROPIC_DEFAULT_FABLE_MODEL']).toBe('wjudge');
+    expect(inSession['CLODEX_INJECTED_BUILTINS']).toBe('fable=wjudge');
+  });
+
   it('clears inherited injections on the no-server and endpoint paths', () => {
     const poisoned = {
       ...baseEnv,
