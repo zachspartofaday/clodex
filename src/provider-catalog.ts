@@ -81,12 +81,16 @@ export async function resolveProvidersForDisplay(): Promise<ProviderDisplayEntry
   const entries: ProviderDisplayEntry[] = [];
 
   for (const provider of reg.providers) {
+    const accountNames = Object.keys(provider.authAccounts ?? {}).sort();
+    const authLabel = accountNames.length
+      ? `${formatRegistryAuthLabel(provider)}; accounts: default, ${accountNames.join(', ')}`
+      : formatRegistryAuthLabel(provider);
     entries.push({
       id: provider.id,
       name: provider.name,
       modelCount: provider.modelsCache?.models.length ?? 0,
       enabled: provider.enabled,
-      authLabel: formatRegistryAuthLabel(provider),
+      authLabel,
       inRegistry: true,
     });
   }

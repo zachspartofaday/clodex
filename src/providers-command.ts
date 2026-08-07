@@ -94,6 +94,7 @@ export function parseProvidersArgs(args: string[]): {
   showHelp: boolean;
   removeId?: string;
   authMethod?: ProviderAuthMethod;
+  authAccount?: string;
   error?: string;
 } {
   if (args.length === 0) return { subcommand: 'hub', showHelp: false };
@@ -110,10 +111,19 @@ export function parseProvidersArgs(args: string[]): {
   if (first === 'auth') {
     if (rest.length === 0) return { subcommand: 'auth', showHelp: true };
     let authMethod: ProviderAuthMethod | undefined;
+    let authAccount: string | undefined;
     const positional: string[] = [];
-    for (const arg of rest) {
+    for (let i = 0; i < rest.length; i++) {
+      const arg = rest[i]!;
       if (arg === '--native') authMethod = 'native';
-      else if (arg.startsWith('-')) {
+      else if (arg === '--account') {
+        const value = rest[i + 1];
+        if (!value || value.startsWith('-')) {
+          return { subcommand: 'auth', showHelp: false, error: 'Usage: clodex providers auth <id> --account <name>' };
+        }
+        authAccount = value;
+        i++;
+      } else if (arg.startsWith('-')) {
         return { subcommand: 'auth', showHelp: false, error: `Unknown auth option: ${arg}` };
       } else {
         positional.push(arg);
@@ -122,7 +132,7 @@ export function parseProvidersArgs(args: string[]): {
     if (positional.length !== 1) {
       return { subcommand: 'auth', showHelp: false, error: 'Usage: clodex providers auth <id>' };
     }
-    return { subcommand: 'auth', showHelp: false, removeId: positional[0], authMethod };
+    return { subcommand: 'auth', showHelp: false, removeId: positional[0], authMethod, authAccount };
   }
   if (first === 'remove') {
     if (rest.length === 0) return { subcommand: 'remove', showHelp: false, error: 'Usage: clodex providers remove <id>' };
@@ -165,10 +175,15 @@ async function runProvidersAuthWithCleanupState(
   providerId: string,
   method?: ProviderAuthMethod,
   cleanupState?: ProviderCommandCleanupState,
+  account?: string,
 ): Promise<number> {
   try {
-    const result = await authenticateProvider(providerId, { method });
-    p.log.success(`Signed in to ${result.registryProvider.name} — credential saved to the credential store.`);
+    const result = await authenticateProvider(providerId, { method, account });
+    p.log.success(
+      account
+        ? `Signed in to ${result.registryProvider.name} (account "${account}") — select it at launch with CLODEX_OAUTH_ACCOUNT=${account}.`
+        : `Signed in to ${result.registryProvider.name} — credential saved to the credential store.`,
+    );
     reportCredentialCleanup(result.credentialCleanupPending, cleanupState, true);
     return 0;
   } catch (err) {
@@ -608,7 +623,7 @@ export async function runProvidersCommand(args: string[]): Promise<number> {
       return 0;
     }
     return runWithCredentialCleanup(state =>
-      runProvidersAuthWithCleanupState(parsed.removeId!, parsed.authMethod, state));
+      runProvidersAuthWithCleanupState(parsed.removeId!, parsed.authMethod, state, parsed.authAccount));
   }
 
   relayIntro('Your providers');

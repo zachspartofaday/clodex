@@ -50,6 +50,15 @@ async function removeProviderWithinLifecycle(
     const cleanupQueued = opts?.deleteCredential !== false
       ? await queueCredentialDelete(removedProvider.authRef)
       : false;
+    if (opts?.deleteCredential !== false) {
+      // Named OAuth account slots own disjoint credential lineages; removing
+      // the provider must not orphan them in the credential store.
+      for (const slot of Object.values(removedProvider.authAccounts ?? {})) {
+        if (slot.authRef && slot.authRef !== removedProvider.authRef) {
+          await queueCredentialDelete(slot.authRef);
+        }
+      }
+    }
     saveRegistry(registry);
 
     return {

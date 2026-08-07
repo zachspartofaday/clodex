@@ -3,7 +3,7 @@
 import { resolveProviderCredential, resolveProviderOAuthAccountId, resolveProviderOAuthProviderData } from '../env.js';
 import type { CompatibilityAgent } from '../model-compatibility.js';
 import type { LocalProvider } from '../types.js';
-import { isAnonymousProvider, materializeRegistry } from './materialize.js';
+import { applySelectedOAuthAccount, isAnonymousProvider, materializeRegistry } from './materialize.js';
 import { loadRegistry } from './io.js';
 
 /** Load enabled providers from ~/.clodex/providers.json with resolved credentials. */
@@ -12,10 +12,12 @@ export async function loadRegistryProviders(
   opts?: { agent?: CompatibilityAgent },
 ): Promise<LocalProvider[]> {
   const registry = loadRegistry();
+  const providers = registry.providers.map(provider => applySelectedOAuthAccount(provider));
+  const selectedRegistry = { ...registry, providers };
   const keys = new Map<string, string>();
   const oauthAccountIds = new Map<string, string>();
   const oauthProviderData = new Map<string, Record<string, unknown>>();
-  await Promise.all(registry.providers.map(async provider => {
+  await Promise.all(providers.map(async provider => {
     if (isAnonymousProvider(provider)) return;
     try {
       const key = await resolveProviderCredential(provider.id, provider.authRef, diag);
@@ -34,7 +36,7 @@ export async function loadRegistryProviders(
       }
     }
   }));
-  return materializeRegistry(registry, provider => keys.get(provider.id) ?? null, opts)
+  return materializeRegistry(selectedRegistry, provider => keys.get(provider.id) ?? null, opts)
     .map(provider => ({
       ...provider,
       oauthAccountId: oauthAccountIds.get(provider.id),
@@ -48,8 +50,12 @@ export function loadRegistryProvidersSync(
   opts?: { agent?: CompatibilityAgent },
 ): LocalProvider[] {
   const registry = loadRegistry();
+  const selectedRegistry = {
+    ...registry,
+    providers: registry.providers.map(provider => applySelectedOAuthAccount(provider)),
+  };
   return materializeRegistry(
-    registry,
+    selectedRegistry,
     provider => isAnonymousProvider(provider) ? null : resolveKey(provider.id, provider.authRef),
     opts,
   );
