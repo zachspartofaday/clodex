@@ -539,6 +539,10 @@ function toolArgumentNormalizationGap(
     return undefined;
   }
   const required = requiredToolProps(payload).get(left.name);
+  // Deliberately re-derives the parse/blank-string semantics instead of
+  // calling sanitizedCallArguments: a canary that shares code with the path
+  // it monitors goes blind to forks in that shared wrapper. Do not
+  // "deduplicate" this into the snapshot helper.
   const stripped = (item: JsonObject): string | undefined => {
     if (typeof item.arguments !== 'string') return undefined;
     const raw = item.arguments.trim();
@@ -623,6 +627,10 @@ function continuationMismatchDetails(
   // that genuinely re-sent a different value under the same call_id is
   // indistinguishable from a defect — warning there would cry wolf in a terminal
   // shared with Claude Code's UI. Those are still recorded on the diagnostic.
+  // Attribution caveat: a client that ADDED filler to its echo would also
+  // strip-equal and be blamed on the rule. No known Claude Code path does
+  // that, so the message keeps the direct wording; if such a client appears,
+  // this is the assumption that broke.
   if (toolArgumentGap?.equalAfterStrip === true && warnOnGap) {
     warnToolArgumentNormalizationGap(toolArgumentGap, log);
   }
