@@ -1,5 +1,11 @@
-import { describe, expect, it } from 'vitest';
+import { afterEach, beforeEach, describe, expect, it } from 'vitest';
+import { mkdtempSync, rmSync, writeFileSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
 import { applySelectedOAuthAccount } from '../src/registry/materialize.js';
+import { emptyRegistry, loadRegistry, loadRegistryStrict, saveRegistry } from '../src/registry/io.js';
+import { credentialIsReferenced } from '../src/registry/credential-lifecycle.js';
+import { withRegistryWriteLockSync } from '../src/registry/lock.js';
 import type { RegistryProvider } from '../src/registry/types.js';
 
 const base: RegistryProvider = {
@@ -58,5 +64,64 @@ describe('applySelectedOAuthAccount', () => {
     // "constructor" must be a missing-slot error, not a Function-valued slot.
     const parsed = JSON.parse(JSON.stringify(withSlots)) as RegistryProvider;
     expect(() => applySelectedOAuthAccount(parsed, 'constructor')).toThrow(/has no account named "constructor"/);
+  });
+});
+
+describe('authAccounts registry persistence', () => {
+  let home = '';
+  let path = '';
+
+  beforeEach(() => {
+    home = mkdtempSync(join(tmpdir(), 'clodex-account-slots-'));
+    path = join(home, 'providers.json');
+  });
+
+  afterEach(() => {
+    rmSync(home, { recursive: true, force: true });
+  });
+
+  function registryWith(provider: unknown): string {
+    return `${JSON.stringify({ schemaVersion: 1, providers: [provider] }, null, 2)}\n`;
+  }
+
+  it('named slots survive load → save-back → load', () => {
+    writeFileSync(path, registryWith(withSlots));
+    const loaded = loadRegistry(path);
+    expect(loaded.providers[0]!.authAccounts).toEqual(withSlots.authAccounts);
+
+    // A model refresh saves the PARSED provider back; the slots must not be
+    // shed on that write, or the next launch silently reverts to the default
+    // identity and reconciliation can delete the slot credential.
+    withRegistryWriteLockSync(() => saveRegistry(loaded, path), { lockPath: `${path}.lock` });
+    expect(loadRegistryStrict(path).providers[0]!.authAccounts).toEqual(withSlots.authAccounts);
+  });
+
+  it('fails closed on a malformed slot instead of silently dropping it', () => {
+    const malformed = {
+      ...withSlots,
+      authAccounts: { work: { addedAt: '2026-08-07T00:00:00.000Z' } }, // no authRef
+    };
+    writeFileSync(path, registryWith(malformed));
+    // Lenient load rejects the whole provider record — a slot-less copy of a
+    // slotted provider must never come back — and the strict load propagates.
+    expect(loadRegistry(path).providers).toHaveLength(0);
+    expect(() => loadRegistryStrict(path)).toThrow();
+  });
+
+  it('rejects slot names the auth flow could never have created', () => {
+    const malformed = {
+      ...withSlots,
+      authAccounts: { 'Bad Name!': { authRef: 'keyring:x', addedAt: '2026-08-07T00:00:00.000Z' } },
+    };
+    writeFileSync(path, registryWith(malformed));
+    expect(loadRegistry(path).providers).toHaveLength(0);
+  });
+
+  it('slot credentials count as live references for reconciliation', () => {
+    const registry = { ...emptyRegistry(), providers: [structuredClone(withSlots)] };
+    expect(credentialIsReferenced(registry, withSlots.authAccounts!.work!.authRef)).toBe(true);
+    expect(credentialIsReferenced(registry, withSlots.authAccounts!.alt!.authRef)).toBe(true);
+    expect(credentialIsReferenced(registry, base.authRef)).toBe(true);
+    expect(credentialIsReferenced(registry, 'keyring:oauth:provider:openai-oauth:account:gone::credential::v1:x')).toBe(false);
   });
 });

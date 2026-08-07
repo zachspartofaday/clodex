@@ -5,6 +5,14 @@ import type { ModelRuntimeCompatibility } from '../model-runtime-compatibility.j
 
 export const REGISTRY_SCHEMA_VERSION = 1;
 
+/**
+ * Shape rule for a named OAuth account-slot name — the single home. Slot
+ * names land in credential-store scopes and env values, and the registry
+ * parser must accept exactly what `validateOAuthAccountName` admits, or a
+ * saved slot fails to survive a load.
+ */
+export const OAUTH_ACCOUNT_NAME_RE = /^[a-z0-9][a-z0-9_-]{0,31}$/;
+
 export type RegistrySubscriptionFilter = 'free';
 
 export interface CachedModel {
