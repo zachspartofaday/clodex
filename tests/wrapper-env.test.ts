@@ -41,6 +41,94 @@ describe('computeWrapperEnv', () => {
     expect(env['PATH']).toBe('/usr/bin');
   });
 
+  it('proxy-mode server applies saved built-in alias remaps with explicit env winning', () => {
+    const state: ServerRuntimeState = {
+      mode: 'proxy',
+      port: 17645,
+      pid: process.pid,
+      caPath: '/home/u/.clodex/http-proxy/clodex-ca.pem',
+      startedAt: '2026-07-20T00:00:00.000Z',
+    };
+
+    const env = computeWrapperEnv(
+      { ...baseEnv, ANTHROPIC_DEFAULT_SONNET_MODEL: 'user-pinned' },
+      state,
+      { sonnet: 'wfast', fable: 'wjudge' },
+    );
+
+    // The saved remap reaches a wrapper-launched claude exactly as it does a
+    // per-session launch; an explicitly set env var still wins.
+    expect(env['ANTHROPIC_DEFAULT_FABLE_MODEL']).toBe('wjudge');
+    expect(env['ANTHROPIC_DEFAULT_SONNET_MODEL']).toBe('user-pinned');
+    expect(env['ANTHROPIC_DEFAULT_OPUS_MODEL']).toBeUndefined();
+  });
+
+  it('preserves a session proxy\'s remap when no runtime record exists', () => {
+    // clodex claude --proxy publishes no record, so state is null while the
+    // inherited proxy env still routes through the live session proxy —
+    // clearing the remap there would break the session's own routing.
+    const inSession = computeWrapperEnv({
+      ...baseEnv,
+      HTTPS_PROXY: 'http://127.0.0.1:17645',
+      https_proxy: 'http://127.0.0.1:17645',
+      CLODEX_SESSION_PROXY: '17645:12345',
+      ANTHROPIC_DEFAULT_FABLE_MODEL: 'wjudge',
+      CLODEX_INJECTED_BUILTINS: 'fable=wjudge',
+    }, null, undefined, { isAlive: () => true });
+    expect(inSession['ANTHROPIC_DEFAULT_FABLE_MODEL']).toBe('wjudge');
+    expect(inSession['CLODEX_INJECTED_BUILTINS']).toBe('fable=wjudge');
+    // The same env with a DEAD owner takes the normal no-server clearing.
+    const crashed = computeWrapperEnv({
+      ...baseEnv,
+      HTTPS_PROXY: 'http://127.0.0.1:17645',
+      https_proxy: 'http://127.0.0.1:17645',
+      CLODEX_SESSION_PROXY: '17645:12345',
+      ANTHROPIC_DEFAULT_FABLE_MODEL: 'wjudge',
+      CLODEX_INJECTED_BUILTINS: 'fable=wjudge',
+    }, null, undefined, { isAlive: () => false });
+    expect(crashed['ANTHROPIC_DEFAULT_FABLE_MODEL']).toBeUndefined();
+    expect(crashed['CLODEX_SESSION_PROXY']).toBeUndefined();
+    // The dead session's proxy vars must go too, or claude is stranded on a
+    // dead port despite taking the no-server fallback.
+    expect(crashed['HTTPS_PROXY']).toBeUndefined();
+    expect(crashed['https_proxy']).toBeUndefined();
+    // A proxy var pointing somewhere ELSE is not ours to touch.
+    const foreignProxy = computeWrapperEnv({
+      ...baseEnv,
+      HTTPS_PROXY: 'http://corp-proxy:8080',
+      CLODEX_SESSION_PROXY: '17645:12345',
+    }, null, undefined, { isAlive: () => false });
+    expect(foreignProxy['HTTPS_PROXY']).toBe('http://corp-proxy:8080');
+  });
+
+  it('clears inherited injections on the no-server and endpoint paths', () => {
+    const poisoned = {
+      ...baseEnv,
+      ANTHROPIC_DEFAULT_FABLE_MODEL: 'wjudge',
+      CLODEX_INJECTED_BUILTINS: 'fable',
+    };
+    // No live server: the stale alias must not go straight to Anthropic.
+    const noServer = computeWrapperEnv(poisoned, null);
+    expect(noServer['ANTHROPIC_DEFAULT_FABLE_MODEL']).toBeUndefined();
+    expect(noServer['CLODEX_INJECTED_BUILTINS']).toBeUndefined();
+    // Endpoint server: the alias may not exist in that catalog either.
+    const endpointState: ServerRuntimeState = {
+      mode: 'endpoint', port: 17646, pid: process.pid, startedAt: '2026-07-20T00:00:00.000Z',
+    };
+    const endpoint = computeWrapperEnv(poisoned, endpointState);
+    expect(endpoint['ANTHROPIC_DEFAULT_FABLE_MODEL']).toBeUndefined();
+    expect(endpoint['CLODEX_INJECTED_BUILTINS']).toBeUndefined();
+    // A genuinely user-set var (no sentinel claim) survives untouched.
+    const userSet = computeWrapperEnv({ ...baseEnv, ANTHROPIC_DEFAULT_OPUS_MODEL: 'user-pin' }, null);
+    expect(userSet['ANTHROPIC_DEFAULT_OPUS_MODEL']).toBe('user-pin');
+  });
+
+  it('no live server leaves saved remaps unapplied — claude launches untouched', () => {
+    const env = computeWrapperEnv(baseEnv, null, { fable: 'wjudge' });
+    expect(env['ANTHROPIC_DEFAULT_FABLE_MODEL']).toBeUndefined();
+    expect(env).toEqual(baseEnv);
+  });
+
   it('proxy-mode server removes Anthropic bypasses while preserving unrelated hosts', () => {
     const state: ServerRuntimeState = {
       mode: 'proxy',

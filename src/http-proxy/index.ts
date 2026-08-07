@@ -9,6 +9,8 @@ import { buildHttpProxyRoutes, type HttpProxyRouteResult } from './routes.js';
 import { startHttpProxy, type HttpProxyHandle, type HttpProxyOptions } from './server.js';
 import { ensureHttpProxyCaBundle } from './ca.js';
 import { registerServerRuntimeState, unregisterServerRuntimeState } from '../server-runtime.js';
+import { routableBuiltinOverrides } from '../builtin-alias-env.js';
+import { normalizeRouteLookupId } from '../context-model-id.js';
 import {
   getInferenceRequestLogPath,
   getSessionLogPath,
@@ -251,6 +253,14 @@ export async function runHttpProxyServerCommand(
       port: handle.port,
       pid: process.pid,
       caPath: handle.caCertPath,
+      // Validated against THIS server's route table; wrappers apply these
+      // instead of re-reading preferences that may postdate the server.
+      builtinModelOverrides: routableBuiltinOverrides(
+        loadPreferences().builtinModelOverrides,
+        [...loaded.aliases.map(alias => alias.name), ...loaded.routes.map(route => route.aliasId)],
+        message => console.log(pc.yellow(`  ${message}`)),
+        normalizeRouteLookupId,
+      ),
       startedAt: new Date().toISOString(),
     });
   }

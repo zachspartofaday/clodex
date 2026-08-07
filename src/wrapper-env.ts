@@ -6,6 +6,8 @@
 // stays tiny and fast — it runs for every Claude-Code-spawned agent process.
 
 import type { ServerRuntimeState } from './server-runtime.js';
+import type { BuiltinAliasName } from './types.js';
+import { applyBuiltinModelOverridesWithProvenance, clearInheritedBuiltinOverrides, insideSessionProxy, SESSION_PROXY_ENV } from './builtin-alias-env.js';
 
 const PROXY_ENV_VARS = ['HTTPS_PROXY', 'HTTP_PROXY', 'https_proxy', 'http_proxy'] as const;
 export const REQUIRE_SERVER_ENV = 'CLODEX_REQUIRE_SERVER';
@@ -49,13 +51,49 @@ export function wrapperRequiresServer(env: NodeJS.ProcessEnv): boolean {
   return env[REQUIRE_SERVER_ENV] === '1';
 }
 
+/** kill(pid, 0) liveness: EPERM still means the process exists. */
+function sessionProxyOwnerAlive(pid: number): boolean {
+  try {
+    process.kill(pid, 0);
+    return true;
+  } catch (err) {
+    return (err as NodeJS.ErrnoException).code === 'EPERM';
+  }
+}
+
 export function computeWrapperEnv(
   baseEnv: NodeJS.ProcessEnv,
   state: ServerRuntimeState | null,
+  builtinOverrides?: Partial<Record<BuiltinAliasName, string>>,
+  opts?: { isAlive?: (pid: number) => boolean; sessionProxyActive?: boolean },
 ): NodeJS.ProcessEnv {
   const env: NodeJS.ProcessEnv = { ...baseEnv };
-  // No live server: launch claude completely untouched — a down server must
-  // never break launching claude.
+  // A verified private session is the parent Claude process's routing
+  // authority. It must outrank every independently discovered standalone
+  // server, or a background agent can silently switch profile snapshots and
+  // lose aliases that exist only in its parent session. The wrapper entry
+  // point additionally TCP-probes the marked listener and passes the result
+  // through `sessionProxyActive`; direct callers retain the owner-liveness
+  // fallback for this pure helper.
+  const sessionProxyActive = opts?.sessionProxyActive
+    ?? insideSessionProxy(baseEnv, opts?.isAlive ?? sessionProxyOwnerAlive);
+  if (sessionProxyActive) return env;
+
+  // Every remaining path repoints or drops the routing this marker described.
+  // That includes the proxy vars themselves: a dead session's
+  // HTTP(S)_PROXY would strand claude on a port nobody is listening on,
+  // defeating the no-server fallback. Only vars that still point at the
+  // MARKED session port are cleared — anything else (a corp proxy, a
+  // user-set value) is not ours to touch.
+  const marker = /^(\d+)(?::\d+)?$/.exec((baseEnv[SESSION_PROXY_ENV] ?? '').trim());
+  if (marker) {
+    const marked = `http://127.0.0.1:${marker[1]}`;
+    for (const name of PROXY_ENV_VARS) {
+      if (env[name] === marked) delete env[name];
+    }
+  }
+  delete env[SESSION_PROXY_ENV];
+  clearInheritedBuiltinOverrides(env, baseEnv);
   if (!state) return env;
 
   if (state.mode === 'proxy') {
@@ -65,6 +103,12 @@ export function computeWrapperEnv(
     delete env['ANTHROPIC_BASE_URL'];
     for (const name of PROXY_ENV_VARS) env[name] = proxyUrl;
     if (state.caPath) env['NODE_EXTRA_CA_CERTS'] = state.caPath;
+    // The same built-in remap the per-session `clodex claude` proxy launch
+    // applies (env.ts): saved sonnet/opus/haiku/fable overrides must also
+    // reach a claude launched through a discovered standalone server, or the
+    // remap silently depends on how claude was started. An env var the user
+    // set explicitly still wins.
+    applyBuiltinModelOverridesWithProvenance(env, builtinOverrides, baseEnv);
     removeAnthropicProxyBypass(env);
     return env;
   }

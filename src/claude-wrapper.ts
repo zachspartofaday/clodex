@@ -1,8 +1,9 @@
 // src/claude-wrapper.ts — the `clodex-claude` bin.
 //
-// A tiny, fast exec-style wrapper around the Claude Code binary that injects
-// bridge env for a running standalone `clodex server` (discovered via
-// ~/.clodex/server-runtime.json). Two invocation shapes:
+// A tiny, fast exec-style wrapper around the Claude Code binary that preserves
+// an inherited private `clodex claude --proxy` session or injects bridge env for
+// a running standalone `clodex server` discovered via server-runtime.json. Two
+// invocation shapes:
 //
 //   1. CLAUDE_CODE_PROCESS_WRAPPER contract: Claude Code invokes
 //      `clodex-claude <claude-binary-path> <args...>` for every process it
@@ -15,8 +16,9 @@
 // With a live proxy-mode server: HTTPS_PROXY/HTTP_PROXY + NODE_EXTRA_CA_CERTS
 // point at it and ANTHROPIC_BASE_URL is removed (claude keeps its own
 // Anthropic auth — this is the recommended mode). With a live endpoint-mode
-// server: ANTHROPIC_BASE_URL points at the gateway. With no live server the
-// env is passed through untouched, so claude always launches.
+// server: ANTHROPIC_BASE_URL points at the gateway. With no live bridge, stale
+// clodex session routing is removed while unrelated user env remains intact,
+// and claude still launches.
 //
 // The wrapper REPLACES its own process image with claude (execve) rather than
 // parenting it — see execIntoClaude below for why that distinction matters.
@@ -27,9 +29,11 @@
 import { spawn } from 'node:child_process';
 import { accessSync, constants as fsConstants, statSync } from 'node:fs';
 import { constants as osConstants } from 'node:os';
+import { SESSION_PROXY_ENV } from './builtin-alias-env.js';
 import { findClaudeBinary } from './launch.js';
-import { waitForTcpListenerCandidate } from './listener-ready.js';
+import { waitForTcpListener, waitForTcpListenerCandidate } from './listener-ready.js';
 import {
+  isPidAlive,
   orderWrapperServerCandidates,
   readLiveServerRuntimeStates,
   type ServerRuntimeState,
@@ -47,6 +51,35 @@ function isExecutableFile(path: string): boolean {
   } catch {
     return false;
   }
+}
+
+interface SessionProxyCandidate {
+  kind: 'session';
+  port: number;
+}
+
+interface StandaloneServerCandidate {
+  kind: 'server';
+  port: number;
+  state: ServerRuntimeState;
+}
+
+/**
+ * Recover the private `clodex claude --proxy` listener inherited by a nested
+ * process. The marker is accepted only when it names a valid loopback HTTPS
+ * proxy and its owner pid still exists; the common TCP probe below then proves
+ * the listener itself is reachable before this candidate can win.
+ */
+function inheritedSessionProxyCandidate(env: NodeJS.ProcessEnv): SessionProxyCandidate | null {
+  const marker = /^(\d+):(\d+)$/.exec((env[SESSION_PROXY_ENV] ?? '').trim());
+  if (!marker) return null;
+  const port = Number(marker[1]);
+  const ownerPid = Number(marker[2]);
+  if (!Number.isInteger(port) || port < 1 || port > 65_535) return null;
+  if (!Number.isInteger(ownerPid) || ownerPid <= 0 || !isPidAlive(ownerPid)) return null;
+  const proxyUrl = env['HTTPS_PROXY'] ?? env['https_proxy'] ?? '';
+  if (proxyUrl !== `http://127.0.0.1:${port}`) return null;
+  return { kind: 'session', port };
 }
 
 /**
@@ -114,25 +147,62 @@ async function main(): Promise<void> {
     process.exit(127);
   }
 
-  // Selection policy (see orderWrapperServerCandidates): proxy-mode servers
-  // are preferred over endpoint-mode ones — bridging keeps Claude Code's own
-  // Anthropic auth — with newest startedAt breaking ties within a mode. A fast
-  // probe round covers every candidate so an unreachable preferred record
-  // cannot delay a reachable fallback. Timed-out probes retry under one shared
-  // deadline; definitive connection errors fail immediately.
-  const candidates = orderWrapperServerCandidates(readLiveServerRuntimeStates());
-  const state: ServerRuntimeState | null = await waitForTcpListenerCandidate(
+  const standaloneCandidates: StandaloneServerCandidate[] = orderWrapperServerCandidates(
+    readLiveServerRuntimeStates(),
+  ).map(state => ({ kind: 'server', port: state.port, state }));
+
+  // Service-manager readiness remains a check of ADVERTISED standalone
+  // servers, per the public --check contract. It never launches Claude.
+  if (checkOnly) {
+    const advertised = await waitForTcpListenerCandidate(
+      '127.0.0.1',
+      standaloneCandidates,
+      WRAPPER_SERVER_READY_TIMEOUT_MS,
+      { retryFailure: result => result === 'timeout' },
+    );
+    process.exit(advertised ? 0 : 1);
+  }
+
+  // A verified private session is absolute routing authority for a nested
+  // wrapper. Probe it and the best standalone candidates concurrently, but do
+  // not allow a ready lower-priority server to win while the session's bounded
+  // probe is still pending: under load, one loopback connect may time out even
+  // though the parent session remains healthy. If the session definitively
+  // refuses or misses the shared deadline, the already-running standalone
+  // probe supplies the fallback without adding a second serial delay.
+  const sessionCandidate = inheritedSessionProxyCandidate(process.env);
+  const standaloneProbe = waitForTcpListenerCandidate(
     '127.0.0.1',
-    candidates,
+    standaloneCandidates,
     WRAPPER_SERVER_READY_TIMEOUT_MS,
     { retryFailure: result => result === 'timeout' },
   );
-  if (checkOnly) process.exit(state ? 0 : 1);
-  if (!state && wrapperRequiresServer(process.env)) {
+  const sessionProxyActive = sessionCandidate
+    ? await waitForTcpListener(
+        '127.0.0.1',
+        sessionCandidate.port,
+        WRAPPER_SERVER_READY_TIMEOUT_MS,
+        { retryFailure: result => result === 'timeout' },
+      )
+    : false;
+  const selectedServer = sessionProxyActive ? null : await standaloneProbe;
+  const state: ServerRuntimeState | null = selectedServer?.state ?? null;
+  const hasLiveBridge = sessionProxyActive || state !== null;
+
+  if (!hasLiveBridge && wrapperRequiresServer(process.env)) {
     process.stderr.write('clodex-claude: no live clodex server is available\n');
     process.exit(1);
   }
-  const env = computeWrapperEnv(process.env, state);
+  // Built-in remaps for standalone servers come from the SERVER's runtime
+  // record — validated against the route table it loaded at startup — never
+  // from current preferences. A selected private session preserves its
+  // already-inherited, route-bound environment instead.
+  const env = computeWrapperEnv(
+    process.env,
+    state,
+    state?.builtinModelOverrides,
+    { sessionProxyActive },
+  );
 
   execIntoClaude(claudePath!, claudeArgs, env);
 
