@@ -89,8 +89,18 @@ function inheritedInjections(baseEnv: NodeJS.ProcessEnv): Map<string, string | n
     const trimmed = entry.trim();
     if (!trimmed) continue;
     const eq = trimmed.indexOf('=');
-    if (eq === -1) map.set(trimmed, null);
-    else map.set(trimmed.slice(0, eq), decodeURIComponent(trimmed.slice(eq + 1)));
+    if (eq === -1) {
+      map.set(trimmed, null);
+    } else {
+      // The sentinel is untrusted provenance: a corrupted percent escape must
+      // never throw a launch-killing URIError. A value that cannot be decoded
+      // degrades to the bare-alias match-any claim.
+      try {
+        map.set(trimmed.slice(0, eq), decodeURIComponent(trimmed.slice(eq + 1)));
+      } catch {
+        map.set(trimmed.slice(0, eq), null);
+      }
+    }
   }
   return map;
 }

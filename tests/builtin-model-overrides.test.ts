@@ -85,6 +85,18 @@ describe('applyBuiltinModelOverridesWithProvenance', () => {
     expect(env[WRAPPER_INJECTED_BUILTINS_ENV]).toBeUndefined();
   });
 
+  it('a corrupted sentinel never breaks the launch — malformed values degrade to match-any', () => {
+    const baseEnv: NodeJS.ProcessEnv = {
+      ANTHROPIC_DEFAULT_FABLE_MODEL: 'old-injected',
+      [WRAPPER_INJECTED_BUILTINS_ENV]: 'fable=%',
+    };
+    const env: NodeJS.ProcessEnv = { ...baseEnv };
+    // decodeURIComponent('%') throws URIError; the parser must treat the
+    // entry as untrusted provenance instead of killing the launch.
+    expect(() => applyBuiltinModelOverridesWithProvenance(env, { fable: 'snapshot' }, baseEnv)).not.toThrow();
+    expect(env.ANTHROPIC_DEFAULT_FABLE_MODEL).toBe('snapshot');
+  });
+
   it('a user who replaced an injected var made it explicit — it survives and wins', () => {
     const baseEnv: NodeJS.ProcessEnv = {
       ANTHROPIC_DEFAULT_FABLE_MODEL: 'user-replaced',
