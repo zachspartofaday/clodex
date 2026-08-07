@@ -538,6 +538,15 @@ function toolArgumentNormalizationGap(
   if (canonicalJson(normalizeToolCallJson(left)) === canonicalJson(normalizeToolCallJson(right))) {
     return undefined;
   }
+  // Only ARGUMENT differences are this canary's subject. Two calls that agree
+  // on normalized arguments but differ in some other field would strip-equal
+  // below and emit a misleading #84 warning about a rule that agrees on both
+  // sides — classify those as ordinary mismatches instead.
+  const normalizedArguments = (item: JsonObject): unknown =>
+    (normalizeToolCallJson(item) as JsonObject).arguments;
+  if (canonicalJson(normalizedArguments(left)) === canonicalJson(normalizedArguments(right))) {
+    return undefined;
+  }
   const required = requiredToolProps(payload).get(left.name);
   // Deliberately re-derives the parse/blank-string semantics instead of
   // calling sanitizedCallArguments: a canary that shares code with the path
