@@ -13,7 +13,6 @@ import {
   claudeSessionPromptCacheKey,
   sdkTranslationErrorSignature,
   upstreamMaxRetries,
-  UPSTREAM_MAX_RETRIES_TOTAL_CEILING,
   resetUpstreamMaxRetriesWarningForTests,
 } from '../src/sdk-adapter.js';
 
@@ -1143,31 +1142,30 @@ describe('upstreamMaxRetries knob', () => {
     expect(upstreamMaxRetries()).toBeUndefined();
   });
 
-  it('clamps values above 5 to 5 on idle-timed paths with a one-time stderr warning', () => {
+  it('honors a large budget and warns once instead of clamping', () => {
     const stderr = vi.spyOn(console, 'error').mockImplementation(() => {});
     try {
-      process.env.CLODEX_UPSTREAM_MAX_RETRIES = '8';
-      expect(upstreamMaxRetries()).toBe(5);
-      expect(upstreamMaxRetries()).toBe(5);
+      // A retry-count ceiling assumes the default backoff schedule, but a
+      // short provider retry-after header packs more attempts into the same
+      // deadline — discarding operator-requested retries on a schedule guess
+      // silently shrinks explicit configuration.
+      process.env.CLODEX_UPSTREAM_MAX_RETRIES = '12';
+      expect(upstreamMaxRetries()).toBe(12);
+      expect(upstreamMaxRetries()).toBe(12);
       expect(stderr).toHaveBeenCalledTimes(1);
-      expect(String(stderr.mock.calls[0]![0])).toContain('120s idle timer');
+      expect(String(stderr.mock.calls[0]![0])).toContain('honored');
+      expect(String(stderr.mock.calls[0]![0])).toContain('retry-after');
     } finally {
       stderr.mockRestore();
     }
   });
 
-  it('allows up to 8 on paths bounded only by the ten-minute total timer', () => {
+  it('passes budgets at or below the advisory threshold without warning', () => {
     const stderr = vi.spyOn(console, 'error').mockImplementation(() => {});
     try {
-      // The 120s idle timer does not arm on the generateText branch or the
-      // OpenAI-compat adapter, so a 9th attempt (t=510s) still fits the
-      // 10-minute budget there — the idle clamp must not discard it.
-      process.env.CLODEX_UPSTREAM_MAX_RETRIES = '8';
-      expect(upstreamMaxRetries(undefined, UPSTREAM_MAX_RETRIES_TOTAL_CEILING)).toBe(8);
-      process.env.CLODEX_UPSTREAM_MAX_RETRIES = '12';
-      expect(upstreamMaxRetries(undefined, UPSTREAM_MAX_RETRIES_TOTAL_CEILING)).toBe(8);
-      expect(stderr).toHaveBeenCalledTimes(1);
-      expect(String(stderr.mock.calls[0]![0])).toContain('10-minute request timeout');
+      process.env.CLODEX_UPSTREAM_MAX_RETRIES = '5';
+      expect(upstreamMaxRetries()).toBe(5);
+      expect(stderr).not.toHaveBeenCalled();
     } finally {
       stderr.mockRestore();
     }

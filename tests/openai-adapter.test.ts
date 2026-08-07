@@ -154,3 +154,36 @@ describe('generateOpenAiResponse with forceStream', () => {
     expect(response.usage).toEqual({ prompt_tokens: 1, completion_tokens: 1, total_tokens: 2 });
   });
 });
+
+describe('collectOpenAiStream abort propagation', () => {
+  async function* parts(items: unknown[]): AsyncGenerator<unknown> {
+    for (const item of items) yield item;
+  }
+
+  it('throws on an abort part instead of returning a partial completion', async () => {
+    await expect(collectOpenAiStream(parts([
+      { type: 'text-delta', text: 'partial ' },
+      { type: 'abort' },
+    ]))).rejects.toThrow(/exceeded 600s/);
+  });
+
+  it('throws when the iterator ends with the deadline signal aborted', async () => {
+    const controller = new AbortController();
+    controller.abort();
+    // The SDK can end the iterator quietly on abort; without the check the
+    // caller would seal the truncated text as a successful completion.
+    await expect(collectOpenAiStream(parts([
+      { type: 'text-delta', text: 'truncated' },
+    ]), controller.signal)).rejects.toThrow(/exceeded 600s/);
+  });
+
+  it('still collects a normal stream to completion', async () => {
+    const controller = new AbortController();
+    const collected = await collectOpenAiStream(parts([
+      { type: 'text-delta', text: 'ok' },
+      { type: 'finish', finishReason: 'stop' },
+    ]), controller.signal);
+    expect(collected.text).toBe('ok');
+    expect(collected.finishReason).toBe('stop');
+  });
+});
