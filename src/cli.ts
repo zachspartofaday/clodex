@@ -37,6 +37,7 @@ import {
 } from './favorites-picker.js';
 import { favoriteProviderDisplayName } from './favorite-provider-display.js';
 import { runProvidersCommand, providersHelpText } from './providers-command.js';
+import { runProfilesCommand } from './profiles-command.js';
 import {
   getInferenceSessionLogPath,
   getSessionLogPath,
@@ -274,6 +275,12 @@ export function parseArgs(args: string[]): ParsedArgs {
       else if (arg === '--version' || arg === '-v') parsed.showVersion = true;
       else parsed.claudeArgs.push(arg);
     }
+    return parsed;
+  }
+
+  if (first === 'profiles') {
+    const parsed = emptyParsed('profiles');
+    parsed.claudeArgs = [...rest];
     return parsed;
   }
 
@@ -1509,6 +1516,10 @@ export async function main(args: string[] = process.argv.slice(2)): Promise<numb
       alias: parsed.favoritesAlias,
       unalias: parsed.favoritesUnalias,
     });
+  }
+
+  if (parsed.command === 'profiles') {
+    return runProfilesCommand(parsed.claudeArgs ?? []);
   }
 
   if (parsed.command === 'providers') {

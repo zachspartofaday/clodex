@@ -5,7 +5,7 @@ import type { ModelRuntimeCompatibility } from './model-runtime-compatibility.js
 
 export type ModelFormat = 'anthropic' | 'openai' | 'unsupported';
 
-export type StarterCommand = 'root' | 'claude' | 'server' | 'models' | 'providers' | 'patch';
+export type StarterCommand = 'root' | 'claude' | 'server' | 'models' | 'providers' | 'profiles' | 'patch';
 
 export interface ModelCost {
   input: number;
@@ -72,12 +72,27 @@ export interface ModelAlias extends FavoriteModel {
 
 export type BridgeMode = 'endpoint' | 'proxy';
 
+export interface ModelProfile {
+  savedAt: string;
+  favoriteModels: FavoriteModel[];
+  modelAliases: ModelAlias[];
+}
+
 export interface UserPreferences {
   lastModel?: string;
   lastProvider?: string;
   recentModelsByProvider?: Record<string, string[]>;
   favoriteModels?: FavoriteModel[];
   modelAliases?: ModelAlias[];
+  /**
+   * Named snapshots of favorites + aliases (`clodex profiles`). Applying one
+   * re-points every alias in a single step — the alias NAMES are what agent
+   * definitions and the Claude Code patch tables key on, so switching the
+   * models behind them never touches agent config.
+   */
+  modelProfiles?: Record<string, ModelProfile>;
+  /** Last profile applied by `clodex profiles use`. */
+  activeModelProfile?: string;
   /** Remembered bridge mode for `clodex claude` (set by --endpoint / --proxy). */
   claudeBridgeMode?: BridgeMode;
   /** Remembered bridge mode for `clodex server` (set by --endpoint / --proxy). */
