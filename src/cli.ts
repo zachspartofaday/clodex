@@ -830,17 +830,27 @@ async function runAliasConfigurator(
       ],
     });
     if (p.isCancel(action) || action === 'back') continue;
+    // The configurator operates on the CANONICAL alias, not one array index:
+    // saved configs may hold duplicate records for the same name (equivalent
+    // duplicates collapse in normalization), and touching a single index
+    // either strands a duplicate at the old target (retarget → conflicting
+    // targets → alias drops out of routing) or clears the remap while an
+    // equivalent duplicate remains routable (remove).
+    const canonicalName = canonicalModelAliasName(alias.name) || alias.name;
     if (action === 'remove') {
-      savePreferences({ modelAliases: aliases.filter((_, i) => i !== index) });
-      p.log.success(`Removed alias ${alias.name}.`);
+      const remaining = aliases.filter(entry => !modelAliasMatchesName(entry, canonicalName));
+      const removedCount = aliases.length - remaining.length;
+      savePreferences({ modelAliases: remaining });
+      p.log.success(removedCount > 1
+        ? `Removed ${removedCount} records for alias ${alias.name}.`
+        : `Removed alias ${alias.name}.`);
       clearBuiltinOverridesForRemovedAlias(alias.name);
       continue;
     }
     const target = await pickTarget(favorites, `Route "${alias.name}" to which favorite?`);
     if (!target) continue;
-    const next = aliases.map((entry, i) => i === index
-      ? { name: entry.name, providerId: target.providerId, modelId: target.modelId }
-      : entry);
+    const next = aliases.filter(entry => !modelAliasMatchesName(entry, canonicalName));
+    next.push({ name: canonicalName, providerId: target.providerId, modelId: target.modelId });
     savePreferences({ modelAliases: next });
     p.log.success(`Saved alias ${alias.name} → clodex:${target.providerId}:${target.modelId}.`);
   }
