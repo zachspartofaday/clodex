@@ -41,6 +41,34 @@ describe('computeWrapperEnv', () => {
     expect(env['PATH']).toBe('/usr/bin');
   });
 
+  it('proxy-mode server applies saved built-in alias remaps with explicit env winning', () => {
+    const state: ServerRuntimeState = {
+      mode: 'proxy',
+      port: 17645,
+      pid: process.pid,
+      caPath: '/home/u/.clodex/http-proxy/clodex-ca.pem',
+      startedAt: '2026-07-20T00:00:00.000Z',
+    };
+
+    const env = computeWrapperEnv(
+      { ...baseEnv, ANTHROPIC_DEFAULT_SONNET_MODEL: 'user-pinned' },
+      state,
+      { sonnet: 'wfast', fable: 'wjudge' },
+    );
+
+    // The saved remap reaches a wrapper-launched claude exactly as it does a
+    // per-session launch; an explicitly set env var still wins.
+    expect(env['ANTHROPIC_DEFAULT_FABLE_MODEL']).toBe('wjudge');
+    expect(env['ANTHROPIC_DEFAULT_SONNET_MODEL']).toBe('user-pinned');
+    expect(env['ANTHROPIC_DEFAULT_OPUS_MODEL']).toBeUndefined();
+  });
+
+  it('no live server leaves saved remaps unapplied — claude launches untouched', () => {
+    const env = computeWrapperEnv(baseEnv, null, { fable: 'wjudge' });
+    expect(env['ANTHROPIC_DEFAULT_FABLE_MODEL']).toBeUndefined();
+    expect(env).toEqual(baseEnv);
+  });
+
   it('proxy-mode server removes Anthropic bypasses while preserving unrelated hosts', () => {
     const state: ServerRuntimeState = {
       mode: 'proxy',

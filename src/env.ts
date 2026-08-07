@@ -1,5 +1,7 @@
 // src/env.ts
 import { CONFLICTING_ENV_VARS } from './constants.js';
+import { applyBuiltinModelOverrides } from './builtin-alias-env.js';
+export { BUILTIN_ALIAS_ENV, applyBuiltinModelOverrides } from './builtin-alias-env.js';
 import {
   createCipheriv,
   createDecipheriv,
@@ -97,32 +99,6 @@ export function buildChildEnv(
  * intact, remove only endpoint modes that would bypass api.anthropic.com, and
  * trust the per-user clodex CA for this child process.
  */
-/** Env var behind each remappable built-in alias. */
-export const BUILTIN_ALIAS_ENV: Record<BuiltinAliasName, string> = {
-  sonnet: 'ANTHROPIC_DEFAULT_SONNET_MODEL',
-  opus: 'ANTHROPIC_DEFAULT_OPUS_MODEL',
-  haiku: 'ANTHROPIC_DEFAULT_HAIKU_MODEL',
-  fable: 'ANTHROPIC_DEFAULT_FABLE_MODEL',
-};
-
-/**
- * Claude Code resolves sonnet/opus/haiku/fable to canonical ids BEFORE
- * sending, so remapping a built-in happens through its ANTHROPIC_DEFAULT_*
- * env var, not through a clodex alias. Config supplies the values; an env
- * var the user set explicitly always wins (captured before the conflicting
- * sweep deletes it).
- */
-export function applyBuiltinModelOverrides(
-  env: NodeJS.ProcessEnv,
-  overrides: Partial<Record<BuiltinAliasName, string>> | undefined,
-  explicit: NodeJS.ProcessEnv = process.env,
-): void {
-  for (const [alias, envName] of Object.entries(BUILTIN_ALIAS_ENV) as Array<[BuiltinAliasName, string]>) {
-    const value = explicit[envName] ?? overrides?.[alias];
-    if (value !== undefined && String(value).trim() !== '') env[envName] = String(value).trim();
-  }
-}
-
 export function buildHttpProxyChildEnv(
   proxyPort: number,
   caCertPath: string,

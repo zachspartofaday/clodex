@@ -35,6 +35,8 @@ import {
   type ServerRuntimeState,
 } from './server-runtime.js';
 import { computeWrapperEnv, wrapperRequiresServer } from './wrapper-env.js';
+import { loadPreferences } from './config.js';
+import type { BuiltinAliasName } from './types.js';
 
 const isWindows = process.platform === 'win32';
 const WRAPPER_SERVER_READY_TIMEOUT_MS = 500;
@@ -132,7 +134,13 @@ async function main(): Promise<void> {
     process.stderr.write('clodex-claude: no live clodex server is available\n');
     process.exit(1);
   }
-  const env = computeWrapperEnv(process.env, state);
+  // Saved built-in alias remaps ride along exactly as in a per-session
+  // launch; a config problem must never break launching claude.
+  let builtinOverrides: Partial<Record<BuiltinAliasName, string>> | undefined;
+  try {
+    builtinOverrides = loadPreferences().builtinModelOverrides;
+  } catch { /* launch untouched */ }
+  const env = computeWrapperEnv(process.env, state, builtinOverrides);
 
   execIntoClaude(claudePath!, claudeArgs, env);
 

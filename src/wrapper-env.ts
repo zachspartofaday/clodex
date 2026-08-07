@@ -6,6 +6,8 @@
 // stays tiny and fast — it runs for every Claude-Code-spawned agent process.
 
 import type { ServerRuntimeState } from './server-runtime.js';
+import type { BuiltinAliasName } from './types.js';
+import { applyBuiltinModelOverrides } from './builtin-alias-env.js';
 
 const PROXY_ENV_VARS = ['HTTPS_PROXY', 'HTTP_PROXY', 'https_proxy', 'http_proxy'] as const;
 export const REQUIRE_SERVER_ENV = 'CLODEX_REQUIRE_SERVER';
@@ -52,6 +54,7 @@ export function wrapperRequiresServer(env: NodeJS.ProcessEnv): boolean {
 export function computeWrapperEnv(
   baseEnv: NodeJS.ProcessEnv,
   state: ServerRuntimeState | null,
+  builtinOverrides?: Partial<Record<BuiltinAliasName, string>>,
 ): NodeJS.ProcessEnv {
   const env: NodeJS.ProcessEnv = { ...baseEnv };
   // No live server: launch claude completely untouched — a down server must
@@ -65,6 +68,12 @@ export function computeWrapperEnv(
     delete env['ANTHROPIC_BASE_URL'];
     for (const name of PROXY_ENV_VARS) env[name] = proxyUrl;
     if (state.caPath) env['NODE_EXTRA_CA_CERTS'] = state.caPath;
+    // The same built-in remap the per-session `clodex claude` proxy launch
+    // applies (env.ts): saved sonnet/opus/haiku/fable overrides must also
+    // reach a claude launched through a discovered standalone server, or the
+    // remap silently depends on how claude was started. An env var the user
+    // set explicitly still wins.
+    applyBuiltinModelOverrides(env, builtinOverrides, baseEnv);
     removeAnthropicProxyBypass(env);
     return env;
   }
