@@ -78,6 +78,8 @@ export function loadPreferences(): UserPreferences {
     recentModelsByProvider: config.recentModelsByProvider,
     favoriteModels: config.favoriteModels,
     modelAliases: config.modelAliases,
+    modelProfiles: config.modelProfiles,
+    activeModelProfile: config.activeModelProfile,
     claudeBridgeMode: config.claudeBridgeMode,
     serverBridgeMode: config.serverBridgeMode,
     appPathOverrides: config.appPathOverrides,
@@ -87,13 +89,18 @@ export function loadPreferences(): UserPreferences {
   };
 }
 
-export function savePreferences(prefs: Partial<Pick<UserPreferences, 'lastModel' | 'lastProvider' | 'recentModelsByProvider' | 'favoriteModels' | 'modelAliases' | 'claudeBridgeMode' | 'serverBridgeMode' | 'appPathOverrides' | 'localPatchesEnabled' | 'recentLaunchFolders'>>): void {
+export function savePreferences(prefs: Partial<Pick<UserPreferences, 'lastModel' | 'lastProvider' | 'recentModelsByProvider' | 'favoriteModels' | 'modelAliases' | 'modelProfiles' | 'activeModelProfile' | 'claudeBridgeMode' | 'serverBridgeMode' | 'appPathOverrides' | 'localPatchesEnabled' | 'recentLaunchFolders'>>): void {
   updateConfig(config => {
     if (prefs.lastModel !== undefined) config.lastModel = prefs.lastModel;
     if (prefs.lastProvider !== undefined) config.lastProvider = prefs.lastProvider;
     if (prefs.recentModelsByProvider !== undefined) config.recentModelsByProvider = prefs.recentModelsByProvider;
     if (prefs.favoriteModels !== undefined) config.favoriteModels = prefs.favoriteModels;
     if (prefs.modelAliases !== undefined) config.modelAliases = prefs.modelAliases;
+    if (prefs.modelProfiles !== undefined) config.modelProfiles = prefs.modelProfiles;
+    if (prefs.activeModelProfile !== undefined) {
+      if (prefs.activeModelProfile === '') delete config.activeModelProfile;
+      else config.activeModelProfile = prefs.activeModelProfile;
+    }
     if (prefs.claudeBridgeMode !== undefined) config.claudeBridgeMode = prefs.claudeBridgeMode;
     if (prefs.serverBridgeMode !== undefined) config.serverBridgeMode = prefs.serverBridgeMode;
     if (prefs.appPathOverrides !== undefined) config.appPathOverrides = prefs.appPathOverrides;
