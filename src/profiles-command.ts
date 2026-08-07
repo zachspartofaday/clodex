@@ -75,7 +75,9 @@ ${pc.bold('Why:')} agent definitions pin alias names (sol, luna, ...). A profile
 re-points the models behind those names in one step — e.g. when a plan's
 usage runs out. The next ${pc.bold('clodex claude')} launch detects the change
 and offers to re-patch — accept it, or run ${pc.bold('clodex patch')} directly.
-Running sessions keep their old routing until relaunched.`;
+Running sessions keep their old routing until relaunched, and a standalone
+${pc.bold('clodex server')} keeps its old routing until restarted — clients
+launched through it follow the server's snapshot, not this profile.`;
 }
 
 export async function runProfilesCommand(args: string[]): Promise<number> {
@@ -148,7 +150,7 @@ export async function runProfilesCommand(args: string[]): Promise<number> {
         activeModelProfile: name,
       });
       p.log.success(`Applied profile "${name}": ${aliasSummary(profile)}`);
-      p.log.info('New clodex claude launches use this routing. The launcher will offer to re-patch for the changed model config — accept it, or run `clodex patch` now. Running sessions keep their old routing until relaunched.');
+      p.log.info('New clodex claude launches use this routing. The launcher will offer to re-patch for the changed model config — accept it, or run `clodex patch` now. Running sessions keep their old routing until relaunched, and a standalone `clodex server` keeps its old routing until you RESTART it — clients launched through it (clodex-claude) follow the server, not this profile.');
       return 0;
     }
 
