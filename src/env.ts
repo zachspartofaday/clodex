@@ -39,7 +39,7 @@ import {
   withCredentialMutationLock,
   withRegistryWriteLock,
 } from './registry/lock.js';
-import type { ConflictInfo } from './types.js';
+import type { BuiltinAliasName, ConflictInfo } from './types.js';
 import { removeAnthropicProxyBypass } from './wrapper-env.js';
 
 export function detectConflicts(): ConflictInfo[] {
@@ -97,12 +97,44 @@ export function buildChildEnv(
  * intact, remove only endpoint modes that would bypass api.anthropic.com, and
  * trust the per-user clodex CA for this child process.
  */
-export function buildHttpProxyChildEnv(proxyPort: number, caCertPath: string): NodeJS.ProcessEnv {
+/** Env var behind each remappable built-in alias. */
+export const BUILTIN_ALIAS_ENV: Record<BuiltinAliasName, string> = {
+  sonnet: 'ANTHROPIC_DEFAULT_SONNET_MODEL',
+  opus: 'ANTHROPIC_DEFAULT_OPUS_MODEL',
+  haiku: 'ANTHROPIC_DEFAULT_HAIKU_MODEL',
+  fable: 'ANTHROPIC_DEFAULT_FABLE_MODEL',
+};
+
+/**
+ * Claude Code resolves sonnet/opus/haiku/fable to canonical ids BEFORE
+ * sending, so remapping a built-in happens through its ANTHROPIC_DEFAULT_*
+ * env var, not through a clodex alias. Config supplies the values; an env
+ * var the user set explicitly always wins (captured before the conflicting
+ * sweep deletes it).
+ */
+export function applyBuiltinModelOverrides(
+  env: NodeJS.ProcessEnv,
+  overrides: Partial<Record<BuiltinAliasName, string>> | undefined,
+  explicit: NodeJS.ProcessEnv = process.env,
+): void {
+  for (const [alias, envName] of Object.entries(BUILTIN_ALIAS_ENV) as Array<[BuiltinAliasName, string]>) {
+    const value = explicit[envName] ?? overrides?.[alias];
+    if (value !== undefined && String(value).trim() !== '') env[envName] = String(value).trim();
+  }
+}
+
+export function buildHttpProxyChildEnv(
+  proxyPort: number,
+  caCertPath: string,
+  builtinOverrides?: Partial<Record<BuiltinAliasName, string>>,
+): NodeJS.ProcessEnv {
   const env: NodeJS.ProcessEnv = { ...process.env };
+  const explicit: NodeJS.ProcessEnv = { ...process.env };
   for (const name of CONFLICTING_ENV_VARS) {
     if (name === 'ANTHROPIC_API_KEY' || name === 'ANTHROPIC_AUTH_TOKEN' || name === 'ANTHROPIC_MODEL') continue;
     delete env[name];
   }
+  applyBuiltinModelOverrides(env, builtinOverrides, explicit);
   const proxyUrl = `http://127.0.0.1:${proxyPort}`;
   env['HTTPS_PROXY'] = proxyUrl;
   env['HTTP_PROXY'] = proxyUrl;

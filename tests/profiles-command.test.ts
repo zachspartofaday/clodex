@@ -95,6 +95,18 @@ describe('clodex profiles', () => {
     expect(configState.current.activeModelProfile).toBeUndefined();
   });
 
+  it('round-trips built-in alias overrides through profiles', async () => {
+    configState.current.builtinModelOverrides = { sonnet: 'wfast', fable: 'wjudge' };
+    await runProfilesCommand(['save', 'remapped']);
+    configState.current.builtinModelOverrides = {};
+    await runProfilesCommand(['save', 'native']);
+
+    await runProfilesCommand(['use', 'remapped']);
+    expect(configState.current.builtinModelOverrides).toEqual({ sonnet: 'wfast', fable: 'wjudge' });
+    await runProfilesCommand(['use', 'native']);
+    expect(configState.current.builtinModelOverrides ?? {}).toEqual({});
+  });
+
   it('never treats prototype names as saved profiles', async () => {
     expect(await runProfilesCommand(['use', 'constructor'])).toBe(1);
     expect(vi.mocked(prompts.log.error)).toHaveBeenCalledWith(
