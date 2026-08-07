@@ -115,6 +115,13 @@ interface ConnectionEntry {
   responseId?: string;
   requestInput?: unknown[];
   expectedAssistant?: unknown[];
+  /**
+   * Per-tool required sets from the request that created this head. The
+   * echoed call was sanitized under THIS schema, so the canary must compare
+   * with it — a tool whose schema changed on a later turn would otherwise
+   * mis-classify a genuine strip-rule fork.
+   */
+  requiredToolProps?: Map<string, Set<string>>;
   /** Memoized canonical form of the stored prefix; cleared whenever it changes. */
   canonicalPrefix?: string[];
   canonicalEchoablePrefix?: string[];
@@ -525,6 +532,7 @@ function toolArgumentNormalizationGap(
   expected: unknown,
   actual: unknown,
   payload: JsonObject,
+  headRequiredProps?: Map<string, Set<string>>,
 ): Record<string, unknown> | undefined {
   if (conversationItemKind(expected) !== 'function_call') return undefined;
   if (conversationItemKind(actual) !== 'function_call') return undefined;
@@ -547,7 +555,8 @@ function toolArgumentNormalizationGap(
   if (canonicalJson(normalizedArguments(left)) === canonicalJson(normalizedArguments(right))) {
     return undefined;
   }
-  const required = requiredToolProps(payload).get(left.name);
+  // The head's schema is authoritative: the echo was sanitized under it.
+  const required = (headRequiredProps ?? requiredToolProps(payload)).get(left.name);
   // Deliberately re-derives the parse/blank-string semantics instead of
   // calling sanitizedCallArguments: a canary that shares code with the path
   // it monitors goes blind to forks in that shared wrapper. Do not
@@ -652,7 +661,7 @@ function continuationMismatchDetails(
       }
     }
   }
-  const toolArgumentGap = toolArgumentNormalizationGap(gapExpected, actual, payload);
+  const toolArgumentGap = toolArgumentNormalizationGap(gapExpected, actual, payload, entry.requiredToolProps);
   // Only the provably-ours case reaches stderr. `equalAfterStrip === false` means
   // the arguments differ for a reason the strip rule cannot explain, and a client
   // that genuinely re-sent a different value under the same call_id is
@@ -1640,6 +1649,7 @@ function handleSocketMessage(entry: ConnectionEntry, data: RawData): void {
       entry.responseId = ctx.responseId;
       entry.requestInput = inputArray(ctx.originalPayload);
       entry.expectedAssistant = expectedAssistantItems(ctx);
+      entry.requiredToolProps = requiredToolProps(ctx.originalPayload);
       // The stored prefix just changed, so the memoized canonical form is stale.
       entry.canonicalPrefix = undefined;
       entry.canonicalEchoablePrefix = undefined;
@@ -1915,6 +1925,15 @@ export function createResponsesWebSocketFetch(
         `history mismatch starting an additional chain; retained ${candidates.length} existing head(s) `
         + `(${continuationMismatchSummary(diagnosticEntry, payload, debug, mismatchDump)})`,
       );
+      // No head matched, so clodex abandoned EVERY candidate this turn — a
+      // normalization gap on any of them is a give-up-shaped gap. Warning only
+      // for the most recently used head let a strip-rule regression on an
+      // older head go silent behind a newer head's ordinary mismatch. The
+      // dedup + hard cap in the warn helpers keep this from becoming a stream.
+      for (const candidate of candidates) {
+        if (candidate === diagnosticEntry || candidate.inFlight) continue;
+        continuationMismatchDetails(candidate, payload, debug, true);
+      }
       decision = 'history_mismatch_new_head';
     } else if (partitionKey) {
       decision = 'new_partition_head';
