@@ -749,21 +749,29 @@ async function runAliasConfigurator(
     if (choice.startsWith('builtin-')) {
       const builtin = choice.slice('builtin-'.length) as 'sonnet' | 'opus' | 'haiku' | 'fable';
       const current = prefs.builtinModelOverrides ?? {};
+      // Offer only what the proxy will actually route. A saved alias that
+      // normalizeModelAliases rejects (conflicting duplicates) or whose
+      // favorite/provider is unavailable would inject a model name through
+      // ANTHROPIC_DEFAULT_*_MODEL that the MITM cannot handle.
+      let resolved: Awaited<ReturnType<typeof loadHttpProxyRoutes>>;
+      try {
+        resolved = await loadHttpProxyRoutes();
+      } catch (err) {
+        p.log.warn(`Cannot resolve routable models right now (${err instanceof Error ? err.message : String(err)}); try again once providers load.`);
+        continue;
+      }
       const routable: Array<{ value: string; label: string; hint: string }> = [
         { value: '__native__', label: 'Native default', hint: 'remove the remap' },
-        ...aliases.map(alias => ({
+        ...resolved.aliases.map(alias => ({
           value: `use:${alias.name}`,
           label: `alias ${pc.bold(alias.name)}`,
-          hint: `clodex:${String(alias.providerId)}:${String(alias.modelId)}`,
+          hint: alias.displayName,
         })),
-        ...favorites.map(favorite => {
-          const entry = modelLookup.get(`${favorite.providerId}:${favorite.modelId}`);
-          return {
-            value: `use:clodex:${favorite.providerId}:${favorite.modelId}`,
-            label: entry ? `${fmtModel(entry.modelName)} ${pc.dim(`(${entry.providerName})`)}` : String(favorite.modelId),
-            hint: `clodex:${favorite.providerId}:${favorite.modelId}`,
-          };
-        }),
+        ...resolved.routes.map(route => ({
+          value: `use:${route.aliasId}`,
+          label: route.displayName,
+          hint: route.aliasId,
+        })),
       ];
       const picked = await p.select<string>({
         message: `Route built-in "${builtin}" to`,
