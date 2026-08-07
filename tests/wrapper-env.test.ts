@@ -88,6 +88,17 @@ describe('computeWrapperEnv', () => {
     }, null, undefined, { isAlive: () => false });
     expect(crashed['ANTHROPIC_DEFAULT_FABLE_MODEL']).toBeUndefined();
     expect(crashed['CLODEX_SESSION_PROXY']).toBeUndefined();
+    // The dead session's proxy vars must go too, or claude is stranded on a
+    // dead port despite taking the no-server fallback.
+    expect(crashed['HTTPS_PROXY']).toBeUndefined();
+    expect(crashed['https_proxy']).toBeUndefined();
+    // A proxy var pointing somewhere ELSE is not ours to touch.
+    const foreignProxy = computeWrapperEnv({
+      ...baseEnv,
+      HTTPS_PROXY: 'http://corp-proxy:8080',
+      CLODEX_SESSION_PROXY: '17645:12345',
+    }, null, undefined, { isAlive: () => false });
+    expect(foreignProxy['HTTPS_PROXY']).toBe('http://corp-proxy:8080');
   });
 
   it('clears inherited injections on the no-server and endpoint paths', () => {

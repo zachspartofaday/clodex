@@ -78,6 +78,18 @@ export function computeWrapperEnv(
   // launching claude.
   if (!state && insideSessionProxy(baseEnv, opts?.isAlive ?? sessionProxyOwnerAlive)) return env;
   // Every remaining path repoints or drops the routing this marker described.
+  // That includes the proxy vars themselves: a dead session's
+  // HTTP(S)_PROXY would strand claude on a port nobody is listening on,
+  // defeating the no-server fallback. Only vars that still point at the
+  // MARKED session port are cleared — anything else (a corp proxy, a
+  // user-set value) is not ours to touch.
+  const marker = /^(\d+)(?::\d+)?$/.exec((baseEnv[SESSION_PROXY_ENV] ?? '').trim());
+  if (marker) {
+    const marked = `http://127.0.0.1:${marker[1]}`;
+    for (const name of PROXY_ENV_VARS) {
+      if (env[name] === marked) delete env[name];
+    }
+  }
   delete env[SESSION_PROXY_ENV];
   clearInheritedBuiltinOverrides(env, baseEnv);
   if (!state) return env;
