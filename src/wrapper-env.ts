@@ -65,18 +65,20 @@ export function computeWrapperEnv(
   baseEnv: NodeJS.ProcessEnv,
   state: ServerRuntimeState | null,
   builtinOverrides?: Partial<Record<BuiltinAliasName, string>>,
-  opts?: { isAlive?: (pid: number) => boolean },
+  opts?: { isAlive?: (pid: number) => boolean; sessionProxyActive?: boolean },
 ): NodeJS.ProcessEnv {
   const env: NodeJS.ProcessEnv = { ...baseEnv };
-  // Remaps a previous launch injected are OUR state, not the user's: they
-  // must never outlive the launch that issued them, or a no-server launch
-  // sends the alias straight to Anthropic and an endpoint launch sends it to
-  // a catalog that may not expose it. One exception: a wrapper invoked
-  // INSIDE a live per-session proxy (which publishes no runtime record)
-  // must keep that session's remap — the inherited proxy still routes it.
-  // Everything else stays untouched — a down server must never break
-  // launching claude.
-  if (!state && insideSessionProxy(baseEnv, opts?.isAlive ?? sessionProxyOwnerAlive)) return env;
+  // A verified private session is the parent Claude process's routing
+  // authority. It must outrank every independently discovered standalone
+  // server, or a background agent can silently switch profile snapshots and
+  // lose aliases that exist only in its parent session. The wrapper entry
+  // point additionally TCP-probes the marked listener and passes the result
+  // through `sessionProxyActive`; direct callers retain the owner-liveness
+  // fallback for this pure helper.
+  const sessionProxyActive = opts?.sessionProxyActive
+    ?? insideSessionProxy(baseEnv, opts?.isAlive ?? sessionProxyOwnerAlive);
+  if (sessionProxyActive) return env;
+
   // Every remaining path repoints or drops the routing this marker described.
   // That includes the proxy vars themselves: a dead session's
   // HTTP(S)_PROXY would strand claude on a port nobody is listening on,
