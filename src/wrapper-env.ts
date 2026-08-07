@@ -7,7 +7,7 @@
 
 import type { ServerRuntimeState } from './server-runtime.js';
 import type { BuiltinAliasName } from './types.js';
-import { applyBuiltinModelOverridesWithProvenance, clearInheritedBuiltinOverrides, insideSessionProxy } from './builtin-alias-env.js';
+import { applyBuiltinModelOverridesWithProvenance, clearInheritedBuiltinOverrides, insideSessionProxy, SESSION_PROXY_ENV } from './builtin-alias-env.js';
 
 const PROXY_ENV_VARS = ['HTTPS_PROXY', 'HTTP_PROXY', 'https_proxy', 'http_proxy'] as const;
 export const REQUIRE_SERVER_ENV = 'CLODEX_REQUIRE_SERVER';
@@ -66,6 +66,8 @@ export function computeWrapperEnv(
   // Everything else stays untouched — a down server must never break
   // launching claude.
   if (!state && insideSessionProxy(baseEnv)) return env;
+  // Every remaining path repoints or drops the routing this marker described.
+  delete env[SESSION_PROXY_ENV];
   clearInheritedBuiltinOverrides(env, baseEnv);
   if (!state) return env;
 

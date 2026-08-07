@@ -71,7 +71,7 @@ describe('computeWrapperEnv', () => {
       ...baseEnv,
       HTTPS_PROXY: 'http://127.0.0.1:17645',
       https_proxy: 'http://127.0.0.1:17645',
-      NODE_EXTRA_CA_CERTS: '/home/u/.clodex/http-proxy/clodex-ca.pem',
+      CLODEX_SESSION_PROXY: '17645',
       ANTHROPIC_DEFAULT_FABLE_MODEL: 'wjudge',
       CLODEX_INJECTED_BUILTINS: 'fable=wjudge',
     }, null);
