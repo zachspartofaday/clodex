@@ -22,6 +22,7 @@ import { pickLocalModel } from './prompts.js';
 import { fetchProviderCatalog, providersForPicker, resolveLocalProviderApiKey } from './provider-catalog.js';
 import { VERSION } from './constants.js';
 import type { BuiltinAliasName, ParsedArgs, FavoriteModel, LocalProvider, LocalProviderModel } from './types.js';
+import { routableBuiltinOverrides } from './builtin-alias-env.js';
 import { addFavorite, removeFavorite, isFavorite } from './favorites.js';
 import {
   canonicalModelAliasName,
@@ -1246,7 +1247,11 @@ async function runClaudeHttpProxyCommand(
   const childEnv = buildHttpProxyChildEnv(
     handle.port,
     handle.caCertPath,
-    loadPreferences().builtinModelOverrides,
+    routableBuiltinOverrides(
+      loadPreferences().builtinModelOverrides,
+      [...loaded.aliases.map(alias => alias.name), ...loaded.routes.map(route => route.aliasId)],
+      message => { if (!agentStdout) p.log.warn(message); },
+    ),
   );
   const debugLogPath = parsed.trace
     ? prepareClaudeTraceLog(getSessionLogPath('claude-debug'))
