@@ -129,6 +129,50 @@ export const PROVIDER_TEMPLATES: ProviderTemplate[] = [
     supported: true,
   },
   {
+    id: 'meta-ai',
+    name: 'Meta AI',
+    authType: 'api',
+    npm: '@ai-sdk/openai-compatible',
+    defaultBaseUrl: 'https://api.meta.ai/v1',
+    signupUrl: 'https://dev.meta.ai',
+    modelSource: 'api-list',
+    // /v1/models requires the key (401 invalid_api_key on a bad one), so the
+    // shared api-list flow validates the credential itself — no probe needed.
+    // Curated metadata supplies the context windows the live list omits;
+    // overlay keeps newly launched Meta models visible.
+    staticModels: [
+      {
+        id: 'muse-spark-1.1',
+        name: 'Muse Spark 1.1',
+        contextWindow: 1_048_576,
+        modelFormat: 'openai',
+        family: 'muse-spark',
+        brand: 'Meta',
+        modalities: ['text', 'image'],
+      },
+      {
+        id: 'muse-spark-1.2',
+        name: 'Muse Spark 1.2',
+        contextWindow: 1_048_576,
+        modelFormat: 'openai',
+        family: 'muse-spark',
+        brand: 'Meta',
+        modalities: ['text', 'image'],
+      },
+      {
+        id: 'muse-spark-1.2-contributor',
+        name: 'Muse Spark 1.2 (Contributor)',
+        contextWindow: 1_048_576,
+        modelFormat: 'openai',
+        family: 'muse-spark',
+        brand: 'Meta',
+        modalities: ['text', 'image'],
+      },
+    ],
+    staticModelPolicy: 'overlay',
+    supported: true,
+  },
+  {
     id: 'openai-oauth',
     name: 'OpenAI (ChatGPT)',
     authType: 'oauth',
