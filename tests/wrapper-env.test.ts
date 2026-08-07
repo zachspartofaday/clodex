@@ -71,12 +71,23 @@ describe('computeWrapperEnv', () => {
       ...baseEnv,
       HTTPS_PROXY: 'http://127.0.0.1:17645',
       https_proxy: 'http://127.0.0.1:17645',
-      CLODEX_SESSION_PROXY: '17645',
+      CLODEX_SESSION_PROXY: '17645:12345',
       ANTHROPIC_DEFAULT_FABLE_MODEL: 'wjudge',
       CLODEX_INJECTED_BUILTINS: 'fable=wjudge',
-    }, null);
+    }, null, undefined, { isAlive: () => true });
     expect(inSession['ANTHROPIC_DEFAULT_FABLE_MODEL']).toBe('wjudge');
     expect(inSession['CLODEX_INJECTED_BUILTINS']).toBe('fable=wjudge');
+    // The same env with a DEAD owner takes the normal no-server clearing.
+    const crashed = computeWrapperEnv({
+      ...baseEnv,
+      HTTPS_PROXY: 'http://127.0.0.1:17645',
+      https_proxy: 'http://127.0.0.1:17645',
+      CLODEX_SESSION_PROXY: '17645:12345',
+      ANTHROPIC_DEFAULT_FABLE_MODEL: 'wjudge',
+      CLODEX_INJECTED_BUILTINS: 'fable=wjudge',
+    }, null, undefined, { isAlive: () => false });
+    expect(crashed['ANTHROPIC_DEFAULT_FABLE_MODEL']).toBeUndefined();
+    expect(crashed['CLODEX_SESSION_PROXY']).toBeUndefined();
   });
 
   it('clears inherited injections on the no-server and endpoint paths', () => {

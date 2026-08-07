@@ -110,19 +110,27 @@ describe('applyBuiltinModelOverridesWithProvenance', () => {
 });
 
 describe('insideSessionProxy', () => {
-  it('requires the explicit marker to agree with the live proxy var', () => {
-    // Path heuristics fail for custom CLODEX_HOMEs and combined-ca bundles,
-    // so detection rests on the marker the session launcher stamps.
-    expect(insideSessionProxy({
+  const alive = () => true;
+  const dead = () => false;
+
+  it('requires marker agreement with the proxy var AND a live owner', () => {
+    const session = {
       HTTPS_PROXY: 'http://127.0.0.1:17645',
-      CLODEX_SESSION_PROXY: '17645',
-    })).toBe(true);
-    // Marker without a matching proxy (stale), proxy without marker, corp
-    // proxies, and empty envs are all non-sessions.
-    expect(insideSessionProxy({ CLODEX_SESSION_PROXY: '17645' })).toBe(false);
-    expect(insideSessionProxy({ HTTPS_PROXY: 'http://127.0.0.1:17645' })).toBe(false);
-    expect(insideSessionProxy({ HTTPS_PROXY: 'http://127.0.0.1:9999', CLODEX_SESSION_PROXY: '17645' })).toBe(false);
-    expect(insideSessionProxy({ HTTPS_PROXY: 'http://corp-proxy:8080', CLODEX_SESSION_PROXY: '8080' })).toBe(false);
-    expect(insideSessionProxy({})).toBe(false);
+      CLODEX_SESSION_PROXY: '17645:12345',
+    };
+    expect(insideSessionProxy(session, alive)).toBe(true);
+    // A crashed session must fall through to the no-server path instead of
+    // sending every request to a dead port.
+    expect(insideSessionProxy(session, dead)).toBe(false);
+  });
+
+  it('never preserves for stale, legacy, or foreign shapes', () => {
+    // Port-only legacy markers are unverifiable.
+    expect(insideSessionProxy({ HTTPS_PROXY: 'http://127.0.0.1:17645', CLODEX_SESSION_PROXY: '17645' }, alive)).toBe(false);
+    expect(insideSessionProxy({ CLODEX_SESSION_PROXY: '17645:12345' }, alive)).toBe(false);
+    expect(insideSessionProxy({ HTTPS_PROXY: 'http://127.0.0.1:17645' }, alive)).toBe(false);
+    expect(insideSessionProxy({ HTTPS_PROXY: 'http://127.0.0.1:9999', CLODEX_SESSION_PROXY: '17645:12345' }, alive)).toBe(false);
+    expect(insideSessionProxy({ HTTPS_PROXY: 'http://corp-proxy:8080', CLODEX_SESSION_PROXY: '8080:12345' }, alive)).toBe(false);
+    expect(insideSessionProxy({}, alive)).toBe(false);
   });
 });

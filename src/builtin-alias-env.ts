@@ -140,10 +140,11 @@ export function applyBuiltinModelOverridesWithProvenance(
 }
 
 /**
- * Explicit marker a per-session proxy launch stamps into its child env: the
- * proxy's port. Path heuristics (a "clodex" substring in the CA path) fail
- * for custom CLODEX_HOMEs and combined-ca bundles, so session-proxy
- * detection uses this marker cross-checked against the live proxy var.
+ * Explicit marker a per-session proxy launch stamps into its child env:
+ * `<port>:<owner-pid>`. Path heuristics (a "clodex" substring in the CA
+ * path) fail for custom CLODEX_HOMEs and combined-ca bundles, so
+ * session-proxy detection uses this marker cross-checked against the live
+ * proxy var AND the owner process's liveness.
  */
 export const SESSION_PROXY_ENV = 'CLODEX_SESSION_PROXY';
 
@@ -153,12 +154,19 @@ export const SESSION_PROXY_ENV = 'CLODEX_SESSION_PROXY';
  * so a wrapper invoked inside that session sees state=null while the
  * inherited HTTP(S)_PROXY still points at the running proxy. Clearing the
  * session's remap there would break the very routing the session set up.
- * The marker must AGREE with the proxy var — a stale marker whose port no
- * longer matches the live proxy is not a session.
+ * Three conditions gate preservation: the marker parses as
+ * `<port>:<owner-pid>`, the proxy var agrees on the port, and the owner
+ * process is still alive — a crashed session must fall through to the
+ * normal no-server path instead of sending requests to a dead port.
+ * Port-only markers (older format) are unverifiable and never preserve.
  */
-export function insideSessionProxy(baseEnv: NodeJS.ProcessEnv): boolean {
-  const port = (baseEnv[SESSION_PROXY_ENV] ?? '').trim();
-  if (!/^\d+$/.test(port)) return false;
+export function insideSessionProxy(
+  baseEnv: NodeJS.ProcessEnv,
+  isAlive: (pid: number) => boolean,
+): boolean {
+  const marker = /^(\d+):(\d+)$/.exec((baseEnv[SESSION_PROXY_ENV] ?? '').trim());
+  if (!marker) return false;
   const proxy = baseEnv['HTTPS_PROXY'] ?? baseEnv['https_proxy'] ?? '';
-  return proxy === `http://127.0.0.1:${port}`;
+  if (proxy !== `http://127.0.0.1:${marker[1]}`) return false;
+  return isAlive(Number(marker[2]));
 }

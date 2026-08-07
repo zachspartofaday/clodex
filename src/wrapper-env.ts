@@ -51,10 +51,21 @@ export function wrapperRequiresServer(env: NodeJS.ProcessEnv): boolean {
   return env[REQUIRE_SERVER_ENV] === '1';
 }
 
+/** kill(pid, 0) liveness: EPERM still means the process exists. */
+function sessionProxyOwnerAlive(pid: number): boolean {
+  try {
+    process.kill(pid, 0);
+    return true;
+  } catch (err) {
+    return (err as NodeJS.ErrnoException).code === 'EPERM';
+  }
+}
+
 export function computeWrapperEnv(
   baseEnv: NodeJS.ProcessEnv,
   state: ServerRuntimeState | null,
   builtinOverrides?: Partial<Record<BuiltinAliasName, string>>,
+  opts?: { isAlive?: (pid: number) => boolean },
 ): NodeJS.ProcessEnv {
   const env: NodeJS.ProcessEnv = { ...baseEnv };
   // Remaps a previous launch injected are OUR state, not the user's: they
@@ -65,7 +76,7 @@ export function computeWrapperEnv(
   // must keep that session's remap — the inherited proxy still routes it.
   // Everything else stays untouched — a down server must never break
   // launching claude.
-  if (!state && insideSessionProxy(baseEnv)) return env;
+  if (!state && insideSessionProxy(baseEnv, opts?.isAlive ?? sessionProxyOwnerAlive)) return env;
   // Every remaining path repoints or drops the routing this marker described.
   delete env[SESSION_PROXY_ENV];
   clearInheritedBuiltinOverrides(env, baseEnv);
