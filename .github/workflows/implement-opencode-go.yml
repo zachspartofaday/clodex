@@ -1,0 +1,555 @@
+name: Implement OpenCode Go provider
+
+on:
+  push:
+    branches:
+      - agent/opencode-go-provider
+
+permissions:
+  contents: write
+  pull-requests: write
+
+jobs:
+  implement:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '24'
+      - run: corepack enable
+      - name: Add OpenCode Go catalog and integration
+        shell: bash
+        run: |
+          python <<'PY'
+          from pathlib import Path
+          import json
+
+          def read(path: str) -> str:
+              return Path(path).read_text()
+
+          def write(path: str, text: str) -> None:
+              Path(path).parent.mkdir(parents=True, exist_ok=True)
+              Path(path).write_text(text)
+
+          def replace_once(text: str, old: str, new: str, label: str) -> str:
+              count = text.count(old)
+              if count != 1:
+                  raise RuntimeError(f"{label}: expected one match, found {count}")
+              return text.replace(old, new, 1)
+
+          common = {
+              'supportsStore': False,
+              'supportsDeveloperRole': False,
+              'maxTokensField': 'max_tokens',
+          }
+          completion_url = 'https://opencode.ai/zen/go/v1'
+          anthropic_url = 'https://opencode.ai/zen/go'
+
+          models = [
+              {
+                  'id': 'qwen3.7-plus', 'name': 'Qwen3.7 Plus', 'upstreamModelId': 'qwen3.7-plus',
+                  'family': 'qwen', 'brand': 'Qwen', 'contextWindow': 1000000,
+                  'cost': {'input': 0.4, 'output': 1.6, 'cache_read': 0.04, 'cache_write': 0.5},
+                  'modelFormat': 'anthropic', 'npm': '@ai-sdk/anthropic', 'apiUrl': anthropic_url,
+                  'reasoning': True, 'modalities': ['text', 'image'],
+              },
+              {
+                  'id': 'glm-5.1', 'name': 'GLM-5.1', 'upstreamModelId': 'glm-5.1',
+                  'family': 'glm', 'brand': 'Z.AI', 'contextWindow': 202752,
+                  'cost': {'input': 1.4, 'output': 4.4, 'cache_read': 0.26, 'cache_write': 0},
+                  'modelFormat': 'openai', 'npm': '@ai-sdk/openai-compatible', 'apiUrl': completion_url,
+                  'reasoning': True, 'modalities': ['text'], 'supportedParameters': ['reasoning_effort'],
+                  'compat': dict(common),
+              },
+              {
+                  'id': 'deepseek-v4-flash', 'name': 'DeepSeek V4 Flash', 'upstreamModelId': 'deepseek-v4-flash',
+                  'family': 'deepseek', 'brand': 'DeepSeek', 'contextWindow': 1000000,
+                  'cost': {'input': 0.14, 'output': 0.28, 'cache_read': 0.0028, 'cache_write': 0},
+                  'modelFormat': 'openai', 'npm': '@ai-sdk/openai-compatible', 'apiUrl': completion_url,
+                  'reasoning': True, 'modalities': ['text'],
+                  'reasoningEffortMap': {'minimal': None, 'low': None, 'medium': None, 'high': 'high', 'max': 'max'},
+                  'compat': {**common, 'requiresReasoningContentOnAssistantMessages': True, 'thinkingFormat': 'deepseek'},
+              },
+              {
+                  'id': 'minimax-m2.7', 'name': 'MiniMax-M2.7', 'upstreamModelId': 'minimax-m2.7',
+                  'family': 'minimax', 'brand': 'MiniMax', 'contextWindow': 204800,
+                  'cost': {'input': 0.3, 'output': 1.2, 'cache_read': 0.06, 'cache_write': 0},
+                  'modelFormat': 'openai', 'npm': '@ai-sdk/openai-compatible', 'apiUrl': completion_url,
+                  'reasoning': True, 'modalities': ['text'], 'supportedParameters': ['reasoning_effort'],
+                  'compat': dict(common),
+              },
+              {
+                  'id': 'glm-5.2', 'name': 'GLM-5.2', 'upstreamModelId': 'glm-5.2',
+                  'family': 'glm', 'brand': 'Z.AI', 'contextWindow': 1000000,
+                  'cost': {'input': 1.4, 'output': 4.4, 'cache_read': 0.26, 'cache_write': 0},
+                  'modelFormat': 'openai', 'npm': '@ai-sdk/openai-compatible', 'apiUrl': completion_url,
+                  'reasoning': True, 'modalities': ['text'],
+                  'reasoningEffortMap': {'off': None, 'minimal': None, 'low': None, 'medium': None, 'high': 'high', 'xhigh': None, 'max': 'max'},
+                  'compat': dict(common),
+              },
+              {
+                  'id': 'qwen3.7-max', 'name': 'Qwen3.7 Max', 'upstreamModelId': 'qwen3.7-max',
+                  'family': 'qwen', 'brand': 'Qwen', 'contextWindow': 1000000,
+                  'cost': {'input': 2.5, 'output': 7.5, 'cache_read': 0.5, 'cache_write': 3.125},
+                  'modelFormat': 'anthropic', 'npm': '@ai-sdk/anthropic', 'apiUrl': anthropic_url,
+                  'reasoning': True, 'modalities': ['text'],
+              },
+              {
+                  'id': 'kimi-k2.6', 'name': 'Kimi K2.6', 'upstreamModelId': 'kimi-k2.6',
+                  'family': 'kimi', 'brand': 'Moonshot AI', 'contextWindow': 262144,
+                  'cost': {'input': 0.95, 'output': 4, 'cache_read': 0.16, 'cache_write': 0},
+                  'modelFormat': 'openai', 'npm': '@ai-sdk/openai-compatible', 'apiUrl': completion_url,
+                  'reasoning': True, 'modalities': ['text', 'image'],
+                  'reasoningEffortMap': {'minimal': None, 'low': None, 'medium': None},
+                  'compat': {**common, 'thinkingFormat': 'deepseek', 'supportsReasoningEffort': False, 'supportsLongCacheRetention': False},
+              },
+              {
+                  'id': 'minimax-m3', 'name': 'MiniMax-M3', 'upstreamModelId': 'minimax-m3',
+                  'family': 'minimax', 'brand': 'MiniMax', 'contextWindow': 1000000,
+                  'cost': {'input': 0.3, 'output': 1.2, 'cache_read': 0.06, 'cache_write': 0},
+                  'modelFormat': 'anthropic', 'npm': '@ai-sdk/anthropic', 'apiUrl': anthropic_url,
+                  'reasoning': True, 'modalities': ['text', 'image'],
+              },
+              {
+                  'id': 'hy3', 'name': 'Hy3', 'upstreamModelId': 'hy3',
+                  'family': 'hy', 'brand': 'Hy', 'contextWindow': 256000,
+                  'cost': {'input': 0.14, 'output': 0.58, 'cache_read': 0.035, 'cache_write': 0},
+                  'modelFormat': 'openai', 'npm': '@ai-sdk/openai-compatible', 'apiUrl': completion_url,
+                  'reasoning': True, 'modalities': ['text'],
+                  'reasoningEffortMap': {'off': 'none', 'minimal': None, 'low': 'low', 'medium': None, 'high': 'high', 'xhigh': None, 'max': None},
+                  'compat': dict(common),
+              },
+              {
+                  'id': 'deepseek-v4-pro', 'name': 'DeepSeek V4 Pro', 'upstreamModelId': 'deepseek-v4-pro',
+                  'family': 'deepseek', 'brand': 'DeepSeek', 'contextWindow': 1000000,
+                  'cost': {'input': 0.435, 'output': 0.87, 'cache_read': 0.003625, 'cache_write': 0},
+                  'modelFormat': 'openai', 'npm': '@ai-sdk/openai-compatible', 'apiUrl': completion_url,
+                  'reasoning': True, 'modalities': ['text'],
+                  'reasoningEffortMap': {'minimal': None, 'low': None, 'medium': None, 'high': 'high', 'max': 'max'},
+                  'compat': {**common, 'requiresReasoningContentOnAssistantMessages': True, 'thinkingFormat': 'deepseek'},
+              },
+              {
+                  'id': 'qwen3.8-max', 'name': 'Qwen3.8 Max', 'upstreamModelId': 'qwen3.8-max',
+                  'family': 'qwen', 'brand': 'Qwen', 'contextWindow': 1000000,
+                  'cost': {'input': 2, 'output': 6, 'cache_read': 0.25, 'cache_write': 2.5},
+                  'modelFormat': 'anthropic', 'npm': '@ai-sdk/anthropic', 'apiUrl': anthropic_url,
+                  'reasoning': True, 'modalities': ['text', 'image'],
+              },
+              {
+                  'id': 'mimo-v2.5', 'name': 'MiMo V2.5', 'upstreamModelId': 'mimo-v2.5',
+                  'family': 'mimo', 'brand': 'Xiaomi', 'contextWindow': 1000000,
+                  'cost': {'input': 0.14, 'output': 0.28, 'cache_read': 0.0028, 'cache_write': 0},
+                  'modelFormat': 'openai', 'npm': '@ai-sdk/openai-compatible', 'apiUrl': completion_url,
+                  'reasoning': True, 'modalities': ['text', 'image'], 'supportedParameters': ['reasoning_effort'],
+                  'compat': dict(common),
+              },
+              {
+                  'id': 'gpt-5.6-luna', 'name': 'GPT-5.6 Luna (2x usage)', 'upstreamModelId': 'gpt-5.6-luna',
+                  'family': 'gpt', 'brand': 'OpenAI', 'contextWindow': 1050000,
+                  'cost': {'input': 0.1, 'output': 0.6, 'cache_read': 0.01, 'cache_write': 0.125},
+                  'modelFormat': 'openai', 'npm': '@ai-sdk/openai-compatible', 'apiUrl': completion_url,
+                  'reasoning': True, 'modalities': ['text', 'image'], 'supportedParameters': ['reasoning_effort'],
+              },
+              {
+                  'id': 'kimi-k2.7-code', 'name': 'Kimi K2.7 Code', 'upstreamModelId': 'kimi-k2.7-code',
+                  'family': 'kimi', 'brand': 'Moonshot AI', 'contextWindow': 262144,
+                  'cost': {'input': 0.95, 'output': 4, 'cache_read': 0.19, 'cache_write': 0},
+                  'modelFormat': 'openai', 'npm': '@ai-sdk/openai-compatible', 'apiUrl': completion_url,
+                  'reasoning': True, 'modalities': ['text', 'image'], 'supportedParameters': ['reasoning_effort'],
+                  'compat': dict(common),
+              },
+              {
+                  'id': 'kimi-k3', 'name': 'Kimi K3 (2x usage)', 'upstreamModelId': 'kimi-k3',
+                  'family': 'kimi', 'brand': 'Moonshot AI', 'contextWindow': 1048576,
+                  'cost': {'input': 3, 'output': 15, 'cache_read': 0.3, 'cache_write': 0},
+                  'modelFormat': 'openai', 'npm': '@ai-sdk/openai-compatible', 'apiUrl': completion_url,
+                  'reasoning': True, 'modalities': ['text', 'image'],
+                  'reasoningEffortMap': {'off': None, 'minimal': None, 'low': None, 'medium': None, 'high': None, 'xhigh': None, 'max': 'max'},
+                  'compat': dict(common),
+              },
+              {
+                  'id': 'mimo-v2.5-pro', 'name': 'MiMo V2.5 Pro', 'upstreamModelId': 'mimo-v2.5-pro',
+                  'family': 'mimo', 'brand': 'Xiaomi', 'contextWindow': 1048576,
+                  'cost': {'input': 0.435, 'output': 0.87, 'cache_read': 0.003625, 'cache_write': 0},
+                  'modelFormat': 'openai', 'npm': '@ai-sdk/openai-compatible', 'apiUrl': completion_url,
+                  'reasoning': True, 'modalities': ['text'], 'supportedParameters': ['reasoning_effort'],
+                  'compat': dict(common),
+              },
+              {
+                  'id': 'qwen3.6-plus', 'name': 'Qwen3.6 Plus', 'upstreamModelId': 'qwen3.6-plus',
+                  'family': 'qwen', 'brand': 'Qwen', 'contextWindow': 1000000,
+                  'cost': {'input': 0.5, 'output': 3, 'cache_read': 0.05, 'cache_write': 0.625},
+                  'modelFormat': 'openai', 'npm': '@ai-sdk/openai-compatible', 'apiUrl': completion_url,
+                  'reasoning': True, 'modalities': ['text', 'image'], 'supportedParameters': ['reasoning_effort'],
+                  'compat': {**common, 'thinkingFormat': 'qwen'},
+              },
+          ]
+
+          write('src/data/opencode-go-models.json', json.dumps(models, indent=2) + '\n')
+          write('src/data/opencode-go-models.ts', '''// Generated from monotykamary/pi-opencode-go-provider models.json + patch.json.
+// Source blobs used for this snapshot:
+//   models.json 0cecde7d5fdab46373f959a0e6189ebbe5de338c
+//   patch.json  98d40a093f559c35d9267f6ff1deecb7d14e5213
+// Run `pnpm update:opencode-go-models` to refresh it.
+
+import modelData from './opencode-go-models.json';
+import type { ProviderTemplateModel } from '../provider-templates.js';
+
+export const OPENCODE_GO_PROVIDER_ID = 'opencode-go';
+export const OPENCODE_GO_COMPLETIONS_URL = 'https://opencode.ai/zen/go/v1';
+export const OPENCODE_GO_ANTHROPIC_URL = 'https://opencode.ai/zen/go';
+
+const MODELS = modelData as unknown as readonly ProviderTemplateModel[];
+
+/** Return independent objects so callers cannot mutate the bundled catalog. */
+export function buildOpenCodeGoModels(): ProviderTemplateModel[] {
+  return MODELS.map(model => ({
+    ...model,
+    cost: model.cost ? { ...model.cost } : undefined,
+    supportedParameters: model.supportedParameters ? [...model.supportedParameters] : undefined,
+    modalities: model.modalities ? [...model.modalities] : undefined,
+    reasoningEffortMap: model.reasoningEffortMap ? { ...model.reasoningEffortMap } : undefined,
+    compat: model.compat ? { ...model.compat } : undefined,
+  }));
+}
+''')
+
+          write('scripts/update-opencode-go-models.mjs', '''#!/usr/bin/env node
+
+// Refresh the curated OpenCode Go model snapshot from the MIT-licensed Pi
+// provider. Only Anthropic Messages and OpenAI Chat Completions models are
+// emitted; Responses-only entries are deliberately excluded from Clodex.
+
+import { writeFile } from 'node:fs/promises';
+import { resolve } from 'node:path';
+
+const MODELS_URL = 'https://raw.githubusercontent.com/monotykamary/pi-opencode-go-provider/main/models.json';
+const PATCH_URL = 'https://raw.githubusercontent.com/monotykamary/pi-opencode-go-provider/main/patch.json';
+const OUTPUT = resolve('src/data/opencode-go-models.json');
+const SUPPORTED = new Set(['anthropic-messages', 'openai-completions']);
+const STANDARD_REASONING_EFFORT = new Set([
+  'glm-5.1',
+  'minimax-m2.7',
+  'mimo-v2.5',
+  'gpt-5.6-luna',
+  'kimi-k2.7-code',
+  'mimo-v2.5-pro',
+  'qwen3.6-plus',
+]);
+const BRANDS = {
+  qwen: 'Qwen',
+  glm: 'Z.AI',
+  deepseek: 'DeepSeek',
+  minimax: 'MiniMax',
+  kimi: 'Moonshot AI',
+  hy: 'Hy',
+  mimo: 'Xiaomi',
+  gpt: 'OpenAI',
+};
+
+async function json(url) {
+  const response = await fetch(url, { headers: { Accept: 'application/json' } });
+  if (!response.ok) throw new Error(`${url}: HTTP ${response.status}`);
+  return response.json();
+}
+
+function merge(model, patch) {
+  if (!patch) return { ...model };
+  const result = { ...model, ...patch };
+  if (patch.cost) result.cost = { ...(model.cost ?? {}), ...patch.cost };
+  if (patch.compat) result.compat = { ...(model.compat ?? {}), ...patch.compat };
+  if (patch.thinkingLevelMap) {
+    result.thinkingLevelMap = {
+      ...(model.thinkingLevelMap ?? {}),
+      ...patch.thinkingLevelMap,
+    };
+  }
+  return result;
+}
+
+function transform(model) {
+  const anthropic = model.api === 'anthropic-messages';
+  const family = model.id.split(/[-/:]/)[0] || model.id;
+  const output = {
+    id: model.id,
+    name: model.name || model.id,
+    upstreamModelId: model.id,
+    family,
+    brand: BRANDS[family] || family,
+    contextWindow: model.contextWindow,
+    cost: {
+      input: model.cost?.input ?? 0,
+      output: model.cost?.output ?? 0,
+      cache_read: model.cost?.cacheRead ?? 0,
+      cache_write: model.cost?.cacheWrite ?? 0,
+    },
+    modelFormat: anthropic ? 'anthropic' : 'openai',
+    npm: anthropic ? '@ai-sdk/anthropic' : '@ai-sdk/openai-compatible',
+    apiUrl: anthropic ? 'https://opencode.ai/zen/go' : 'https://opencode.ai/zen/go/v1',
+    reasoning: model.reasoning === true,
+    modalities: model.input ?? ['text'],
+  };
+  if (STANDARD_REASONING_EFFORT.has(model.id)) {
+    output.supportedParameters = ['reasoning_effort'];
+  }
+  if (model.thinkingLevelMap) output.reasoningEffortMap = model.thinkingLevelMap;
+  if (model.compat) output.compat = model.compat;
+  return output;
+}
+
+const [models, patches] = await Promise.all([json(MODELS_URL), json(PATCH_URL)]);
+const output = models
+  .map(model => merge(model, patches[model.id]))
+  .filter(model => SUPPORTED.has(model.api))
+  .map(transform);
+
+if (output.some(model => model.id === 'grok-4.5')) {
+  throw new Error('Responses-only model unexpectedly survived filtering');
+}
+await writeFile(OUTPUT, `${JSON.stringify(output, null, 2)}\n`);
+console.log(`Wrote ${output.length} OpenCode Go models to ${OUTPUT}`);
+''')
+
+          # Register the provider template.
+          path = 'src/provider-templates.ts'
+          text = read(path)
+          text = replace_once(
+              text,
+              "import type { ModelCompatibilityProfile, ReasoningEffortMap } from './model-profile.js';\n",
+              "import type { ModelCompatibilityProfile, ReasoningEffortMap } from './model-profile.js';\nimport { buildOpenCodeGoModels } from './data/opencode-go-models.js';\n",
+              path + ' catalog import',
+          )
+          text = text.replace(
+              '/** clodex ships exactly two provider templates: OpenAI (API key) and OpenAI OAuth (ChatGPT plan). */',
+              '/** Built-in provider templates available through `clodex providers add`. */',
+          )
+          marker = "  {\n    id: 'openai-oauth',\n    name: 'OpenAI (ChatGPT)',\n    authType: 'oauth',\n    npm: '@ai-sdk/openai',\n    signupUrl: 'https://chatgpt.com',\n    modelSource: 'api-list',\n    supported: true,\n  },\n"
+          addition = marker + "  {\n    id: 'opencode-go',\n    name: 'OpenCode Go',\n    authType: 'api',\n    npm: '@ai-sdk/openai-compatible',\n    defaultBaseUrl: 'https://opencode.ai/zen/go/v1',\n    modelsPath: 'models',\n    signupUrl: 'https://opencode.ai',\n    modelSource: 'api-list',\n    curatedModels: buildOpenCodeGoModels(),\n    curatedOnly: true,\n    supported: true,\n  },\n"
+          text = replace_once(text, marker, addition, path + ' provider template')
+          write(path, text)
+
+          # Add the maintenance command without changing dependencies.
+          path = 'package.json'
+          package = json.loads(read(path))
+          scripts = package['scripts']
+          rebuilt = {}
+          for key, value in scripts.items():
+              rebuilt[key] = value
+              if key == 'dev':
+                  rebuilt['update:opencode-go-models'] = 'node scripts/update-opencode-go-models.mjs'
+          package['scripts'] = rebuilt
+          write(path, json.dumps(package, indent=2) + '\n')
+
+          # User-facing setup and supported-provider documentation.
+          path = 'README.md'
+          text = read(path)
+          section = '''### OpenCode Go provider
+
+Clodex can also use the OpenCode Go catalog alongside native Claude and OpenAI/Codex-plan models:
+
+```bash
+clodex providers add   # choose OpenCode Go and paste your opencode.ai API key
+clodex models          # favorite Kimi, DeepSeek, Qwen, MiniMax, MiMo, GLM, etc.
+clodex patch
+clodex claude
+```
+
+OpenCode Go models keep their provider-declared wire protocol per model: Anthropic Messages models are forwarded directly, while Chat Completions models use the OpenAI-compatible adapter. Responses-only entries are intentionally not exposed.
+
+'''
+          text = replace_once(
+              text,
+              '## Difference between Clodex and other solutions\n',
+              section + '## Difference between Clodex and other solutions\n',
+              path + ' setup section',
+          )
+          text = replace_once(
+              text,
+              'Providers supported: `openai` (API key, platform.openai.com) and `openai-oauth` (ChatGPT/Codex plan).',
+              'Providers supported: `openai` (API key, platform.openai.com), `openai-oauth` (ChatGPT/Codex plan), and `opencode-go` (OpenCode Go API key).',
+              path + ' provider list',
+          )
+          write(path, text)
+
+          # Integration tests exercise sparse discovery, filtering, both protocols, and routing.
+          write('tests/opencode-go-provider.test.ts', '''import { afterEach, describe, expect, it, vi } from 'vitest';
+import { buildHttpProxyRoutes } from '../src/http-proxy/routes.js';
+import { getTemplateById } from '../src/provider-templates.js';
+import { fetchTemplateModels } from '../src/registry/fetch-template-models.js';
+import { cachedModelToLocal } from '../src/registry/materialize.js';
+import type { RegistryProvider } from '../src/registry/types.js';
+
+const template = getTemplateById('opencode-go')!;
+
+afterEach(() => {
+  vi.unstubAllGlobals();
+});
+
+describe('OpenCode Go provider', () => {
+  it('ships a curated mixed-protocol catalog without Responses models', () => {
+    expect(template).toMatchObject({
+      id: 'opencode-go',
+      npm: '@ai-sdk/openai-compatible',
+      defaultBaseUrl: 'https://opencode.ai/zen/go/v1',
+      modelsPath: 'models',
+      modelSource: 'api-list',
+      curatedOnly: true,
+      supported: true,
+    });
+    expect(template.curatedModels).toHaveLength(17);
+    expect(template.curatedModels?.some(model => model.id === 'grok-4.5')).toBe(false);
+    expect(template.curatedModels?.filter(model => model.modelFormat === 'anthropic')).toHaveLength(4);
+    expect(template.curatedModels?.filter(model => model.modelFormat === 'openai')).toHaveLength(13);
+
+    expect(template.curatedModels?.find(model => model.id === 'gpt-5.6-luna')).toMatchObject({
+      npm: '@ai-sdk/openai-compatible',
+      modelFormat: 'openai',
+      apiUrl: 'https://opencode.ai/zen/go/v1',
+      contextWindow: 1_050_000,
+    });
+    expect(template.curatedModels?.find(model => model.id === 'qwen3.8-max')).toMatchObject({
+      npm: '@ai-sdk/anthropic',
+      modelFormat: 'anthropic',
+      apiUrl: 'https://opencode.ai/zen/go',
+      contextWindow: 1_000_000,
+    });
+  });
+
+  it('reconciles sparse live availability with curated model metadata', async () => {
+    const rows = [
+      ...(template.curatedModels ?? []).map(model => ({ id: model.id, name: model.id })),
+      { id: 'grok-4.5', name: 'Grok 4.5' },
+      { id: 'unreviewed-future-model', name: 'Future Model' },
+    ];
+    const fetchMock = vi.fn(async () => new Response(JSON.stringify({ data: rows }), {
+      status: 200,
+      headers: { 'Content-Type': 'application/json' },
+    }));
+    vi.stubGlobal('fetch', fetchMock);
+
+    const result = await fetchTemplateModels(template, 'opencode-secret');
+
+    expect(result.error).toBeUndefined();
+    expect(result.models).toHaveLength(17);
+    expect(result.models.some(model => model.id === 'grok-4.5')).toBe(false);
+    expect(result.models.some(model => model.id === 'unreviewed-future-model')).toBe(false);
+    expect(result.models.find(model => model.id === 'deepseek-v4-pro')).toMatchObject({
+      contextWindow: 1_000_000,
+      cost: { input: 0.435, output: 0.87, cache_read: 0.003625 },
+      reasoningEffortMap: { high: 'high', max: 'max' },
+      compat: {
+        supportsStore: false,
+        requiresReasoningContentOnAssistantMessages: true,
+        thinkingFormat: 'deepseek',
+      },
+    });
+
+    const [url, init] = fetchMock.mock.calls[0] as unknown as [string, RequestInit];
+    expect(url).toBe('https://opencode.ai/zen/go/v1/models');
+    expect(new Headers(init.headers).get('authorization')).toBe('Bearer opencode-secret');
+  });
+
+  it('builds selective-proxy routes for both Anthropic and completions models', async () => {
+    const rows = (template.curatedModels ?? []).map(model => ({ id: model.id, name: model.id }));
+    vi.stubGlobal('fetch', vi.fn(async () => new Response(JSON.stringify({ data: rows }), {
+      status: 200,
+      headers: { 'Content-Type': 'application/json' },
+    })));
+    const fetched = await fetchTemplateModels(template, 'opencode-secret');
+    const provider: RegistryProvider = {
+      id: 'opencode-go',
+      templateId: 'opencode-go',
+      name: 'OpenCode Go',
+      enabled: true,
+      authRef: 'keyring:provider:opencode-go',
+      authType: 'api',
+      api: { npm: template.npm, url: fetched.baseUrl },
+      modelsCache: { fetchedAt: new Date(0).toISOString(), models: fetched.models },
+      addedAt: new Date(0).toISOString(),
+    };
+    const localModels = fetched.models
+      .map(model => cachedModelToLocal(model, provider))
+      .filter(model => model !== null);
+    const localProvider = {
+      id: 'opencode-go',
+      name: 'OpenCode Go',
+      apiKey: 'opencode-secret',
+      authType: 'api' as const,
+      models: localModels,
+    };
+
+    const result = buildHttpProxyRoutes(localProvider ? [localProvider] : [], [
+      { providerId: 'opencode-go', modelId: 'qwen3.8-max' },
+      { providerId: 'opencode-go', modelId: 'gpt-5.6-luna' },
+    ]);
+
+    expect(result.unsupported).toEqual([]);
+    expect(result.unavailable).toEqual([]);
+    expect(result.routes).toHaveLength(2);
+    expect(result.routes[0]).toMatchObject({
+      realModelId: 'qwen3.8-max',
+      modelFormat: 'anthropic',
+      upstreamUrl: 'https://opencode.ai/zen/go',
+      npm: '@ai-sdk/anthropic',
+    });
+    expect(result.routes[1]).toMatchObject({
+      realModelId: 'gpt-5.6-luna',
+      modelFormat: 'openai',
+      npm: '@ai-sdk/openai-compatible',
+      baseURL: 'https://opencode.ai/zen/go/v1',
+    });
+  });
+});
+''')
+          PY
+      - run: pnpm install --frozen-lockfile
+      - run: pnpm typecheck
+      - run: pnpm test
+      - run: pnpm build
+      - name: Publish clean stacked commit and open draft PR
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: bash
+        run: |
+          rm -f .github/workflows/implement-opencode-go.yml
+          git config user.name github-actions[bot]
+          git config user.email 41898282+github-actions[bot]@users.noreply.github.com
+          git reset --soft origin/agent/mixed-provider-runtime
+          git add -A
+          git diff --cached --check
+          git commit -m "feat: add OpenCode Go provider"
+          git push --force-with-lease origin HEAD:agent/opencode-go-provider
+          if ! gh pr view agent/opencode-go-provider --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            cat > /tmp/pr-body.md <<'EOF'
+          ## Summary
+
+          - add OpenCode Go as a first-class API-key provider
+          - reconcile its sparse live `/models` response with a curated 17-model catalog
+          - route four models through Anthropic Messages and thirteen through OpenAI Chat Completions
+          - deliberately exclude Responses-only models, including Grok 4.5
+          - preserve model-specific context windows, pricing, image support, reasoning maps, and compatibility metadata
+          - add a maintenance generator, setup documentation, and mixed-protocol integration tests
+
+          ## User impact
+
+          Claude Code can use native Claude models, OpenAI/Codex-plan models, and OpenCode Go models in the same Clodex installation. Favorites, aliases, `/model`, subagents, endpoint mode, and selective proxy mode all receive provider-qualified model identities and accurate context metadata.
+
+          ## Validation
+
+          - `pnpm typecheck`
+          - `pnpm test`
+          - `pnpm build`
+
+          ## Stack
+
+          This is PR 2 of 2 and intentionally targets `agent/mixed-provider-runtime`. Merge the infrastructure PR first, then retarget this PR to `main` or allow GitHub to update the stack after the base branch merges.
+
+          ## Source
+
+          Catalog metadata is generated from the MIT-licensed `monotykamary/pi-opencode-go-provider` `models.json` and `patch.json`. `pnpm update:opencode-go-models` refreshes the checked-in snapshot.
+          EOF
+            gh pr create --repo "$GITHUB_REPOSITORY" --draft --base agent/mixed-provider-runtime --head agent/opencode-go-provider --title "feat: add OpenCode Go provider" --body-file /tmp/pr-body.md
+          fi
