@@ -68,6 +68,18 @@ describe('applySelectedOAuthAccount', () => {
   });
 });
 
+describe('selection on disabled providers', () => {
+  it('ignores the selector on a disabled provider instead of throwing', () => {
+    // A disabled slotted provider cannot participate in the launch; a stale
+    // or mistyped CLODEX_OAUTH_ACCOUNT aimed at it must not take the whole
+    // catalog load down for the providers that CAN launch.
+    const disabled: RegistryProvider = { ...withSlots, enabled: false };
+    expect(applySelectedOAuthAccount(disabled, 'personal')).toBe(disabled);
+    // Enabled slotted providers keep the fail-loud contract.
+    expect(() => applySelectedOAuthAccount(withSlots, 'personal')).toThrow(/has no account named/);
+  });
+});
+
 describe('authAccounts registry persistence', () => {
   let home = '';
   let path = '';
