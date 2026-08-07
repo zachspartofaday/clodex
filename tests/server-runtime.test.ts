@@ -66,6 +66,25 @@ describe('server runtime state file', () => {
     expect(readLiveServerRuntimeStates(env, alwaysAlive)[1]?.caPath).toBeUndefined();
   });
 
+  it('round-trips the route-bound remap snapshot and drops only malformed shapes', () => {
+    const alwaysAlive = { isAlive: () => true };
+    const withRemaps = proxyState({ pid: 999997 });
+    withRemaps.builtinModelOverrides = { fable: 'wjudge', sonnet: 'clodex:openai-oauth:gpt-5.6-sol' };
+    registerServerRuntimeState(withRemaps, env, alwaysAlive);
+    // Dropping this field in the parser silently reverts every wrapper launch
+    // to native models — the same defect class as the registry's authAccounts.
+    expect(readLiveServerRuntimeStates(env, alwaysAlive)[0]?.builtinModelOverrides)
+      .toEqual({ fable: 'wjudge', sonnet: 'clodex:openai-oauth:gpt-5.6-sol' });
+
+    // A malformed shape drops the FIELD, never the record.
+    const raw = JSON.parse(readFileSync(getServerRuntimePath(env), 'utf8')) as Record<string, unknown>[];
+    raw[0]!.builtinModelOverrides = { fable: 42 };
+    writeFileSync(getServerRuntimePath(env), JSON.stringify(raw));
+    const reread = readLiveServerRuntimeStates(env, alwaysAlive);
+    expect(reread).toHaveLength(1);
+    expect(reread[0]?.builtinModelOverrides).toBeUndefined();
+  });
+
   it('two registering servers do not clobber each other', () => {
     const proxy = proxyState({ pid: process.pid });
     const endpoint = endpointState({ pid: 999999 });
