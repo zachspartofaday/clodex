@@ -563,9 +563,17 @@ function toolArgumentNormalizationGap(
   };
   const leftStripped = stripped(left);
   const rightStripped = stripped(right);
+  // The rule-forked verdict requires the WHOLE calls to agree once the
+  // stripped arguments are substituted back: arguments differing only by
+  // filler while some other field also differs is a mismatch stripping
+  // cannot repair, and blaming the rule for it would be false.
+  const wholeAfterStrip = (item: JsonObject, args: string): string =>
+    canonicalJson(normalizeToolCallJson({ ...item, arguments: args }));
   return {
     tool: left.name,
-    equalAfterStrip: leftStripped !== undefined && leftStripped === rightStripped,
+    equalAfterStrip: leftStripped !== undefined && rightStripped !== undefined
+      && leftStripped === rightStripped
+      && wholeAfterStrip(left, leftStripped) === wholeAfterStrip(right, rightStripped),
   };
 }
 
