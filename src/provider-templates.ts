@@ -1,6 +1,12 @@
 // src/provider-templates.ts — builtin provider templates for clodex providers add
 
 import type { CachedModel } from './registry/types.js';
+import {
+  buildOpenCodeGoModels,
+  OPENCODE_GO_COMPLETIONS_BASE_URL,
+  OPENCODE_GO_PROVIDER_ID,
+  OPENCODE_GO_PROVIDER_NAME,
+} from './data/opencode-go-models.js';
 
 export type ProviderAuthType = 'api' | 'oauth' | 'none';
 export type ProviderModelSource = 'api-list' | 'static-seed' | 'manual-only';
@@ -35,7 +41,7 @@ export interface ProviderTemplate {
   unsupportedReason?: string;
 }
 
-/** clodex ships exactly two provider templates: OpenAI (API key) and OpenAI OAuth (ChatGPT plan). */
+/** Built-in providers available through `clodex providers add` or OAuth authentication. */
 export const PROVIDER_TEMPLATES: ProviderTemplate[] = [
   {
     id: 'openai',
@@ -45,6 +51,20 @@ export const PROVIDER_TEMPLATES: ProviderTemplate[] = [
     defaultBaseUrl: 'https://api.openai.com/v1',
     signupUrl: 'https://platform.openai.com/api-keys',
     modelSource: 'api-list',
+    supported: true,
+  },
+  {
+    id: OPENCODE_GO_PROVIDER_ID,
+    name: OPENCODE_GO_PROVIDER_NAME,
+    authType: 'api',
+    npm: '@ai-sdk/openai-compatible',
+    defaultBaseUrl: OPENCODE_GO_COMPLETIONS_BASE_URL,
+    modelsPath: '/models',
+    signupUrl: 'https://opencode.ai',
+    modelSource: 'api-list',
+    staticModels: buildOpenCodeGoModels(),
+    staticModelPolicy: 'allowlist',
+    preserveModelPricing: true,
     supported: true,
   },
   {
