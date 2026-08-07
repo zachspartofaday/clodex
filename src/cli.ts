@@ -21,7 +21,7 @@ import { loadPreferences, savePreferences, recordLaunchSelection, resolveBridgeM
 import { pickLocalModel } from './prompts.js';
 import { fetchProviderCatalog, providersForPicker, resolveLocalProviderApiKey } from './provider-catalog.js';
 import { VERSION } from './constants.js';
-import type { ParsedArgs, FavoriteModel, LocalProvider, LocalProviderModel } from './types.js';
+import type { BuiltinAliasName, ParsedArgs, FavoriteModel, LocalProvider, LocalProviderModel } from './types.js';
 import { addFavorite, removeFavorite, isFavorite } from './favorites.js';
 import {
   canonicalModelAliasName,
@@ -362,6 +362,7 @@ ${pc.bold('Usage:')}
   clodex models
   clodex favorites
   clodex providers
+  clodex profiles
   clodex --help
   clodex --version
 
@@ -376,6 +377,7 @@ ${pc.bold('Commands:')}
   models      Manage favorite models and aliases (max ${MAX_MODEL_CATALOG})
   favorites   Alias for models
   providers   Add or sign in to model providers
+  profiles    Save and apply named snapshots of favorites + model aliases
 
 ${pc.bold('Bridge modes (claude and server):')}
   --endpoint   Local Anthropic-format gateway; Claude Code launches with
@@ -815,6 +817,7 @@ async function runAliasConfigurator(
     if (action === 'remove') {
       savePreferences({ modelAliases: aliases.filter((_, i) => i !== index) });
       p.log.success(`Removed alias ${alias.name}.`);
+      clearBuiltinOverridesForRemovedAlias(alias.name);
       continue;
     }
     const target = await pickTarget(favorites, `Route "${alias.name}" to which favorite?`);
@@ -824,6 +827,26 @@ async function runAliasConfigurator(
       : entry);
     savePreferences({ modelAliases: next });
     p.log.success(`Saved alias ${alias.name} → clodex:${target.providerId}:${target.modelId}.`);
+  }
+}
+
+/**
+ * A built-in remap pointing at a removed alias would keep injecting that name
+ * through ANTHROPIC_DEFAULT_*_MODEL while the proxy no longer has a route for
+ * it — requests using the built-in would fail instead of reverting to the
+ * native default. Clear matching remaps whenever an alias is deleted.
+ */
+function clearBuiltinOverridesForRemovedAlias(removedName: string): void {
+  const prefs = loadPreferences();
+  const overrides = prefs.builtinModelOverrides ?? {};
+  const cleared = (Object.entries(overrides) as Array<[BuiltinAliasName, string]>)
+    .filter(([, target]) => target.trim().toLowerCase() === removedName.trim().toLowerCase());
+  if (cleared.length === 0) return;
+  const next = { ...overrides };
+  for (const [builtin] of cleared) delete next[builtin];
+  savePreferences({ builtinModelOverrides: next });
+  for (const [builtin, target] of cleared) {
+    p.log.warn(`Cleared built-in remap ${builtin} → ${target}: its alias was removed, so ${builtin} reverts to the native default.`);
   }
 }
 
@@ -880,6 +903,7 @@ export async function runModelsCommand(opts: FavoritesCommandOptions = {}): Prom
         ? `Removed model alias ${name || JSON.stringify(requestedName)}.`
         : `Removed ${removedCount} model aliases named ${name || JSON.stringify(requestedName)}.`,
     );
+    clearBuiltinOverridesForRemovedAlias(name || requestedName);
     return 0;
   }
   if (opts.list) {

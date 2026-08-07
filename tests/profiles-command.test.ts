@@ -107,10 +107,13 @@ describe('clodex profiles', () => {
     expect(configState.current.builtinModelOverrides ?? {}).toEqual({});
   });
 
-  it('never treats prototype names as saved profiles', async () => {
+  it('rejects prototype-key profile names at validation', async () => {
+    expect(() => validateProfileName('constructor')).toThrow(/reserved name/);
+    expect(await runProfilesCommand(['save', 'constructor'])).toBe(1);
+    expect(configState.current.modelProfiles?.constructor).not.toBeInstanceOf(Object);
     expect(await runProfilesCommand(['use', 'constructor'])).toBe(1);
     expect(vi.mocked(prompts.log.error)).toHaveBeenCalledWith(
-      expect.stringContaining('No profile named "constructor"'),
+      expect.stringContaining('reserved name'),
     );
   });
 });

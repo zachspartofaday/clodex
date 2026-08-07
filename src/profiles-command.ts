@@ -21,6 +21,13 @@ export function validateProfileName(name: string): string {
       `Invalid profile name "${name}" — use 1-32 characters: lowercase letters, digits, "-" or "_", starting with a letter or digit.`,
     );
   }
+  // The regex admits lowercase prototype keys like "constructor"; storing one
+  // as an own property would let a later plain-object lookup shadow it. The
+  // profile map is null-prototype, but the name is rejected here so the
+  // reserved-name contract holds at the entry point, not just at lookup.
+  if (Object.getOwnPropertyNames(Object.prototype).includes(trimmed)) {
+    throw new Error(`Invalid profile name "${name}" — reserved name.`);
+  }
   return trimmed;
 }
 
