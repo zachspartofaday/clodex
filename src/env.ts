@@ -1,6 +1,6 @@
 // src/env.ts
 import { CONFLICTING_ENV_VARS } from './constants.js';
-import { applyBuiltinModelOverrides } from './builtin-alias-env.js';
+import { applyBuiltinModelOverridesWithProvenance } from './builtin-alias-env.js';
 export { BUILTIN_ALIAS_ENV, applyBuiltinModelOverrides } from './builtin-alias-env.js';
 import {
   createCipheriv,
@@ -110,7 +110,7 @@ export function buildHttpProxyChildEnv(
     if (name === 'ANTHROPIC_API_KEY' || name === 'ANTHROPIC_AUTH_TOKEN' || name === 'ANTHROPIC_MODEL') continue;
     delete env[name];
   }
-  applyBuiltinModelOverrides(env, builtinOverrides, explicit);
+  applyBuiltinModelOverridesWithProvenance(env, builtinOverrides, explicit);
   const proxyUrl = `http://127.0.0.1:${proxyPort}`;
   env['HTTPS_PROXY'] = proxyUrl;
   env['HTTP_PROXY'] = proxyUrl;

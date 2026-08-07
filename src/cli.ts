@@ -284,7 +284,10 @@ export function parseArgs(args: string[]): ParsedArgs {
 
   if (first === 'profiles') {
     const parsed = emptyParsed('profiles');
-    parsed.claudeArgs = [...rest];
+    for (const arg of rest) {
+      if (arg === '--version' || arg === '-v') parsed.showVersion = true;
+      else parsed.claudeArgs.push(arg);
+    }
     return parsed;
   }
 
