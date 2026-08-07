@@ -755,25 +755,28 @@ async function runAliasConfigurator(
       // normalizeModelAliases rejects (conflicting duplicates) or whose
       // favorite/provider is unavailable would inject a model name through
       // ANTHROPIC_DEFAULT_*_MODEL that the MITM cannot handle.
-      let resolved: Awaited<ReturnType<typeof loadHttpProxyRoutes>>;
+      let resolved: Awaited<ReturnType<typeof loadHttpProxyRoutes>> | null = null;
       try {
         resolved = await loadHttpProxyRoutes();
       } catch (err) {
-        p.log.warn(`Cannot resolve routable models right now (${err instanceof Error ? err.message : String(err)}); try again once providers load.`);
-        continue;
+        // The native reset must stay reachable even when providers cannot
+        // load: it is the only way to clear a stale remap, and blocking it
+        // behind route resolution would wedge the user until providers are
+        // repaired. Only the model-backed choices are unavailable.
+        p.log.warn(`Cannot resolve routable models right now (${err instanceof Error ? err.message : String(err)}); only "Native default" is offered.`);
       }
       const routable: Array<{ value: string; label: string; hint: string }> = [
         { value: '__native__', label: 'Native default', hint: 'remove the remap' },
-        ...resolved.aliases.map(alias => ({
+        ...(resolved ? resolved.aliases.map(alias => ({
           value: `use:${alias.name}`,
           label: `alias ${pc.bold(alias.name)}`,
           hint: alias.displayName,
-        })),
-        ...resolved.routes.map(route => ({
+        })) : []),
+        ...(resolved ? resolved.routes.map(route => ({
           value: `use:${route.aliasId}`,
           label: route.displayName,
           hint: route.aliasId,
-        })),
+        })) : []),
       ];
       const picked = await p.select<string>({
         message: `Route built-in "${builtin}" to`,
