@@ -76,8 +76,27 @@ export const WRAPPER_INJECTED_BUILTINS_ENV = 'CLODEX_INJECTED_BUILTINS';
  * current overrides applied with true user env winning, and the sentinel
  * rewritten to exactly what THIS launch injected.
  */
-function inheritedInjectedAliases(baseEnv: NodeJS.ProcessEnv): string[] {
-  return (baseEnv[WRAPPER_INJECTED_BUILTINS_ENV] ?? '').split(',').map(name => name.trim()).filter(Boolean);
+/**
+ * Parse the provenance sentinel into alias → injected value. Entries are
+ * `alias=encodedValue`; a bare `alias` (older sentinel format) matches any
+ * current value. Only entries whose recorded value still matches the live
+ * env var are "ours to clear" — a user who deliberately replaced an
+ * injected var made it explicit, and explicit env always wins.
+ */
+function inheritedInjections(baseEnv: NodeJS.ProcessEnv): Map<string, string | null> {
+  const map = new Map<string, string | null>();
+  for (const entry of (baseEnv[WRAPPER_INJECTED_BUILTINS_ENV] ?? '').split(',')) {
+    const trimmed = entry.trim();
+    if (!trimmed) continue;
+    const eq = trimmed.indexOf('=');
+    if (eq === -1) map.set(trimmed, null);
+    else map.set(trimmed.slice(0, eq), decodeURIComponent(trimmed.slice(eq + 1)));
+  }
+  return map;
+}
+
+function stillOurs(baseEnv: NodeJS.ProcessEnv, envName: string, recorded: string | null): boolean {
+  return recorded === null || baseEnv[envName] === recorded;
 }
 
 /**
@@ -86,15 +105,16 @@ function inheritedInjectedAliases(baseEnv: NodeJS.ProcessEnv): string[] {
  * stale injection surviving into a no-server launch goes straight to
  * Anthropic as an unknown model id, and into an endpoint launch as a name
  * its catalog may not expose. Only a proxy launch re-applies a snapshot
- * afterwards.
+ * afterwards. A var whose current value no longer matches what was
+ * recorded is a deliberate user replacement and is left untouched.
  */
 export function clearInheritedBuiltinOverrides(
   env: NodeJS.ProcessEnv,
   baseEnv: NodeJS.ProcessEnv,
 ): void {
-  for (const alias of inheritedInjectedAliases(baseEnv)) {
+  for (const [alias, recorded] of inheritedInjections(baseEnv)) {
     const envName = BUILTIN_ALIAS_ENV[alias as BuiltinAliasName];
-    if (envName) delete env[envName];
+    if (envName && stillOurs(baseEnv, envName, recorded)) delete env[envName];
   }
   delete env[WRAPPER_INJECTED_BUILTINS_ENV];
 }
@@ -105,16 +125,30 @@ export function applyBuiltinModelOverridesWithProvenance(
   baseEnv: NodeJS.ProcessEnv,
 ): void {
   const explicit: NodeJS.ProcessEnv = { ...baseEnv };
-  for (const alias of inheritedInjectedAliases(baseEnv)) {
+  for (const [alias, recorded] of inheritedInjections(baseEnv)) {
     const envName = BUILTIN_ALIAS_ENV[alias as BuiltinAliasName];
-    if (envName) delete explicit[envName];
+    if (envName && stillOurs(baseEnv, envName, recorded)) delete explicit[envName];
   }
   clearInheritedBuiltinOverrides(env, baseEnv);
   applyBuiltinModelOverrides(env, overrides, explicit);
   const injected = (Object.entries(BUILTIN_ALIAS_ENV) as Array<[BuiltinAliasName, string]>)
     .filter(([alias, envName]) => explicit[envName] === undefined && env[envName] !== undefined
       && String(overrides?.[alias] ?? '').trim() !== '')
-    .map(([alias]) => alias);
+    .map(([alias, envName]) => `${alias}=${encodeURIComponent(String(env[envName]))}`);
   if (injected.length > 0) env[WRAPPER_INJECTED_BUILTINS_ENV] = injected.join(',');
   else delete env[WRAPPER_INJECTED_BUILTINS_ENV];
+}
+
+/**
+ * True when the environment still routes through a live per-session clodex
+ * proxy: `clodex claude --proxy` deliberately publishes no runtime record,
+ * so a wrapper invoked inside that session sees state=null while the
+ * inherited HTTP(S)_PROXY + clodex CA still point at the running proxy.
+ * Clearing the session's remap there would break the very routing the
+ * session set up.
+ */
+export function insideSessionProxy(baseEnv: NodeJS.ProcessEnv): boolean {
+  const proxy = baseEnv['HTTPS_PROXY'] ?? baseEnv['https_proxy'] ?? '';
+  return /^http:\/\/127\.0\.0\.1:\d+\/?$/.test(proxy)
+    && (baseEnv['NODE_EXTRA_CA_CERTS'] ?? '').includes('clodex');
 }

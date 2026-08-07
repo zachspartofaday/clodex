@@ -7,7 +7,7 @@
 
 import type { ServerRuntimeState } from './server-runtime.js';
 import type { BuiltinAliasName } from './types.js';
-import { applyBuiltinModelOverridesWithProvenance, clearInheritedBuiltinOverrides } from './builtin-alias-env.js';
+import { applyBuiltinModelOverridesWithProvenance, clearInheritedBuiltinOverrides, insideSessionProxy } from './builtin-alias-env.js';
 
 const PROXY_ENV_VARS = ['HTTPS_PROXY', 'HTTP_PROXY', 'https_proxy', 'http_proxy'] as const;
 export const REQUIRE_SERVER_ENV = 'CLODEX_REQUIRE_SERVER';
@@ -60,8 +60,12 @@ export function computeWrapperEnv(
   // Remaps a previous launch injected are OUR state, not the user's: they
   // must never outlive the launch that issued them, or a no-server launch
   // sends the alias straight to Anthropic and an endpoint launch sends it to
-  // a catalog that may not expose it. Everything else stays untouched — a
-  // down server must never break launching claude.
+  // a catalog that may not expose it. One exception: a wrapper invoked
+  // INSIDE a live per-session proxy (which publishes no runtime record)
+  // must keep that session's remap — the inherited proxy still routes it.
+  // Everything else stays untouched — a down server must never break
+  // launching claude.
+  if (!state && insideSessionProxy(baseEnv)) return env;
   clearInheritedBuiltinOverrides(env, baseEnv);
   if (!state) return env;
 

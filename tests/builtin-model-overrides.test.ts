@@ -1,6 +1,6 @@
 import { describe, expect, it } from 'vitest';
 import { applyBuiltinModelOverrides, BUILTIN_ALIAS_ENV } from '../src/env.js';
-import { applyBuiltinModelOverridesWithProvenance, routableBuiltinOverrides, WRAPPER_INJECTED_BUILTINS_ENV } from '../src/builtin-alias-env.js';
+import { applyBuiltinModelOverridesWithProvenance, insideSessionProxy, routableBuiltinOverrides, WRAPPER_INJECTED_BUILTINS_ENV } from '../src/builtin-alias-env.js';
 import { CONFLICTING_ENV_VARS } from '../src/constants.js';
 
 describe('applyBuiltinModelOverrides', () => {
@@ -71,7 +71,7 @@ describe('applyBuiltinModelOverridesWithProvenance', () => {
     const env: NodeJS.ProcessEnv = { ...baseEnv };
     applyBuiltinModelOverridesWithProvenance(env, { fable: 'new-target' }, baseEnv);
     expect(env.ANTHROPIC_DEFAULT_FABLE_MODEL).toBe('new-target');
-    expect(env[WRAPPER_INJECTED_BUILTINS_ENV]).toBe('fable');
+    expect(env[WRAPPER_INJECTED_BUILTINS_ENV]).toBe('fable=new-target');
   });
 
   it('clears a stale inherited injection the new launch does not re-issue', () => {
@@ -85,13 +85,38 @@ describe('applyBuiltinModelOverridesWithProvenance', () => {
     expect(env[WRAPPER_INJECTED_BUILTINS_ENV]).toBeUndefined();
   });
 
+  it('a user who replaced an injected var made it explicit — it survives and wins', () => {
+    const baseEnv: NodeJS.ProcessEnv = {
+      ANTHROPIC_DEFAULT_FABLE_MODEL: 'user-replaced',
+      [WRAPPER_INJECTED_BUILTINS_ENV]: `fable=${encodeURIComponent('old-injected')}`,
+    };
+    const env: NodeJS.ProcessEnv = { ...baseEnv };
+    applyBuiltinModelOverridesWithProvenance(env, { fable: 'snapshot' }, baseEnv);
+    // The recorded value no longer matches, so the sentinel's claim is void:
+    // the replacement is user-explicit and outranks the snapshot.
+    expect(env.ANTHROPIC_DEFAULT_FABLE_MODEL).toBe('user-replaced');
+    expect(env[WRAPPER_INJECTED_BUILTINS_ENV]).toBeUndefined();
+  });
+
   it('a true user-set env var still outranks everything and is never claimed', () => {
     const baseEnv: NodeJS.ProcessEnv = { ANTHROPIC_DEFAULT_SONNET_MODEL: 'user-pinned' };
     const env: NodeJS.ProcessEnv = { ...baseEnv };
     applyBuiltinModelOverridesWithProvenance(env, { sonnet: 'snapshot', fable: 'wjudge' }, baseEnv);
     expect(env.ANTHROPIC_DEFAULT_SONNET_MODEL).toBe('user-pinned');
     expect(env.ANTHROPIC_DEFAULT_FABLE_MODEL).toBe('wjudge');
-    // Only what THIS launch injected is claimed by the sentinel.
-    expect(env[WRAPPER_INJECTED_BUILTINS_ENV]).toBe('fable');
+    // Only what THIS launch injected is claimed by the sentinel, with its value.
+    expect(env[WRAPPER_INJECTED_BUILTINS_ENV]).toBe('fable=wjudge');
+  });
+});
+
+describe('insideSessionProxy', () => {
+  it('detects the per-session proxy shape and nothing else', () => {
+    expect(insideSessionProxy({
+      HTTPS_PROXY: 'http://127.0.0.1:17645',
+      NODE_EXTRA_CA_CERTS: '/home/u/.clodex/http-proxy/clodex-ca.pem',
+    })).toBe(true);
+    expect(insideSessionProxy({ HTTPS_PROXY: 'http://corp-proxy:8080' })).toBe(false);
+    expect(insideSessionProxy({ HTTPS_PROXY: 'http://127.0.0.1:17645' })).toBe(false);
+    expect(insideSessionProxy({})).toBe(false);
   });
 });
