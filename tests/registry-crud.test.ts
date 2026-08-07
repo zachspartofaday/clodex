@@ -148,6 +148,29 @@ describe('registry provider removal', () => {
     );
   });
 
+  it('queues every named OAuth account slot credential on provider removal', async () => {
+    registryState.current.providers[0] = {
+      ...registryState.current.providers[0]!,
+      authType: 'oauth',
+      authRef: 'keyring:oauth:provider:openai-oauth::credential::v1:default',
+      authAccounts: {
+        work: { authRef: 'keyring:oauth:provider:openai-oauth:account:work::credential::v1:w', addedAt: '2026-08-07T00:00:00.000Z' },
+        alt: { authRef: 'keyring:oauth:provider:openai-oauth:account:alt::credential::v1:a', addedAt: '2026-08-07T00:00:00.000Z' },
+      },
+    };
+
+    const result = await removeProviderFromRegistry('openai');
+
+    expect(result.removed).toBe(true);
+    expect(registryState.current.providers).toHaveLength(0);
+    const deleted = vi.mocked(deleteProviderCredential).mock.calls.map(call => call[0]).sort();
+    expect(deleted).toEqual([
+      'keyring:oauth:provider:openai-oauth::credential::v1:default',
+      'keyring:oauth:provider:openai-oauth:account:alt::credential::v1:a',
+      'keyring:oauth:provider:openai-oauth:account:work::credential::v1:w',
+    ].sort());
+  });
+
   it('commits the registry mutation before deleting the credential outside the lock', async () => {
     const result = await removeProviderFromRegistry('openai');
 

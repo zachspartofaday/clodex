@@ -194,6 +194,43 @@ describe('authenticateProvider', () => {
     rmSync(home, { recursive: true, force: true });
   });
 
+  it('stores a named account slot without touching the default credential', async () => {
+    await authenticateProvider('openai');
+    const defaultRef = registryState.current.providers[0]!.authRef;
+
+    const result = await authenticateProvider('openai', { account: 'work' });
+
+    const entry = registryState.current.providers[0]!;
+    expect(entry.authRef).toBe(defaultRef);
+    const slot = entry.authAccounts?.work;
+    expect(slot?.authRef).toBeTruthy();
+    expect(slot!.authRef).not.toBe(defaultRef);
+    expect(slot!.oauthAccountId).toBe('acct-123');
+    expect(result.registryProvider.authAccounts?.work?.authRef).toBe(slot!.authRef);
+  });
+
+  it('normalizes the account name and reuses the slot ref on re-auth', async () => {
+    await authenticateProvider('openai');
+    await authenticateProvider('openai', { account: 'Work' });
+    const firstRef = registryState.current.providers[0]!.authAccounts!.work!.authRef;
+    await authenticateProvider('openai', { account: 'work' });
+    const entry = registryState.current.providers[0]!;
+    expect(Object.keys(entry.authAccounts!)).toEqual(['work']);
+    expect(entry.authAccounts!.work!.authRef).toBe(firstRef);
+  });
+
+  it('rejects a named account before the default sign-in exists', async () => {
+    await expect(authenticateProvider('openai', { account: 'work' }))
+      .rejects.toThrow(/default sign-in first/);
+    expect(registryState.current.providers).toHaveLength(0);
+  });
+
+  it('rejects an invalid account name before any device authorization', async () => {
+    await expect(authenticateProvider('openai', { account: 'Bad Name!' }))
+      .rejects.toThrow(/Invalid account name/);
+    expect(runOpenAiDeviceCodeFlow).not.toHaveBeenCalled();
+  });
+
   it('runs the OpenAI device-code flow and stores the openai-oauth registry entry', async () => {
     vi.mocked(provisionProviderCredential).mockImplementationOnce(async () => {
       expect(lockState.active).toBe(false);
