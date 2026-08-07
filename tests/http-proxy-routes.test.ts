@@ -52,7 +52,7 @@ describe('HTTP proxy routes', () => {
       apiKey: 'groq-key',
     });
     expect(result.routes[1]).toMatchObject({
-      aliasId: 'clodex:anthropic:claude-sonnet-4-6',
+      aliasId: 'clodex:anthropic:claude-sonnet-4-6[1m]',
       realModelId: 'claude-sonnet-4-6',
       modelFormat: 'anthropic',
       upstreamUrl: 'https://api.anthropic.com',
