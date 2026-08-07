@@ -23,6 +23,7 @@ import { fetchProviderCatalog, providersForPicker, resolveLocalProviderApiKey } 
 import { VERSION } from './constants.js';
 import type { BuiltinAliasName, ParsedArgs, FavoriteModel, LocalProvider, LocalProviderModel } from './types.js';
 import { routableBuiltinOverrides } from './builtin-alias-env.js';
+import { normalizeRouteLookupId } from './context-model-id.js';
 import { addFavorite, removeFavorite, isFavorite } from './favorites.js';
 import {
   canonicalModelAliasName,
@@ -1279,6 +1280,7 @@ async function runClaudeHttpProxyCommand(
       loadPreferences().builtinModelOverrides,
       [...loaded.aliases.map(alias => alias.name), ...loaded.routes.map(route => route.aliasId)],
       message => { if (!agentStdout) p.log.warn(message); },
+      normalizeRouteLookupId,
     ),
   );
   const debugLogPath = parsed.trace
