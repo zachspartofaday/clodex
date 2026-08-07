@@ -21,15 +21,18 @@ import { loadPreferences, savePreferences, recordLaunchSelection, resolveBridgeM
 import { pickLocalModel } from './prompts.js';
 import { fetchProviderCatalog, providersForPicker, resolveLocalProviderApiKey } from './provider-catalog.js';
 import { VERSION } from './constants.js';
-import type { ParsedArgs, FavoriteModel, LocalProvider, LocalProviderModel } from './types.js';
+import type { BuiltinAliasName, ParsedArgs, FavoriteModel, LocalProvider, LocalProviderModel } from './types.js';
 import { addFavorite, removeFavorite, isFavorite } from './favorites.js';
 import {
   canonicalModelAliasName,
+  isReservedModelAlias,
+  isModelAliasNameSyntax,
   modelAliasMatchesName,
   modelAliasMatchesStoredName,
   modelAliasTarget,
   parseModelAliasAssignment,
 } from './model-aliases.js';
+import type { ModelAlias } from './types.js';
 import {
   browseByProviderChoice,
   buildGlobalFavoriteIndex,
@@ -37,6 +40,7 @@ import {
 } from './favorites-picker.js';
 import { favoriteProviderDisplayName } from './favorite-provider-display.js';
 import { runProvidersCommand, providersHelpText } from './providers-command.js';
+import { runProfilesCommand } from './profiles-command.js';
 import {
   getInferenceSessionLogPath,
   getSessionLogPath,
@@ -277,6 +281,12 @@ export function parseArgs(args: string[]): ParsedArgs {
     return parsed;
   }
 
+  if (first === 'profiles') {
+    const parsed = emptyParsed('profiles');
+    parsed.claudeArgs = [...rest];
+    return parsed;
+  }
+
   if (first === 'patch') {
     const parsed = emptyParsed('patch');
     for (const arg of rest) {
@@ -352,6 +362,7 @@ ${pc.bold('Usage:')}
   clodex models
   clodex favorites
   clodex providers
+  clodex profiles
   clodex --help
   clodex --version
 
@@ -366,6 +377,7 @@ ${pc.bold('Commands:')}
   models      Manage favorite models and aliases (max ${MAX_MODEL_CATALOG})
   favorites   Alias for models
   providers   Add or sign in to model providers
+  profiles    Save and apply named snapshots of favorites + model aliases
 
 ${pc.bold('Bridge modes (claude and server):')}
   --endpoint   Local Anthropic-format gateway; Claude Code launches with
@@ -671,6 +683,174 @@ interface FavoritesCommandOptions {
   unalias?: string;
 }
 
+/**
+ * Interactive alias configurator inside `clodex models`: list saved aliases,
+ * re-point one at a different favorite, add, or remove — the picker
+ * equivalent of `clodex models --alias name=clodex:<provider>:<model>`.
+ * Aliases only resolve to saved favorites, so the target picker offers
+ * exactly the favorites list.
+ */
+async function runAliasConfigurator(
+  modelLookup: Map<string, { modelName: string; providerName: string }>,
+): Promise<void> {
+  const pickTarget = async (favorites: FavoriteModel[], message: string): Promise<FavoriteModel | null> => {
+    if (favorites.length === 0) {
+      p.log.warn('No favorites saved — add favorites first; aliases only route to favorited models.');
+      return null;
+    }
+    const choice = await p.select<string>({
+      message,
+      options: favorites.map((favorite, index) => {
+        const entry = modelLookup.get(`${favorite.providerId}:${favorite.modelId}`);
+        return {
+          value: `target-${index}`,
+          label: entry ? `${fmtModel(entry.modelName)} ${pc.dim(`(${entry.providerName})`)}` : String(favorite.modelId),
+          hint: `clodex:${favorite.providerId}:${favorite.modelId}`,
+        };
+      }),
+    });
+    if (p.isCancel(choice)) return null;
+    return favorites[Number(choice.slice('target-'.length))] ?? null;
+  };
+
+  while (true) {
+    const prefs = loadPreferences();
+    const aliases = Array.isArray(prefs.modelAliases) ? prefs.modelAliases : [];
+    const favorites = prefs.favoriteModels ?? [];
+    const options: Array<{ value: string; label: string; hint: string }> = aliases.map((alias, index) => {
+      const entry = modelLookup.get(`${alias.providerId}:${alias.modelId}`);
+      const target = entry
+        ? `${entry.modelName} ${pc.dim(`(${entry.providerName})`)}`
+        : pc.dim(`clodex:${String(alias.providerId)}:${String(alias.modelId)}`);
+      return {
+        value: `alias-${index}`,
+        label: `${pc.bold(alias.name)} → ${target}`,
+        hint: 'change target or remove',
+      };
+    });
+    options.push({ value: '__add__', label: pc.cyan('+ Add an alias'), hint: 'name a favorite for /model and agent frontmatter' });
+    const builtinOverrides = prefs.builtinModelOverrides ?? {};
+    for (const name of ['sonnet', 'opus', 'haiku', 'fable'] as const) {
+      const target = builtinOverrides[name];
+      options.push({
+        value: `builtin-${name}`,
+        label: `${pc.bold(name)} ${pc.dim('(built-in)')} → ${target ? pc.yellow(target) : pc.dim('native default')}`,
+        hint: 'remap Claude Code\'s built-in alias at launch',
+      });
+    }
+    options.push({ value: '__back__', label: 'Done', hint: '' });
+
+    const choice = await p.select<string>({
+      message: aliases.length === 0 ? 'Aliases (none saved)' : `Aliases (${aliases.length})`,
+      options,
+      initialValue: '__back__',
+    });
+    if (p.isCancel(choice) || choice === '__back__') return;
+
+    if (choice.startsWith('builtin-')) {
+      const builtin = choice.slice('builtin-'.length) as 'sonnet' | 'opus' | 'haiku' | 'fable';
+      const current = prefs.builtinModelOverrides ?? {};
+      const routable: Array<{ value: string; label: string; hint: string }> = [
+        { value: '__native__', label: 'Native default', hint: 'remove the remap' },
+        ...aliases.map(alias => ({
+          value: `use:${alias.name}`,
+          label: `alias ${pc.bold(alias.name)}`,
+          hint: `clodex:${String(alias.providerId)}:${String(alias.modelId)}`,
+        })),
+        ...favorites.map(favorite => {
+          const entry = modelLookup.get(`${favorite.providerId}:${favorite.modelId}`);
+          return {
+            value: `use:clodex:${favorite.providerId}:${favorite.modelId}`,
+            label: entry ? `${fmtModel(entry.modelName)} ${pc.dim(`(${entry.providerName})`)}` : String(favorite.modelId),
+            hint: `clodex:${favorite.providerId}:${favorite.modelId}`,
+          };
+        }),
+      ];
+      const picked = await p.select<string>({
+        message: `Route built-in "${builtin}" to`,
+        options: routable,
+      });
+      if (p.isCancel(picked)) continue;
+      const next = { ...current };
+      if (picked === '__native__') delete next[builtin];
+      else next[builtin] = picked.slice('use:'.length);
+      savePreferences({ builtinModelOverrides: next });
+      p.log.success(picked === '__native__'
+        ? `Restored built-in ${builtin} to its native default.`
+        : `Built-in ${builtin} now launches as ${picked.slice('use:'.length)} (proxy mode; explicit env vars still win).`);
+      continue;
+    }
+
+    if (choice === '__add__') {
+      const rawName = await p.text({
+        message: 'Alias name (what /model and agent model: fields will use)',
+        placeholder: 'wjudge',
+        validate: value => {
+          const name = canonicalModelAliasName(String(value ?? ''));
+          if (!isModelAliasNameSyntax(name)) return 'Use 1-64 letters, numbers, dots, underscores, or hyphens.';
+          if (isReservedModelAlias(name)) return 'That name is reserved by the client.';
+          return undefined;
+        },
+      });
+      if (p.isCancel(rawName)) continue;
+      const name = canonicalModelAliasName(String(rawName));
+      const target = await pickTarget(favorites, `Route "${name}" to which favorite?`);
+      if (!target) continue;
+      const next: ModelAlias[] = aliases.filter(alias => !modelAliasMatchesName(alias, name));
+      next.push({ name, providerId: target.providerId, modelId: target.modelId });
+      savePreferences({ modelAliases: next });
+      p.log.success(`Saved alias ${name} → clodex:${target.providerId}:${target.modelId}.`);
+      continue;
+    }
+
+    const index = Number(choice.slice('alias-'.length));
+    const alias = aliases[index];
+    if (!alias) continue;
+    const action = await p.select<string>({
+      message: `${alias.name} → clodex:${String(alias.providerId)}:${String(alias.modelId)}`,
+      options: [
+        { value: 'retarget', label: 'Change target', hint: 'pick a different favorite' },
+        { value: 'remove', label: 'Remove alias', hint: '' },
+        { value: 'back', label: 'Cancel', hint: '' },
+      ],
+    });
+    if (p.isCancel(action) || action === 'back') continue;
+    if (action === 'remove') {
+      savePreferences({ modelAliases: aliases.filter((_, i) => i !== index) });
+      p.log.success(`Removed alias ${alias.name}.`);
+      clearBuiltinOverridesForRemovedAlias(alias.name);
+      continue;
+    }
+    const target = await pickTarget(favorites, `Route "${alias.name}" to which favorite?`);
+    if (!target) continue;
+    const next = aliases.map((entry, i) => i === index
+      ? { name: entry.name, providerId: target.providerId, modelId: target.modelId }
+      : entry);
+    savePreferences({ modelAliases: next });
+    p.log.success(`Saved alias ${alias.name} → clodex:${target.providerId}:${target.modelId}.`);
+  }
+}
+
+/**
+ * A built-in remap pointing at a removed alias would keep injecting that name
+ * through ANTHROPIC_DEFAULT_*_MODEL while the proxy no longer has a route for
+ * it — requests using the built-in would fail instead of reverting to the
+ * native default. Clear matching remaps whenever an alias is deleted.
+ */
+function clearBuiltinOverridesForRemovedAlias(removedName: string): void {
+  const prefs = loadPreferences();
+  const overrides = prefs.builtinModelOverrides ?? {};
+  const cleared = (Object.entries(overrides) as Array<[BuiltinAliasName, string]>)
+    .filter(([, target]) => target.trim().toLowerCase() === removedName.trim().toLowerCase());
+  if (cleared.length === 0) return;
+  const next = { ...overrides };
+  for (const [builtin] of cleared) delete next[builtin];
+  savePreferences({ builtinModelOverrides: next });
+  for (const [builtin, target] of cleared) {
+    p.log.warn(`Cleared built-in remap ${builtin} → ${target}: its alias was removed, so ${builtin} reverts to the native default.`);
+  }
+}
+
 export async function runModelsCommand(opts: FavoritesCommandOptions = {}): Promise<number> {
   const changesAlias = opts.alias !== undefined || opts.unalias !== undefined;
   if (changesAlias && (opts.list || (opts.alias !== undefined && opts.unalias !== undefined))) {
@@ -724,6 +904,7 @@ export async function runModelsCommand(opts: FavoritesCommandOptions = {}): Prom
         ? `Removed model alias ${name || JSON.stringify(requestedName)}.`
         : `Removed ${removedCount} model aliases named ${name || JSON.stringify(requestedName)}.`,
     );
+    clearBuiltinOverridesForRemovedAlias(name || requestedName);
     return 0;
   }
   if (opts.list) {
@@ -795,6 +976,12 @@ export async function runModelsCommand(opts: FavoritesCommandOptions = {}): Prom
         ? 'Remove a favorite first to make room'
         : `${allProviders.length} provider${allProviders.length !== 1 ? 's' : ''} available`,
     });
+    const aliasCount = (loadPreferences().modelAliases ?? []).length;
+    options.push({
+      value: '__aliases__',
+      label: pc.cyan('⇢ Configure aliases'),
+      hint: aliasCount ? `${aliasCount} saved — name → model routing` : 'name → model routing for /model and agents',
+    });
     options.push({ value: '__done__', label: 'Done', hint: '' });
 
     const header = favorites.length === 0
@@ -808,6 +995,15 @@ export async function runModelsCommand(opts: FavoritesCommandOptions = {}): Prom
     });
 
     if (p.isCancel(choice) || choice === '__done__') break;
+
+    if (choice === '__aliases__') {
+      if (favoritesDirty) {
+        savePreferences({ favoriteModels: favorites });
+        favoritesDirty = false;
+      }
+      await runAliasConfigurator(modelLookup);
+      continue;
+    }
 
     if (choice === '__add__') {
       if (atCap) {
@@ -1040,7 +1236,11 @@ async function runClaudeHttpProxyCommand(
     }
   }
 
-  const childEnv = buildHttpProxyChildEnv(handle.port, handle.caCertPath);
+  const childEnv = buildHttpProxyChildEnv(
+    handle.port,
+    handle.caCertPath,
+    loadPreferences().builtinModelOverrides,
+  );
   const debugLogPath = parsed.trace
     ? prepareClaudeTraceLog(getSessionLogPath('claude-debug'))
     : undefined;
@@ -1510,6 +1710,10 @@ export async function main(args: string[] = process.argv.slice(2)): Promise<numb
       alias: parsed.favoritesAlias,
       unalias: parsed.favoritesUnalias,
     });
+  }
+
+  if (parsed.command === 'profiles') {
+    return runProfilesCommand(parsed.claudeArgs ?? []);
   }
 
   if (parsed.command === 'providers') {

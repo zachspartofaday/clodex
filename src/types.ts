@@ -5,7 +5,7 @@ import type { ModelRuntimeCompatibility } from './model-runtime-compatibility.js
 
 export type ModelFormat = 'anthropic' | 'openai' | 'unsupported';
 
-export type StarterCommand = 'root' | 'claude' | 'server' | 'models' | 'providers' | 'patch';
+export type StarterCommand = 'root' | 'claude' | 'server' | 'models' | 'providers' | 'profiles' | 'patch';
 
 export interface ModelCost {
   input: number;
@@ -72,12 +72,39 @@ export interface ModelAlias extends FavoriteModel {
 
 export type BridgeMode = 'endpoint' | 'proxy';
 
+/** Claude Code's built-in model aliases whose targets can be remapped at launch. */
+export type BuiltinAliasName = 'sonnet' | 'opus' | 'haiku' | 'fable';
+
+export interface ModelProfile {
+  savedAt: string;
+  favoriteModels: FavoriteModel[];
+  modelAliases: ModelAlias[];
+  /** Remaps of Claude Code's built-in aliases applied via ANTHROPIC_DEFAULT_*_MODEL at launch. */
+  builtinModelOverrides?: Partial<Record<BuiltinAliasName, string>>;
+}
+
 export interface UserPreferences {
   lastModel?: string;
   lastProvider?: string;
   recentModelsByProvider?: Record<string, string[]>;
   favoriteModels?: FavoriteModel[];
   modelAliases?: ModelAlias[];
+  /**
+   * Named snapshots of favorites + aliases (`clodex profiles`). Applying one
+   * re-points every alias in a single step — the alias NAMES are what agent
+   * definitions and the Claude Code patch tables key on, so switching the
+   * models behind them never touches agent config.
+   */
+  modelProfiles?: Record<string, ModelProfile>;
+  /** Last profile applied by `clodex profiles use`. */
+  activeModelProfile?: string;
+  /**
+   * Remap Claude Code's built-in aliases (sonnet/opus/haiku/fable) to other
+   * models at launch via ANTHROPIC_DEFAULT_*_MODEL. Values are request model
+   * ids the proxy can route: a saved clodex alias name or clodex:<provider>:<model>.
+   * An explicitly set environment variable always wins over this config.
+   */
+  builtinModelOverrides?: Partial<Record<BuiltinAliasName, string>>;
   /** Remembered bridge mode for `clodex claude` (set by --endpoint / --proxy). */
   claudeBridgeMode?: BridgeMode;
   /** Remembered bridge mode for `clodex server` (set by --endpoint / --proxy). */

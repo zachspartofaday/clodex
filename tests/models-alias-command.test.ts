@@ -113,6 +113,26 @@ describe('models alias command', () => {
     expect(JSON.parse(readFileSync(getConfigPath(), 'utf8')).modelAliases).toEqual(malformed);
   });
 
+  it('clears a built-in remap whose target alias is removed', async () => {
+    const warn = vi.spyOn(p.log, 'warn').mockImplementation(() => {});
+    try {
+      expect(await runModelsCommand({ alias: 'luna=clodex:openai-oauth:gpt-5.6-luna' })).toBe(0);
+      savePreferences({ builtinModelOverrides: { fable: 'luna', sonnet: 'clodex:openai-oauth:gpt-5.6-sol' } });
+
+      expect(await runModelsCommand({ unalias: 'luna' })).toBe(0);
+
+      // The remap pointing at the deleted alias would inject a model id the
+      // proxy no longer routes; it must revert to the native default. The
+      // canonical-id remap is untouched.
+      expect(loadPreferences().builtinModelOverrides).toEqual({
+        sonnet: 'clodex:openai-oauth:gpt-5.6-sol',
+      });
+      expect(warn).toHaveBeenCalledWith(expect.stringContaining('Cleared built-in remap fable → luna'));
+    } finally {
+      warn.mockRestore();
+    }
+  });
+
   it('removes one alias without discarding unrelated inactive entries', async () => {
     const aliases = [
       { name: 'Active', providerId: 'openai-oauth', modelId: 'gpt-5.6-luna' },

@@ -1,5 +1,7 @@
 // src/env.ts
 import { CONFLICTING_ENV_VARS } from './constants.js';
+import { applyBuiltinModelOverrides } from './builtin-alias-env.js';
+export { BUILTIN_ALIAS_ENV, applyBuiltinModelOverrides } from './builtin-alias-env.js';
 import {
   createCipheriv,
   createDecipheriv,
@@ -39,7 +41,7 @@ import {
   withCredentialMutationLock,
   withRegistryWriteLock,
 } from './registry/lock.js';
-import type { ConflictInfo } from './types.js';
+import type { BuiltinAliasName, ConflictInfo } from './types.js';
 import { removeAnthropicProxyBypass } from './wrapper-env.js';
 
 export function detectConflicts(): ConflictInfo[] {
@@ -97,12 +99,18 @@ export function buildChildEnv(
  * intact, remove only endpoint modes that would bypass api.anthropic.com, and
  * trust the per-user clodex CA for this child process.
  */
-export function buildHttpProxyChildEnv(proxyPort: number, caCertPath: string): NodeJS.ProcessEnv {
+export function buildHttpProxyChildEnv(
+  proxyPort: number,
+  caCertPath: string,
+  builtinOverrides?: Partial<Record<BuiltinAliasName, string>>,
+): NodeJS.ProcessEnv {
   const env: NodeJS.ProcessEnv = { ...process.env };
+  const explicit: NodeJS.ProcessEnv = { ...process.env };
   for (const name of CONFLICTING_ENV_VARS) {
     if (name === 'ANTHROPIC_API_KEY' || name === 'ANTHROPIC_AUTH_TOKEN' || name === 'ANTHROPIC_MODEL') continue;
     delete env[name];
   }
+  applyBuiltinModelOverrides(env, builtinOverrides, explicit);
   const proxyUrl = `http://127.0.0.1:${proxyPort}`;
   env['HTTPS_PROXY'] = proxyUrl;
   env['HTTP_PROXY'] = proxyUrl;
