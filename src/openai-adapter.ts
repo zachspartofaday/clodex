@@ -2,6 +2,7 @@ import { tool, jsonSchema, streamText, generateText } from 'ai';
 import type { LanguageModel, ModelMessage } from 'ai';
 import { parseToolArguments } from './proxy-shared.js';
 import type { SdkCallParams } from './sdk-adapter.js';
+import { SDK_TOTAL_TIMEOUT_MS, upstreamMaxRetries } from './sdk-adapter.js';
 
 // ── OpenAI request shapes ───────────────────────────────────────────────────
 
@@ -162,7 +163,10 @@ export interface CollectedOpenAiStream {
 }
 
 /** Reduce an SDK full stream into the fields a non-streaming chat completion needs. */
-export async function collectOpenAiStream(stream: AsyncIterable<unknown>): Promise<CollectedOpenAiStream> {
+export async function collectOpenAiStream(
+  stream: AsyncIterable<unknown>,
+  abortSignal?: AbortSignal,
+): Promise<CollectedOpenAiStream> {
   const collected: CollectedOpenAiStream = { text: '', toolCalls: [], finishReason: undefined, usage: undefined };
   for await (const part of stream) {
     const p = part as any;
@@ -181,11 +185,18 @@ export async function collectOpenAiStream(stream: AsyncIterable<unknown>): Promi
         collected.finishReason = p.finishReason ?? collected.finishReason;
         collected.usage = p.totalUsage ?? p.usage ?? collected.usage;
         break;
+      case 'abort':
+        // The deadline fired mid-stream; a silent partial completion would
+        // look like a successful (truncated) answer to the client.
+        throw new Error(`provider request exceeded ${Math.round(SDK_TOTAL_TIMEOUT_MS / 1000)}s`);
       case 'error':
         throw p.error instanceof Error || (p.error && typeof p.error === 'object')
           ? p.error
           : new Error(typeof p.error === 'string' ? p.error : 'Upstream stream failed');
     }
+  }
+  if (abortSignal?.aborted) {
+    throw new Error(`provider request exceeded ${Math.round(SDK_TOTAL_TIMEOUT_MS / 1000)}s`);
   }
   return collected;
 }
@@ -201,10 +212,11 @@ export async function generateOpenAiResponse(
     // Some upstreams (e.g. ChatGPT's Codex OAuth backend) only ever answer as a
     // stream. Request a real stream from the SDK and collect it into one
     // response instead of issuing a non-streaming request upstream.
-    const { stream } = streamText({ model, ...(params as any), onError: () => {} });
-    result = await collectOpenAiStream(stream);
+    const abortSignal = AbortSignal.timeout(SDK_TOTAL_TIMEOUT_MS);
+    const { stream } = streamText({ model, ...(params as any), ...(upstreamMaxRetries() !== undefined ? { maxRetries: upstreamMaxRetries() } : {}), abortSignal, onError: () => {} });
+    result = await collectOpenAiStream(stream, abortSignal);
   } else {
-    result = (await generateText({ model, ...(params as any) })) as any;
+    result = (await generateText({ model, ...(params as any), ...(upstreamMaxRetries() !== undefined ? { maxRetries: upstreamMaxRetries() } : {}), abortSignal: AbortSignal.timeout(SDK_TOTAL_TIMEOUT_MS) })) as any;
   }
   const message: Record<string, any> = { role: 'assistant', content: result.text || null };
 
@@ -236,7 +248,8 @@ export async function streamOpenAiResponse(
   responseModelId: string,
   onChunk: (chunk: string) => void,
 ): Promise<void> {
-  const { stream } = streamText({ model, ...(params as any) });
+  const abortSignal = AbortSignal.timeout(SDK_TOTAL_TIMEOUT_MS);
+  const { stream } = streamText({ model, ...(params as any), ...(upstreamMaxRetries() !== undefined ? { maxRetries: upstreamMaxRetries() } : {}), abortSignal });
   const baseData = {
     id: `chatcmpl-${Date.now()}`,
     object: 'chat.completion.chunk',
@@ -262,11 +275,18 @@ export async function streamOpenAiResponse(
       case 'finish':
         send({}, p.finishReason || 'stop');
         break;
+      case 'abort':
+        throw new Error(`provider request exceeded ${Math.round(SDK_TOTAL_TIMEOUT_MS / 1000)}s`);
       case 'error':
         throw p.error instanceof Error || (p.error && typeof p.error === 'object')
           ? p.error
           : new Error(typeof p.error === 'string' ? p.error : 'Upstream stream failed');
     }
+  }
+  if (abortSignal.aborted) {
+    // Never seal a truncated stream with [DONE]: the client would treat the
+    // partial text as the complete answer.
+    throw new Error(`provider request exceeded ${Math.round(SDK_TOTAL_TIMEOUT_MS / 1000)}s`);
   }
 
   onChunk('data: [DONE]\n\n');
