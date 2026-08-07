@@ -33,7 +33,7 @@ import {
   withRegistryWriteLock,
 } from './lock.js';
 import { refreshProviderModels } from './refresh-models.js';
-import type { RegistryProvider } from './types.js';
+import { OAUTH_ACCOUNT_NAME_RE, type RegistryProvider } from './types.js';
 
 export type { StoredOAuthCredential } from '../oauth/types.js';
 
@@ -45,12 +45,10 @@ export interface ProviderAuthOptions {
   account?: string;
 }
 
-const ACCOUNT_NAME_RE = /^[a-z0-9][a-z0-9_-]{0,31}$/;
-
 /** Validate a named-account slot; the name lands in credential-store scopes and env values. */
 export function validateOAuthAccountName(name: string): string {
   const trimmed = name.trim().toLowerCase();
-  if (!ACCOUNT_NAME_RE.test(trimmed)) {
+  if (!OAUTH_ACCOUNT_NAME_RE.test(trimmed)) {
     throw new Error(
       `Invalid account name "${name}" — use 1-32 characters: lowercase letters, digits, "-" or "_", starting with a letter or digit.`,
     );
