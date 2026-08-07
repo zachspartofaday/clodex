@@ -2238,6 +2238,7 @@ describe('createResponsesWebSocketFetch', () => {
     storedArguments: string;
     echoedArguments: string;
     tools?: unknown[];
+    echoedExtra?: Record<string, unknown>;
   }): Promise<{ stderr: string[]; diagnostics: ResponsesWebSocketDiagnosticEvent[] }> {
     const stderr: string[] = [];
     const spy = vi.spyOn(process.stderr, 'write')
@@ -2269,7 +2270,7 @@ describe('createResponsesWebSocketFetch', () => {
       // Same call_id, same tool — only the argument bytes differ.
       const echoed = [
         input[0]!,
-        { type: 'function_call', call_id: 'call_g', name: 'Grep', arguments: options.echoedArguments },
+        { type: 'function_call', call_id: 'call_g', name: 'Grep', arguments: options.echoedArguments, ...(options.echoedExtra ?? {}) },
         storedOutput,
         { role: 'user', content: [{ type: 'input_text', text: 'again' }] },
       ];
@@ -2337,6 +2338,23 @@ describe('createResponsesWebSocketFetch', () => {
     const decision = diagnostics.filter(event => event.event === 'ws_head_decision').at(-1)!;
     expect((decision.heads as { mismatch: Record<string, unknown> }[])[0]!.mismatch)
       .toMatchObject({ toolArgumentNormalizationGap: { equalAfterStrip: false } });
+  });
+
+  it('classifies a non-argument field difference as an ordinary mismatch', async () => {
+    const { stderr, diagnostics } = await runToolArgumentMismatch({
+      accountId: 'acct-tool-gap-otherfield',
+      responseId: 'resp_tool_other',
+      // Arguments agree; the echo differs in an extension field. The strip
+      // rule agrees on both sides, so a #84 warning here would be misleading.
+      storedArguments: '{"pattern":"x"}',
+      echoedArguments: '{"pattern":"x"}',
+      echoedExtra: { metadata: 'client-extension' },
+    });
+
+    expect(stderr.join('')).toBe('');
+    const decision = diagnostics.filter(event => event.event === 'ws_head_decision').at(-1)!;
+    expect((decision.heads as { mismatch: Record<string, unknown> }[])[0]!.mismatch)
+      .not.toHaveProperty('toolArgumentNormalizationGap');
   });
 
   it('stays silent when a different call_id makes it a genuine branch', async () => {
