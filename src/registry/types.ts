@@ -46,6 +46,13 @@ export interface RegistryProvider {
   enabled: boolean;
   authRef: string;
   authType?: 'api' | 'oauth' | 'none';
+  /**
+   * Named OAuth account slots beyond the default credential
+   * (`clodex providers auth openai --account <name>`). Each slot owns a
+   * disjoint credential-store lineage; CLODEX_OAUTH_ACCOUNT selects one at
+   * launch without touching the default `authRef`.
+   */
+  authAccounts?: Record<string, { authRef: string; addedAt: string; oauthAccountId?: string }>;
   subscriptionFilter?: RegistrySubscriptionFilter;
   /** Keep provider/curated costs instead of replacing them with the global pricing cache. */
   preserveModelPricing?: boolean;
