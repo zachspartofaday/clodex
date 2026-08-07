@@ -1,0 +1,116 @@
+name: Restack OpenCode Go provider
+
+on:
+  push:
+    branches:
+      - agent/opencode-go-provider
+
+permissions:
+  contents: write
+  pull-requests: write
+
+jobs:
+  restack:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '24'
+      - run: corepack enable
+      - name: Preserve provider layer or recover its implementation script
+        shell: bash
+        run: |
+          python <<'PY'
+          from pathlib import Path
+          import json
+          import shutil
+          import textwrap
+
+          files = [
+              'src/data/opencode-go-models.json',
+              'src/data/opencode-go-models.ts',
+              'scripts/update-opencode-go-models.mjs',
+              'tests/opencode-go-provider.test.ts',
+              'src/provider-templates.ts',
+              'package.json',
+              'README.md',
+          ]
+          snapshot = Path('/tmp/opencode-layer')
+          snapshot.mkdir(parents=True, exist_ok=True)
+          if Path('src/data/opencode-go-models.json').exists():
+              for relative in files:
+                  source = Path(relative)
+                  if not source.exists():
+                      raise RuntimeError(f'missing provider-layer file: {relative}')
+                  target = snapshot / relative
+                  target.parent.mkdir(parents=True, exist_ok=True)
+                  shutil.copy2(source, target)
+              Path('/tmp/opencode-mode').write_text('snapshot')
+          else:
+              workflow = Path('.github/workflows/implement-opencode-go.yml')
+              if not workflow.exists():
+                  raise RuntimeError('provider implementation and recovery source are both unavailable')
+              source = workflow.read_text()
+              marker = "          python <<'PY'\n"
+              start = source.index(marker) + len(marker)
+              end = source.index("\n          PY\n", start)
+              Path('/tmp/opencode-impl.py').write_text(textwrap.dedent(source[start:end]))
+              Path('/tmp/opencode-mode').write_text('script')
+          PY
+      - name: Rebuild directly on corrected infrastructure head
+        shell: bash
+        run: |
+          git fetch origin agent/mixed-provider-runtime
+          git reset --hard origin/agent/mixed-provider-runtime
+          if [ "$(cat /tmp/opencode-mode)" = snapshot ]; then
+            cp -a /tmp/opencode-layer/. .
+          else
+            python /tmp/opencode-impl.py
+          fi
+      - run: pnpm install --frozen-lockfile
+      - run: pnpm typecheck
+      - run: pnpm test
+      - run: pnpm build
+      - name: Publish one clean stacked commit and ensure PR target
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: bash
+        run: |
+          rm -f .github/workflows/implement-opencode-go.yml
+          rm -f .github/workflows/finalize-opencode-go.yml
+          rm -f .github/workflows/restack-opencode-go.yml
+          git config user.name github-actions[bot]
+          git config user.email 41898282+github-actions[bot]@users.noreply.github.com
+          git reset --soft origin/agent/mixed-provider-runtime
+          git add -A
+          git diff --cached --check
+          git commit -m "feat: add OpenCode Go provider"
+          git push --force-with-lease origin HEAD:agent/opencode-go-provider
+          if gh pr view agent/opencode-go-provider --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            gh pr edit agent/opencode-go-provider --repo "$GITHUB_REPOSITORY" --base agent/mixed-provider-runtime
+          else
+            cat > /tmp/pr-body.md <<'EOF'
+          ## Summary
+
+          - add OpenCode Go as a first-class API-key provider
+          - reconcile its sparse live `/models` response with a curated 17-model catalog
+          - route four models through Anthropic Messages and thirteen through OpenAI Chat Completions
+          - deliberately exclude Responses-only models, including Grok 4.5
+          - preserve model-specific context windows, pricing, image support, reasoning maps, and compatibility metadata
+          - add a maintenance generator, setup documentation, and mixed-protocol integration tests
+
+          ## Validation
+
+          - `pnpm typecheck`
+          - `pnpm test`
+          - `pnpm build`
+
+          ## Stack
+
+          PR 2 of 2. This targets `agent/mixed-provider-runtime` and should merge after the infrastructure PR.
+          EOF
+            gh pr create --repo "$GITHUB_REPOSITORY" --draft --base agent/mixed-provider-runtime --head agent/opencode-go-provider --title "feat: add OpenCode Go provider" --body-file /tmp/pr-body.md
+          fi
