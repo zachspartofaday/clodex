@@ -22,7 +22,7 @@ import { reconcilePendingCredentialDeletes } from './registry/credential-lifecyc
 import { loadRegistry } from './registry/io.js';
 import { refreshAllProviderModels, refreshProviderModels } from './registry/refresh-models.js';
 import { resolveRefreshCredential } from './registry/refresh-credentials.js';
-import { authenticateProvider, providerAuthHelpText, type ProviderAuthMethod } from './registry/provider-auth.js';
+import { authenticateProvider, providerAuthHelpText, validateOAuthAccountName, type ProviderAuthMethod } from './registry/provider-auth.js';
 import { supportsNativeOAuth } from './oauth/types.js';
 import { browseAllModels } from './prompts.js';
 import { cachedModelToLocal } from './registry/materialize.js';
@@ -551,6 +551,12 @@ export async function runProvidersHub(): Promise<number> {
     const configuredIds = new Set(entries.map(entry => entry.id));
     if (listVisibleOAuthTemplates(configuredIds).length > 0) {
       options.push({ value: 'auth-menu', label: '→ Sign in with ChatGPT (OAuth)', hint: 'device code' });
+    } else if (configuredIds.has('openai-oauth')) {
+      options.push({
+        value: 'auth-account',
+        label: '→ Add another ChatGPT account',
+        hint: 'named slot; select at launch with CLODEX_OAUTH_ACCOUNT=<name>',
+      });
     }
     if (entries.length > 0) {
       options.push({ value: 'refresh-all', label: '↺ Refresh all models', hint: 'Update model lists for all providers' });
@@ -575,6 +581,24 @@ export async function runProvidersHub(): Promise<number> {
     if (choice === 'auth-menu') {
       await runWithCredentialCleanup(state =>
         runProvidersAuthWithCleanupState('openai', undefined, state));
+      continue;
+    }
+    if (choice === 'auth-account') {
+      const name = await p.text({
+        message: 'Name for this account (you will select it at launch with CLODEX_OAUTH_ACCOUNT=<name>)',
+        placeholder: 'work',
+        validate: value => {
+          try {
+            validateOAuthAccountName(String(value ?? ''));
+            return undefined;
+          } catch (err) {
+            return err instanceof Error ? err.message : String(err);
+          }
+        },
+      });
+      if (p.isCancel(name)) continue;
+      await runWithCredentialCleanup(state =>
+        runProvidersAuthWithCleanupState('openai', undefined, state, String(name)));
       continue;
     }
     if (typeof choice === 'string' && choice.startsWith('provider:')) {
