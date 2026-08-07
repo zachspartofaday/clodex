@@ -2238,6 +2238,7 @@ describe('createResponsesWebSocketFetch', () => {
     storedArguments: string;
     echoedArguments: string;
     tools?: unknown[];
+    replayTools?: unknown[];
     echoedExtra?: Record<string, unknown>;
   }): Promise<{ stderr: string[]; diagnostics: ResponsesWebSocketDiagnosticEvent[] }> {
     const stderr: string[] = [];
@@ -2274,8 +2275,9 @@ describe('createResponsesWebSocketFetch', () => {
         storedOutput,
         { role: 'user', content: [{ type: 'input_text', text: 'again' }] },
       ];
+      const replayExtra = options.replayTools ? { tools: options.replayTools } : extra;
       const second = await wsFetch('https://x', {
-        method: 'POST', headers: {}, body: JSON.stringify(sessionPayload(echoed, extra)),
+        method: 'POST', headers: {}, body: JSON.stringify(sessionPayload(echoed, replayExtra)),
       });
       emitTextResponse(lastSocket(), `${options.responseId}_next`, 'done');
       await readAll(second);
@@ -2338,6 +2340,83 @@ describe('createResponsesWebSocketFetch', () => {
     const decision = diagnostics.filter(event => event.event === 'ws_head_decision').at(-1)!;
     expect((decision.heads as { mismatch: Record<string, unknown> }[])[0]!.mismatch)
       .toMatchObject({ toolArgumentNormalizationGap: { equalAfterStrip: false } });
+  });
+
+  it('compares under the schema that created the head, not the replay schema', async () => {
+    const { stderr, diagnostics } = await runToolArgumentMismatch({
+      accountId: 'acct-tool-gap-schema-drift',
+      responseId: 'resp_tool_drift',
+      // matches was OPTIONAL when the head was created, so the echo was
+      // sanitized without it. The replay marks it required — deriving the
+      // required set from the replay would call this unexplainable and
+      // suppress the genuine fork warning.
+      tools: [{
+        type: 'function', name: 'Grep',
+        parameters: { type: 'object', properties: { matches: { type: 'array' } }, required: [] },
+      }],
+      replayTools: [{
+        type: 'function', name: 'Grep',
+        parameters: { type: 'object', properties: { matches: { type: 'array' } }, required: ['matches'] },
+      }],
+      storedArguments: '{"pattern":"x","matches":[]}',
+      echoedArguments: '{"pattern":"x"}',
+    });
+
+    expect(stderr.join('')).toContain('regression of #84');
+    const decision = diagnostics.filter(event => event.event === 'ws_head_decision').at(-1)!;
+    expect((decision.heads as { mismatch: Record<string, unknown> }[])[0]!.mismatch)
+      .toMatchObject({ toolArgumentNormalizationGap: { tool: 'Grep', equalAfterStrip: true } });
+  });
+
+  it('warns for a gap on an older head even when a newer head mismatches ordinarily', async () => {
+    const stderr: string[] = [];
+    const spy = vi.spyOn(process.stderr, 'write')
+      .mockImplementation((chunk: unknown) => { stderr.push(String(chunk)); return true; });
+    try {
+      const user = { role: 'user', content: [{ type: 'input_text', text: 'search it' }] };
+      const gapOut = { type: 'function_call_output', call_id: 'call_m', output: 'hits' };
+      const wsFetch = createResponsesWebSocketFetch(WS_URL, undefined, { accountId: 'acct-tool-gap-multi' });
+      // Older head: carries the unstripped call (the forked-rule shape).
+      const first = await wsFetch('https://x', {
+        method: 'POST', headers: {},
+        body: JSON.stringify(sessionPayload([
+          user,
+          { type: 'function_call', call_id: 'call_m', name: 'Grep', arguments: '{"pattern":"x","glob":null}' },
+          gapOut,
+        ])),
+      });
+      lastSocket().emit('open');
+      emitTextResponse(lastSocket(), 'resp_multi_a', 'ok');
+      await readAll(first);
+      // Newer head: unrelated conversation — will mismatch ordinarily.
+      const second = await wsFetch('https://x', {
+        method: 'POST', headers: {},
+        body: JSON.stringify(sessionPayload([
+          { role: 'user', content: [{ type: 'input_text', text: 'something else' }] },
+        ])),
+      });
+      lastSocket().emit('open');
+      emitTextResponse(lastSocket(), 'resp_multi_b', 'ok');
+      await readAll(second);
+
+      // Replay echoes the OLDER head's call sanitized; the newest head (the
+      // diagnostic entry) mismatches ordinarily. The canary must still warn.
+      const third = await wsFetch('https://x', {
+        method: 'POST', headers: {},
+        body: JSON.stringify(sessionPayload([
+          user,
+          { type: 'function_call', call_id: 'call_m', name: 'Grep', arguments: '{"pattern":"x"}' },
+          gapOut,
+          { role: 'user', content: [{ type: 'input_text', text: 'again' }] },
+        ])),
+      });
+      emitTextResponse(lastSocket(), 'resp_multi_c', 'done');
+      await readAll(third);
+
+      expect(stderr.join('')).toContain('regression of #84');
+    } finally {
+      spy.mockRestore();
+    }
   });
 
   it('still catches a forked rule when Claude omits the stored reasoning item', async () => {
