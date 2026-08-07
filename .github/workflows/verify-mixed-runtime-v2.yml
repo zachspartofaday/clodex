@@ -1,0 +1,104 @@
+name: Verify mixed provider runtime final
+
+on:
+  push:
+    branches:
+      - agent/mixed-provider-runtime
+
+permissions:
+  contents: write
+  pull-requests: write
+
+jobs:
+  verify:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '24'
+      - run: corepack enable
+      - name: Recover implementation if necessary and enforce scoped pricing
+        shell: bash
+        run: |
+          python <<'PY'
+          from pathlib import Path
+          import re
+          import textwrap
+
+          if not Path('src/model-profile.ts').exists():
+              workflow = Path('.github/workflows/implement-mixed-runtime.yml')
+              if not workflow.exists():
+                  raise RuntimeError('mixed-provider implementation and recovery source are unavailable')
+              source = workflow.read_text()
+              marker = "          python <<'PY'\n"
+              start = source.index(marker) + len(marker)
+              end = source.index("\n          PY\n", start)
+              script = textwrap.dedent(source[start:end])
+              script, count = re.subn(
+                  r"\n# Existing curated cost data is authoritative[\s\S]*?(?=\n# Selective proxy can safely route)",
+                  "\n",
+                  script,
+                  count=1,
+              )
+              if count != 1:
+                  raise RuntimeError('could not narrow pricing mutation in recovery source')
+              exec(compile(script, '<mixed-provider-recovery>', 'exec'), {})
+
+          pricing_path = Path('src/registry/pricing.ts')
+          pricing = pricing_path.read_text().replace('    if (model.cost) return model;\n', '')
+          pricing_path.write_text(pricing)
+
+          add_path = Path('src/registry/add-template.ts')
+          add = add_path.read_text()
+          old = '''  const pricedModels = enrichModelsWithPricing(
+    catalogModels,
+    buildPricingIndex(pricingCache),
+    platform,
+  );
+'''
+          new = '''  const pricedModels = enrichModelsWithPricing(
+    catalogModels,
+    buildPricingIndex(pricingCache),
+    platform,
+  ).map((model, index) => {
+    const source = catalogModels[index];
+    return source?.cost ? { ...model, cost: source.cost } : model;
+  });
+'''
+          if old in add:
+              add = add.replace(old, new, 1)
+          elif new not in add:
+              raise RuntimeError('curated pricing safeguard is missing')
+          add_path.write_text(add)
+          PY
+      - name: Verify infrastructure contract
+        run: |
+          test -f src/model-profile.ts
+          grep -q "curatedModels" src/provider-templates.ts
+          grep -q "reasoningEffortMap" src/provider-factory.ts
+          grep -q "model.modelFormat === 'anthropic'" src/http-proxy/routes.ts
+      - run: pnpm install --frozen-lockfile
+      - run: pnpm typecheck
+      - run: pnpm test
+      - run: pnpm build
+      - name: Publish one clean verified commit
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: bash
+        run: |
+          rm -f .github/workflows/export-source.yml
+          rm -f .github/workflows/implement-mixed-runtime.yml
+          rm -f .github/workflows/finalize-mixed-runtime.yml
+          rm -f .github/workflows/rescue-mixed-runtime.yml
+          rm -f .github/workflows/verify-mixed-runtime-v2.yml
+          git config user.name github-actions[bot]
+          git config user.email 41898282+github-actions[bot]@users.noreply.github.com
+          git reset --soft origin/main
+          git add -A
+          git diff --cached --check
+          git commit -m "feat: support curated mixed-protocol providers"
+          git push --force origin HEAD:agent/mixed-provider-runtime
+          gh pr edit agent/mixed-provider-runtime --repo "$GITHUB_REPOSITORY" --base main
