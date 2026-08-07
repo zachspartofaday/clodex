@@ -118,6 +118,9 @@ export function applySelectedOAuthAccount(
 ): RegistryProvider {
   const name = selected?.trim();
   if (!name) return provider;
+  // A disabled provider cannot participate in the launch, so a stale selector
+  // aimed at it must not throw and take the whole catalog load down.
+  if (!provider.enabled) return provider;
   if (provider.authType !== 'oauth') return provider;
   const slots = provider.authAccounts;
   if (!slots || Object.keys(slots).length === 0) return provider;
