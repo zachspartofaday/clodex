@@ -523,6 +523,7 @@ export function translateRequest(
   // blocks, while retaining an automatic latest-message breakpoint as fallback.
   if (npm === '@ai-sdk/openai') {
     const claudeSessionId = extractClaudeSessionId(body, options?.claudeSessionId);
+    const serviceTier = options?.openAiOAuth ? oauthServiceTier() : undefined;
     providerOptions = deepMergeProviderOptions(providerOptions, {
       openai: {
         promptCacheKey: claudeSessionId
@@ -531,6 +532,7 @@ export function translateRequest(
         ...(supportsExplicitOpenAiCaching
           ? { promptCacheOptions: { mode: 'implicit', ttl: '30m' } }
           : {}),
+        ...(serviceTier ? { serviceTier } : {}),
       },
     });
   }
@@ -597,6 +599,40 @@ export function upstreamMaxRetries(log?: (message: string) => void): number | un
 
 export function resetUpstreamMaxRetriesWarningForTests(): void {
   warnedUpstreamMaxRetries = false;
+}
+
+/**
+ * Service tier for ChatGPT-OAuth (Codex backend) requests — Codex "fast mode"
+ * (Codex CLI config `service_tier = "fast"`; wire value `priority`). Applied
+ * ONLY on the OAuth route, and only after alias/remap resolution, so an alias
+ * that resolves to a ChatGPT model gets the tier while the same worker slot
+ * remapped to a non-OpenAI provider (OpenCode Zen, DeepSeek, …) never sends
+ * it. API-key OpenAI is deliberately excluded: on the public API `priority`
+ * is a billable per-token surcharge, not a plan feature. Absence of the
+ * variable preserves the backend default exactly. `fast` is accepted as the
+ * Codex CLI spelling and normalized to `priority`; the SDK's providerOptions
+ * schema takes only auto/default/flex/priority.
+ */
+const SERVICE_TIERS = new Set(['auto', 'default', 'flex', 'priority']);
+let warnedServiceTier = false;
+export function oauthServiceTier(log?: (message: string) => void): string | undefined {
+  const raw = process.env.CLODEX_SERVICE_TIER;
+  if (raw === undefined || raw.trim() === '') return undefined;
+  const normalized = raw.trim().toLowerCase() === 'fast' ? 'priority' : raw.trim().toLowerCase();
+  if (!SERVICE_TIERS.has(normalized)) {
+    if (!warnedServiceTier) {
+      warnedServiceTier = true;
+      const message = `ignoring CLODEX_SERVICE_TIER=${raw} (expected auto, default, flex, priority, or fast)`;
+      console.error(`clodex: ${message}`);
+      try { log?.(message); } catch { /* ignore */ }
+    }
+    return undefined;
+  }
+  return normalized;
+}
+
+export function resetServiceTierWarningForTests(): void {
+  warnedServiceTier = false;
 }
 
 // ── usage: SDK → Anthropic ────────────────────────────────────────────────────

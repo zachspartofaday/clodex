@@ -14,6 +14,7 @@ import {
   sdkTranslationErrorSignature,
   upstreamMaxRetries,
   resetUpstreamMaxRetriesWarningForTests,
+  resetServiceTierWarningForTests,
 } from '../src/sdk-adapter.js';
 
 describe('sdkTranslationErrorSignature', () => {
@@ -262,6 +263,47 @@ describe('translateRequest', () => {
     const systemMessages = explicitCaching.messages.filter(m => m.role === 'system');
     expect(systemMessages).toHaveLength(1);
     expect(systemMessages[0]?.content).toBe('You are Claude Code.\nFollow the user instructions.');
+  });
+
+  it('applies CLODEX_SERVICE_TIER on the OAuth route only, normalizing the Codex fast spelling', () => {
+    const body = {
+      model: 'gpt-5.6-sol',
+      messages: [{ role: 'user' as const, content: 'hello' }],
+    };
+    const prior = process.env.CLODEX_SERVICE_TIER;
+    try {
+      process.env.CLODEX_SERVICE_TIER = 'fast';
+      resetServiceTierWarningForTests();
+      // OAuth route (the worker path): Codex CLI's `fast` → wire `priority`.
+      const oauth = translateRequest(body, '@ai-sdk/openai', { openAiOAuth: true });
+      expect(oauth.providerOptions?.openai?.serviceTier).toBe('priority');
+
+      // API-key OpenAI: excluded — priority is a billable surcharge there.
+      const publicApi = translateRequest(body, '@ai-sdk/openai');
+      expect(publicApi.providerOptions?.openai?.serviceTier).toBeUndefined();
+
+      // Non-OpenAI providers never see the field, whatever alias routed here.
+      const compatible = translateRequest({ ...body, model: 'deepseek-v4-flash' }, '@ai-sdk/openai-compatible');
+      expect(compatible.providerOptions?.openai?.serviceTier).toBeUndefined();
+
+      process.env.CLODEX_SERVICE_TIER = 'priority';
+      const explicit = translateRequest(body, '@ai-sdk/openai', { openAiOAuth: true });
+      expect(explicit.providerOptions?.openai?.serviceTier).toBe('priority');
+
+      // Malformed values warn once and preserve the backend default.
+      process.env.CLODEX_SERVICE_TIER = 'warp-speed';
+      resetServiceTierWarningForTests();
+      const malformed = translateRequest(body, '@ai-sdk/openai', { openAiOAuth: true });
+      expect(malformed.providerOptions?.openai?.serviceTier).toBeUndefined();
+
+      delete process.env.CLODEX_SERVICE_TIER;
+      const unset = translateRequest(body, '@ai-sdk/openai', { openAiOAuth: true });
+      expect(unset.providerOptions?.openai?.serviceTier).toBeUndefined();
+    } finally {
+      if (prior === undefined) delete process.env.CLODEX_SERVICE_TIER;
+      else process.env.CLODEX_SERVICE_TIER = prior;
+      resetServiceTierWarningForTests();
+    }
   });
 
   it('maps output_config.effort to Google thinking budget without dropping includeThoughts', () => {
