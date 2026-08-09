@@ -854,13 +854,6 @@ async function runProviderDetail(id: string): Promise<'back' | 'removed'> {
       result.account,
       resolveActiveAccount(result.provider),
     );
-    if (outcome.ok) p.log.success(outcome.message);
-    else p.log.warn(outcome.message);
-    const restartWarning = accountSwitchServerRestartWarning(
-      readLiveServerRuntimeStates().length,
-      result.changed,
-    );
-    if (restartWarning) p.log.warn(restartWarning);
     // The catalog belongs to the credential identity. The write above parks
     // the old account's cache and projects only a cache already owned by the
     // selected identity; refresh immediately to rebuild or update it. A no-op
@@ -869,12 +862,28 @@ async function runProviderDetail(id: string): Promise<'back' | 'removed'> {
     // per-process account override. Explicit refresh commands still honor the
     // environment; the switch refresh deliberately rebuilds the cache for the
     // identity every future launch will use after that override is unset.
-    if (result.changed) {
-      await runProvidersRefreshModels(id, {
+    const refreshExitCode = result.changed
+      ? await runProvidersRefreshModels(id, {
         accountOverride: null,
         ignoreProviderCredentialOverride: true,
-      });
+      })
+      : undefined;
+    if (outcome.ok && refreshExitCode !== undefined && refreshExitCode !== 0) {
+      const savedLabel = result.account ?? PROVIDER_DEFAULT_ACCOUNT_LABEL;
+      p.log.warn(
+        `Saved ${savedLabel} for ${provider.name}, but automatic model refresh failed. `
+        + `Run clodex providers refresh-models ${id} before relying on this selection for launches.`,
+      );
+    } else if (outcome.ok) {
+      p.log.success(outcome.message);
+    } else {
+      p.log.warn(outcome.message);
     }
+    const restartWarning = accountSwitchServerRestartWarning(
+      readLiveServerRuntimeStates().length,
+      result.changed,
+    );
+    if (restartWarning) p.log.warn(restartWarning);
     return 'back';
   }
 

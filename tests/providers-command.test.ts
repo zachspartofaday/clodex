@@ -389,6 +389,10 @@ describe('interactive OAuth account switching', () => {
     expect(loadRegistry().providers[0]).toMatchObject({ activeAuthAccount: 'work' });
     expect(loadRegistry().providers[0]?.modelsCache).toBeUndefined();
     expect(logErrorMock).toHaveBeenCalledWith('OpenAI (ChatGPT): simulated discovery failure');
+    expect(logSuccessMock).not.toHaveBeenCalledWith(expect.stringContaining('will launch'));
+    expect(warnMock).toHaveBeenCalledWith(
+      expect.stringContaining('Saved work for OpenAI (ChatGPT), but automatic model refresh failed.'),
+    );
   });
 
   it('refreshes the persisted account instead of a temporary process selection', async () => {
