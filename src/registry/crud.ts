@@ -10,6 +10,7 @@ import {
   withRegistryWriteLock,
   withRegistryWriteLockSync,
 } from './lock.js';
+import type { RegistryProvider } from './types.js';
 
 export interface RemoveProviderResult {
   removed: boolean;
@@ -113,12 +114,13 @@ export async function removeProviderFromRegistry(
 export function setActiveOAuthAccount(
   id: string,
   account: string | undefined,
-): { updated: boolean; account?: string; error?: string } {
+): { updated: boolean; changed?: boolean; account?: string; provider?: RegistryProvider; error?: string } {
   return withRegistryWriteLockSync(() => {
     const registry = loadRegistryStrict();
     const provider = registry.providers.find(p => p.id === id);
     if (!provider) return { updated: false, error: `Provider not found: ${id}` };
     const name = account?.trim();
+    const previous = provider.activeAuthAccount?.trim() || undefined;
     if (name) {
       const slots = provider.authAccounts ?? {};
       if (!Object.prototype.hasOwnProperty.call(slots, name)) {
@@ -128,12 +130,16 @@ export function setActiveOAuthAccount(
           error: `${provider.name} has no account named "${name}" (available: ${available}).`,
         };
       }
-      provider.activeAuthAccount = name;
-    } else {
+      if (previous !== name) provider.activeAuthAccount = name;
+    } else if (previous !== undefined) {
       delete provider.activeAuthAccount;
     }
-    saveRegistry(registry);
-    return { updated: true, ...(name ? { account: name } : {}) };
+    const changed = previous !== name;
+    if (changed) saveRegistry(registry);
+    // Return the state that actually won the write lock. The provider may have
+    // been disabled, retyped, or otherwise changed while the picker was open;
+    // post-switch messages must not be derived from the stale pre-prompt copy.
+    return { updated: true, changed, ...(name ? { account: name } : {}), provider };
   });
 }
 

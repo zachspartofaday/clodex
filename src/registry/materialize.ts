@@ -9,6 +9,9 @@ import { findModelsDevModel } from './models-dev.js';
 import type { CachedModel, ProviderRegistry, RegistryProvider } from './types.js';
 import { isValidProviderId } from './validate.js';
 import { classifyFreeStatus, isFreeStatus } from '../free-models.js';
+import { OAUTH_ACCOUNT_ENV } from '../oauth-account-selection.js';
+
+export { OAUTH_ACCOUNT_ENV } from '../oauth-account-selection.js';
 
 export type CredentialResolver = (provider: RegistryProvider) => string | null;
 
@@ -99,8 +102,6 @@ function isLegacyAnonymousCustomEndpoint(
     && provider.authRef === `keyring:provider:${provider.id}`
     && credential === 'local';
 }
-
-export const OAUTH_ACCOUNT_ENV = 'CLODEX_OAUTH_ACCOUNT';
 
 /**
  * Resolve the selected OAuth account slot for a provider, highest precedence

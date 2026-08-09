@@ -39,6 +39,7 @@ vi.mock('../src/env.js', async importOriginal => {
     deleteProviderCredential: vi.fn(),
     probeProviderCredentialStore: vi.fn(),
     provisionProviderCredential: vi.fn(),
+    resolveProviderCredential: vi.fn(),
     saveProviderCredential: vi.fn(),
   };
 });
@@ -63,7 +64,7 @@ vi.mock('../src/registry/credential-cleanup-journal.js', () => ({
     journalState.pending.delete(authRef)),
 }));
 vi.mock('../src/registry/refresh-models.js', () => ({
-  refreshProviderModels: vi.fn(),
+  refreshProviderModelsWithCredential: vi.fn(),
 }));
 vi.mock('../src/registry/lock.js', () => ({
   withRegistryWriteLock: vi.fn(async <T>(operation: () => Promise<T> | T): Promise<T> => {
@@ -124,6 +125,7 @@ import {
   deleteProviderCredential,
   probeProviderCredentialStore,
   provisionProviderCredential,
+  resolveProviderCredential,
   saveProviderCredential,
 } from '../src/env.js';
 import { runOpenAiDeviceCodeFlow } from '../src/oauth/openai.js';
@@ -131,13 +133,14 @@ import { reconcilePendingCredentialDeletes } from '../src/registry/credential-li
 import * as cleanupJournal from '../src/registry/credential-cleanup-journal.js';
 import { loadRegistryStrict, saveRegistry } from '../src/registry/io.js';
 import { authenticateProvider } from '../src/registry/provider-auth.js';
-import { refreshProviderModels } from '../src/registry/refresh-models.js';
+import { refreshProviderModelsWithCredential as refreshProviderModels } from '../src/registry/refresh-models.js';
 import { credentialInstanceAuthRef } from '../src/credential-helper.js';
 import * as prompts from '@clack/prompts';
 
 describe('authenticateProvider', () => {
   const previousHelper = process.env.CLODEX_CREDENTIAL_HELPER;
   const previousHome = process.env.CLODEX_HOME;
+  const previousAccountOverride = process.env.CLODEX_OAUTH_ACCOUNT;
   let home = '';
   let credentialRef = '';
   beforeEach(() => {
@@ -147,6 +150,7 @@ describe('authenticateProvider', () => {
     registryState.current = { schemaVersion: 1, providers: [] };
     journalState.pending.clear();
     delete process.env.CLODEX_CREDENTIAL_HELPER;
+    delete process.env.CLODEX_OAUTH_ACCOUNT;
     vi.mocked(deleteProviderCredential).mockReset().mockResolvedValue(true);
     vi.mocked(probeProviderCredentialStore).mockReset().mockResolvedValue(true);
     lockState.active = false;
@@ -156,6 +160,7 @@ describe('authenticateProvider', () => {
     lockState.afterRegistryUnlock = null;
     lockState.providerActive = false;
     vi.mocked(provisionProviderCredential).mockReset().mockResolvedValue(true);
+    vi.mocked(resolveProviderCredential).mockReset().mockResolvedValue('selected-access');
     vi.mocked(saveProviderCredential).mockReset().mockResolvedValue(true);
     vi.mocked(loadRegistryStrict).mockReset().mockImplementation(
       () => structuredClone(registryState.current),
@@ -191,6 +196,8 @@ describe('authenticateProvider', () => {
     else process.env.CLODEX_CREDENTIAL_HELPER = previousHelper;
     if (previousHome === undefined) delete process.env.CLODEX_HOME;
     else process.env.CLODEX_HOME = previousHome;
+    if (previousAccountOverride === undefined) delete process.env.CLODEX_OAUTH_ACCOUNT;
+    else process.env.CLODEX_OAUTH_ACCOUNT = previousAccountOverride;
     rmSync(home, { recursive: true, force: true });
   });
 
@@ -215,6 +222,14 @@ describe('authenticateProvider', () => {
     expect(slot!.authRef).not.toBe(defaultRef);
     expect(slot!.oauthAccountId).toBe('acct-123');
     expect(result.registryProvider.authAccounts?.work?.authRef).toBe(slot!.authRef);
+    // Authenticating a non-selected slot must not replace the shared cache
+    // with that slot's entitlements. The locked helper re-resolves the actual
+    // launch selection; no environment override was captured here.
+    expect(refreshProviderModels).toHaveBeenLastCalledWith(
+      'openai-oauth',
+      expect.any(Function),
+      null,
+    );
   });
 
   it('normalizes the account name and reuses the slot ref on re-auth', async () => {
@@ -225,6 +240,40 @@ describe('authenticateProvider', () => {
     const entry = registryState.current.providers[0]!;
     expect(Object.keys(entry.authAccounts!)).toEqual(['work']);
     expect(entry.authAccounts!.work!.authRef).toBe(firstRef);
+  });
+
+  it('captures the real environment override for the post-auth refresh', async () => {
+    await authenticateProvider('openai');
+    await authenticateProvider('openai', { account: 'work' });
+    process.env.CLODEX_OAUTH_ACCOUNT = 'work';
+
+    await authenticateProvider('openai');
+
+    expect(refreshProviderModels).toHaveBeenLastCalledWith(
+      'openai-oauth',
+      expect.any(Function),
+      'work',
+    );
+  });
+
+  it('reports a returned model-refresh failure instead of claiming success', async () => {
+    const stop = vi.fn();
+    vi.mocked(prompts.spinner)
+      .mockReturnValueOnce({ start: vi.fn(), stop: vi.fn() })
+      .mockReturnValueOnce({ start: vi.fn(), stop });
+    vi.mocked(refreshProviderModels).mockResolvedValueOnce({
+      id: 'openai-oauth',
+      name: 'OpenAI',
+      ok: false,
+      reason: 'Provider configuration changed while credentials were resolving.',
+    });
+
+    await authenticateProvider('openai');
+
+    expect(stop).toHaveBeenCalledWith(
+      'Could not refresh models — Provider configuration changed while credentials were resolving.',
+    );
+    expect(stop).not.toHaveBeenCalledWith('Models refreshed');
   });
 
   it('rejects a named account before the default sign-in exists', async () => {

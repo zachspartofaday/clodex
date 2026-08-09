@@ -1,6 +1,13 @@
 import { describe, expect, it, vi, beforeEach } from 'vitest';
-import { refreshProviderModels } from '../src/registry/refresh-models.js';
+import {
+  refreshAllProviderModels,
+  refreshProviderModels,
+  refreshProviderModelsWithCredential,
+} from '../src/registry/refresh-models.js';
+import { refreshCredentialSnapshot } from '../src/registry/refresh-credentials.js';
 import type { ProviderRegistry } from '../src/registry/types.js';
+
+const providerMutationState = vi.hoisted(() => ({ active: false }));
 
 vi.mock('../src/registry/fetch-template-models.js', () => ({
   fetchTemplateModels: vi.fn(),
@@ -14,6 +21,14 @@ vi.mock('../src/registry/io.js', () => ({
 }));
 vi.mock('../src/registry/lock.js', () => ({
   withCredentialMutationLock: vi.fn(async (_authRef: string, operation: () => unknown) => operation()),
+  withProviderMutationLock: vi.fn(async (_providerId: string, operation: () => unknown) => {
+    providerMutationState.active = true;
+    try {
+      return await operation();
+    } finally {
+      providerMutationState.active = false;
+    }
+  }),
   withRegistryWriteLock: vi.fn(async (operation: () => unknown) => operation()),
 }));
 
@@ -22,6 +37,7 @@ import { loadRegistryStrict, saveRegistry } from '../src/registry/io.js';
 
 describe('refreshProviderModels', () => {
   beforeEach(() => {
+    providerMutationState.active = false;
     vi.mocked(fetchTemplateModels).mockReset();
     vi.mocked(loadRegistryStrict).mockReset();
     vi.mocked(saveRegistry).mockClear();
@@ -146,6 +162,231 @@ describe('refreshProviderModels', () => {
       reason: 'Provider configuration changed while models were refreshing.',
     });
     expect(saveRegistry).not.toHaveBeenCalled();
+  });
+
+  it('does not send a resolved credential after the provider route is replaced', async () => {
+    const startedProvider = {
+      id: 'groq',
+      templateId: 'groq',
+      name: 'Groq',
+      enabled: true,
+      authRef: 'keyring:provider:groq',
+      authType: 'api' as const,
+      api: { npm: '@ai-sdk/groq', url: 'https://api.groq.com/openai/v1' },
+      addedAt: '2026-01-01T00:00:00.000Z',
+    };
+    vi.mocked(loadRegistryStrict).mockReturnValue({
+      schemaVersion: 1,
+      providers: [{
+        ...startedProvider,
+        api: { npm: '@ai-sdk/openai-compatible', url: 'https://replacement.example/v1' },
+        addedAt: '2026-08-09T00:00:00.000Z',
+      }],
+    });
+
+    const result = await refreshProviderModels(
+      'groq',
+      'credential-resolved-for-old-route',
+      undefined,
+      refreshCredentialSnapshot(startedProvider, null),
+    );
+
+    expect(result).toMatchObject({
+      ok: false,
+      reason: 'Provider configuration changed while credentials were resolving.',
+    });
+    expect(fetchTemplateModels).not.toHaveBeenCalled();
+    expect(saveRegistry).not.toHaveBeenCalled();
+  });
+
+  it('does not send or commit with a reauthenticated named slot that kept its authRef', async () => {
+    const startedProvider = {
+      id: 'groq',
+      templateId: 'groq',
+      name: 'Groq',
+      enabled: true,
+      authRef: 'keyring:provider:default',
+      authType: 'oauth' as const,
+      activeAuthAccount: 'work',
+      authAccounts: {
+        work: {
+          authRef: 'keyring:provider:work',
+          addedAt: '2026-08-09T00:00:00.000Z',
+          oauthAccountId: 'old-account',
+        },
+      },
+      api: { npm: '@ai-sdk/groq', url: 'https://api.groq.com/openai/v1' },
+      addedAt: '2026-01-01T00:00:00.000Z',
+    };
+    vi.mocked(loadRegistryStrict).mockReturnValue({
+      schemaVersion: 3,
+      providers: [{
+        ...startedProvider,
+        authAccounts: {
+          work: {
+            authRef: 'keyring:provider:work',
+            addedAt: '2026-08-09T01:00:00.000Z',
+            oauthAccountId: 'new-account',
+          },
+        },
+      }],
+    });
+
+    const result = await refreshProviderModels(
+      'groq',
+      'credential-resolved-before-reauth',
+      undefined,
+      refreshCredentialSnapshot(startedProvider, null),
+    );
+
+    expect(result).toMatchObject({
+      ok: false,
+      reason: 'Provider account credentials changed while models were refreshing.',
+    });
+    expect(fetchTemplateModels).not.toHaveBeenCalled();
+    expect(saveRegistry).not.toHaveBeenCalled();
+  });
+
+  it('does not commit account-specific discovery after the active account changes', async () => {
+    const startedProvider = {
+      id: 'groq',
+      templateId: 'groq',
+      name: 'Groq',
+      enabled: true,
+      authRef: 'keyring:provider:default',
+      authType: 'oauth' as const,
+      activeAuthAccount: 'work',
+      authAccounts: {
+        work: { authRef: 'keyring:provider:work', addedAt: '2026-08-09T00:00:00.000Z' },
+        alt: { authRef: 'keyring:provider:alt', addedAt: '2026-08-09T00:00:00.000Z' },
+      },
+      api: { npm: '@ai-sdk/groq', url: 'https://api.groq.com/openai/v1' },
+      addedAt: '2026-01-01T00:00:00.000Z',
+    };
+    const initialRegistry: ProviderRegistry = { schemaVersion: 3, providers: [startedProvider] };
+    const switchedRegistry: ProviderRegistry = {
+      schemaVersion: 3,
+      providers: [{ ...startedProvider, activeAuthAccount: 'alt' }],
+    };
+    vi.mocked(loadRegistryStrict).mockReturnValue(switchedRegistry);
+    vi.mocked(fetchTemplateModels).mockResolvedValue({
+      baseUrl: 'https://api.groq.com/openai/v1',
+      models: [{ id: 'live-a', name: 'Live A', upstreamModelId: 'live-a', modelFormat: 'openai' }],
+    });
+
+    const result = await refreshProviderModels(
+      'groq',
+      'work-token',
+      initialRegistry,
+      refreshCredentialSnapshot(startedProvider, undefined),
+    );
+
+    expect(result).toMatchObject({
+      ok: false,
+      reason: 'Provider account selection changed while models were refreshing.',
+    });
+    expect(saveRegistry).not.toHaveBeenCalled();
+  });
+
+  it('refresh-all resolves each provider through its selected OAuth account', async () => {
+    const provider = {
+      id: 'groq',
+      templateId: 'groq',
+      name: 'Groq',
+      enabled: true,
+      authRef: 'keyring:provider:default',
+      authType: 'oauth' as const,
+      activeAuthAccount: 'work',
+      authAccounts: {
+        work: { authRef: 'keyring:provider:work', addedAt: '2026-08-09T00:00:00.000Z' },
+      },
+      api: { npm: '@ai-sdk/groq', url: 'https://api.groq.com/openai/v1' },
+      addedAt: '2026-01-01T00:00:00.000Z',
+    };
+    const registry: ProviderRegistry = { schemaVersion: 3, providers: [provider] };
+    vi.mocked(loadRegistryStrict).mockReturnValue(registry);
+    vi.mocked(fetchTemplateModels).mockResolvedValue({
+      baseUrl: 'https://api.groq.com/openai/v1',
+      models: [{ id: 'live-a', name: 'Live A', upstreamModelId: 'live-a', modelFormat: 'openai' }],
+    });
+    const resolveKey = vi.fn(async () => 'work-token');
+
+    const result = await refreshAllProviderModels(resolveKey);
+
+    expect(result.refreshed).toMatchObject([{ ok: true, modelCount: 1 }]);
+    expect(resolveKey).toHaveBeenCalledWith(expect.objectContaining({
+      id: 'groq',
+      authRef: 'keyring:provider:work',
+    }));
+  });
+
+  it('does not refresh an inactive named account merely because it was just authenticated', async () => {
+    const provider = {
+      id: 'groq',
+      templateId: 'groq',
+      name: 'Groq',
+      enabled: true,
+      authRef: 'keyring:provider:default',
+      authType: 'oauth' as const,
+      authAccounts: {
+        work: { authRef: 'keyring:provider:work', addedAt: '2026-08-09T00:00:00.000Z' },
+      },
+      api: { npm: '@ai-sdk/groq', url: 'https://api.groq.com/openai/v1' },
+      addedAt: '2026-01-01T00:00:00.000Z',
+    };
+    const registry: ProviderRegistry = { schemaVersion: 2, providers: [provider] };
+    vi.mocked(loadRegistryStrict).mockReturnValue(registry);
+    vi.mocked(fetchTemplateModels).mockResolvedValue({
+      baseUrl: 'https://api.groq.com/openai/v1',
+      models: [{ id: 'live-a', name: 'Live A', upstreamModelId: 'live-a', modelFormat: 'openai' }],
+    });
+    const resolveKey = vi.fn(async () => 'default-token');
+
+    const result = await refreshProviderModelsWithCredential('groq', resolveKey, null);
+
+    expect(result).toMatchObject({ ok: true, modelCount: 1 });
+    expect(resolveKey).toHaveBeenCalledWith(expect.objectContaining({
+      authRef: 'keyring:provider:default',
+    }));
+  });
+
+  it('uses the captured environment slot for the whole locked refresh', async () => {
+    const provider = {
+      id: 'groq',
+      templateId: 'groq',
+      name: 'Groq',
+      enabled: true,
+      authRef: 'keyring:provider:default',
+      authType: 'oauth' as const,
+      activeAuthAccount: 'work',
+      authAccounts: {
+        work: { authRef: 'keyring:provider:work', addedAt: '2026-08-09T00:00:00.000Z' },
+        alt: { authRef: 'keyring:provider:alt', addedAt: '2026-08-09T00:00:00.000Z' },
+      },
+      api: { npm: '@ai-sdk/groq', url: 'https://api.groq.com/openai/v1' },
+      addedAt: '2026-01-01T00:00:00.000Z',
+    };
+    const registry: ProviderRegistry = { schemaVersion: 3, providers: [provider] };
+    vi.mocked(loadRegistryStrict).mockReturnValue(registry);
+    vi.mocked(fetchTemplateModels).mockImplementation(async () => {
+      expect(providerMutationState.active).toBe(true);
+      return {
+        baseUrl: 'https://api.groq.com/openai/v1',
+        models: [{ id: 'live-a', name: 'Live A', upstreamModelId: 'live-a', modelFormat: 'openai' }],
+      };
+    });
+    const resolveKey = vi.fn(async () => {
+      expect(providerMutationState.active).toBe(true);
+      return 'alt-token';
+    });
+
+    const result = await refreshProviderModelsWithCredential('groq', resolveKey, 'alt');
+
+    expect(result).toMatchObject({ ok: true, modelCount: 1 });
+    expect(resolveKey).toHaveBeenCalledWith(expect.objectContaining({
+      authRef: 'keyring:provider:alt',
+    }));
+    expect(providerMutationState.active).toBe(false);
   });
 
   it('rejects restricted provider API URLs before refreshing models', async () => {

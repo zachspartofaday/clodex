@@ -4,7 +4,7 @@ import { isDeepStrictEqual } from 'node:util';
 import { fetchAnthropicModels } from './custom-endpoint.js';
 import { fetchTemplateModels } from './fetch-template-models.js';
 import { loadRegistryStrict, saveRegistry } from './io.js';
-import { withRegistryWriteLock } from './lock.js';
+import { withProviderMutationLock, withRegistryWriteLock } from './lock.js';
 import { resolveModelSource } from './model-source.js';
 import { validateCustomEndpointUrl } from './url-security.js';
 import {
@@ -19,7 +19,15 @@ import {
   loadPricingCache,
   pricingPlatformForProvider,
 } from './pricing.js';
-import { cachedModelCount, isLikelyPlaceholderKey, resolveRefreshCredential, skipWithCachedModels } from './refresh-credentials.js';
+import {
+  cachedModelCount,
+  isLikelyPlaceholderKey,
+  refreshCredentialSnapshot,
+  resolveRefreshCredential,
+  skipWithCachedModels,
+  type RefreshCredentialSnapshot,
+} from './refresh-credentials.js';
+import { OAUTH_ACCOUNT_ENV } from '../oauth-account-selection.js';
 import type { CachedModel, ProviderRegistry, RegistryProvider } from './types.js';
 import { buildOpenAiOAuthModels, CHATGPT_CODEX_UNSUPPORTED_MODELS } from '../data/openai-oauth-models.js';
 import { modelPrefersResponsesApi } from '../provider-factory.js';
@@ -306,20 +314,67 @@ function providerDiscoveryInputsMatch(
   started: RegistryProvider,
 ): boolean {
   return current.authRef === started.authRef
+    && current.enabled === started.enabled
     && current.authType === started.authType
     && current.templateId === started.templateId
     && isDeepStrictEqual(current.api, started.api);
+}
+
+function assertRefreshCredentialStillCurrent(
+  current: RegistryProvider,
+  snapshot: RefreshCredentialSnapshot,
+): void {
+  const routing = snapshot.provider;
+  if (
+    current.id !== routing.id
+    || current.addedAt !== routing.addedAt
+    || current.enabled !== routing.enabled
+    || current.authType !== routing.authType
+    || current.templateId !== routing.templateId
+    || !isDeepStrictEqual(current.api, routing.api)
+  ) {
+    throw new Error('Provider configuration changed while credentials were resolving.');
+  }
+  const activeAuthAccount = current.activeAuthAccount?.trim() || undefined;
+  if (activeAuthAccount !== snapshot.activeAuthAccount) {
+    throw new Error('Provider account selection changed while models were refreshing.');
+  }
+  let currentSnapshot: RefreshCredentialSnapshot;
+  try {
+    currentSnapshot = refreshCredentialSnapshot(current, snapshot.environmentAccount ?? null);
+  } catch {
+    throw new Error('Provider account selection changed while models were refreshing.');
+  }
+  if (currentSnapshot.authRef !== snapshot.authRef) {
+    throw new Error('Provider credentials changed while models were refreshing.');
+  }
+  if (!isDeepStrictEqual(currentSnapshot.selectedAccount, snapshot.selectedAccount)) {
+    throw new Error('Provider account credentials changed while models were refreshing.');
+  }
 }
 
 export async function refreshProviderModels(
   providerId: string,
   apiKey: string | null,
   registry?: ProviderRegistry,
+  credentialSnapshot?: RefreshCredentialSnapshot,
 ): Promise<RefreshProviderResult> {
   const workingRegistry = registry ?? loadRegistryStrict();
   const provider = workingRegistry.providers.find(p => p.id === providerId);
   if (!provider) {
     return { id: providerId, name: providerId, ok: false, reason: 'Provider not found.' };
+  }
+  if (credentialSnapshot) {
+    try {
+      assertRefreshCredentialStillCurrent(provider, credentialSnapshot);
+    } catch (err) {
+      return {
+        id: provider.id,
+        name: provider.name,
+        ok: false,
+        reason: err instanceof Error ? err.message : String(err),
+      };
+    }
   }
 
   const source = resolveModelSource(provider);
@@ -435,6 +490,9 @@ export async function refreshProviderModels(
       if (!providerDiscoveryInputsMatch(currentProvider, provider)) {
         throw new Error('Provider configuration changed while models were refreshing.');
       }
+      if (credentialSnapshot) {
+        assertRefreshCredentialStillCurrent(currentProvider, credentialSnapshot);
+      }
       updateProviderCache(currentRegistry, providerId, enriched, baseUrl);
       saveRegistry(currentRegistry);
     });
@@ -458,6 +516,40 @@ export async function refreshProviderModels(
   }
 }
 
+/**
+ * Resolve and use one provider credential under the provider mutation lock.
+ * OAuth credential references are deterministic, so registry fields alone
+ * cannot detect a concurrent default-account reauthentication. Holding this
+ * lock from the credential read through the cache commit makes that generation
+ * boundary explicit without persisting credential metadata in the registry.
+ */
+export async function refreshProviderModelsWithCredential(
+  providerId: string,
+  resolveKey: (provider: RegistryProvider) => Promise<string | null>,
+  selected: string | null | undefined = process.env[OAUTH_ACCOUNT_ENV],
+  options: { requireEnabled?: boolean } = {},
+): Promise<RefreshProviderResult> {
+  return withProviderMutationLock(providerId, async () => {
+    const provider = loadRegistryStrict().providers.find(candidate => candidate.id === providerId);
+    if (!provider) {
+      return { id: providerId, name: providerId, ok: false, reason: 'Provider not found.' };
+    }
+    if (options.requireEnabled && !provider.enabled) {
+      return {
+        id: provider.id,
+        name: provider.name,
+        ok: true,
+        skipped: true,
+        reason: 'Provider was disabled before its model refresh began.',
+      };
+    }
+    const accountOverride = selected === null ? null : selected ?? process.env[OAUTH_ACCOUNT_ENV] ?? null;
+    const snapshot = refreshCredentialSnapshot(provider, accountOverride);
+    const key = await resolveRefreshCredential(provider, resolveKey, accountOverride);
+    return refreshProviderModels(provider.id, key, undefined, snapshot);
+  });
+}
+
 export async function refreshAllProviderModels(
   resolveKey: (provider: RegistryProvider) => Promise<string | null>,
 ): Promise<RefreshModelsResult> {
@@ -467,8 +559,22 @@ export async function refreshAllProviderModels(
   const enabledProviders = registry.providers.filter(p => p.enabled);
 
   for (const provider of enabledProviders) {
-    const key = await resolveRefreshCredential(provider, resolveKey);
-    refreshed.push(await refreshProviderModels(provider.id, key));
+    const accountOverride = process.env[OAUTH_ACCOUNT_ENV] ?? null;
+    try {
+      refreshed.push(await refreshProviderModelsWithCredential(
+        provider.id,
+        resolveKey,
+        accountOverride,
+        { requireEnabled: true },
+      ));
+    } catch (err) {
+      refreshed.push({
+        id: provider.id,
+        name: provider.name,
+        ok: false,
+        reason: err instanceof Error ? err.message : String(err),
+      });
+    }
   }
 
   return { refreshed };

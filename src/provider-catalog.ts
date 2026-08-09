@@ -3,7 +3,8 @@ import type { CompatibilityAgent } from './model-compatibility.js';
 import { oauthAuthRef } from './registry/import-build.js';
 import { loadRegistry } from './registry/io.js';
 import { loadRegistryProviders } from './registry/load.js';
-import { isAnonymousProvider, OAUTH_ACCOUNT_ENV } from './registry/materialize.js';
+import { isAnonymousProvider } from './registry/materialize.js';
+import { OAUTH_ACCOUNT_ENV } from './oauth-account-selection.js';
 import { getTemplateById } from './provider-templates.js';
 import type { LocalProvider } from './types.js';
 import type { ServerModelInfo } from './server/models.js';
@@ -98,21 +99,21 @@ export const PROVIDER_DEFAULT_ACCOUNT_LABEL = '(provider default)';
  */
 export type ActiveAccount =
   /** Launches on the provider's own credential. */
-  | { kind: 'default'; latentOrphan?: string; dormant?: true }
+  | { kind: 'default'; latentOrphan?: string; inactiveReason?: AccountSelectionInactiveReason }
   /** Launches on this named slot. */
-  | { kind: 'slot'; name: string; fromEnvironment: boolean; latentOrphan?: string; dormant?: true }
+  | { kind: 'slot'; name: string; fromEnvironment: boolean; latentOrphan?: string; inactiveReason?: AccountSelectionInactiveReason }
   /** Cannot be honoured: this selector names no such slot. */
-  | { kind: 'broken'; name: string; fromEnvironment: boolean; latentOrphan?: string; dormant?: true };
+  | { kind: 'broken'; name: string; fromEnvironment: boolean; latentOrphan?: string; inactiveReason?: AccountSelectionInactiveReason };
+
+export type AccountSelectionInactiveReason = 'disabled' | 'non-oauth';
 
 /**
- * `dormant` — the provider cannot launch at all (disabled, or not OAuth), so
- * none of this describes a CURRENT outcome.
+ * `inactiveReason` — this does not describe a current OAuth launch outcome.
  *
- * The selection still matters, which is why it is resolved rather than
- * skipped: a broken one will start failing the moment the provider is enabled.
- * But saying "every launch fails" about a provider that is not launching is
- * simply untrue, and materialization excludes it entirely. Callers use this to
- * phrase a saved state rather than a live one.
+ * A disabled OAuth provider carries the projected outcome it will have if it
+ * is enabled, including the current environment override. A non-OAuth
+ * provider carries only its stored registry state: enabling it cannot make an
+ * OAuth selector apply, so callers must not describe it as merely disabled.
  */
 
 /**
@@ -137,47 +138,51 @@ export function resolveActiveAccount(
   const stored = provider.activeAuthAccount?.trim();
   const override = env[OAUTH_ACCOUNT_ENV]?.trim();
 
-  // A provider that cannot participate in a launch still gets its selection
-  // CHECKED. `applySelectedOAuthAccount` returns such a provider untouched
-  // rather than throwing — deliberately, so a stale selector cannot take down a
-  // catalog load — but "does not throw yet" is not "is fine": the selection is
-  // equally unhonourable, and hiding that means the listing looks healthy right
-  // up until the provider is enabled and every launch starts failing.
-  //
-  // So `broken` means "this selection names no such slot", not "this throws
-  // right now". The safety property is one-directional: anything that WOULD
-  // throw is reported broken; not everything reported broken throws today.
-  const launchable = provider.authType === 'oauth' && provider.enabled;
-  if (!launchable) {
-    if (!stored) return { kind: 'default', dormant: true };
-    return has(stored)
-      ? { kind: 'slot', name: stored, fromEnvironment: false, dormant: true }
-      : { kind: 'broken', name: stored, fromEnvironment: false, dormant: true };
-  }
+  const projectOAuthSelection = (environmentSelection: string | undefined): ActiveAccount => {
+    // Carried on whatever answer wins below: a stored selection that names no
+    // slot is still broken while an override happens to be masking it. Only
+    // carry a DIFFERENT stored name, or one failure is rendered twice.
+    const latentOrphan = stored && !has(stored) && stored !== environmentSelection
+      ? { latentOrphan: stored }
+      : {};
 
-  // Carried on whatever answer wins below: a stored selection that names no
-  // slot is still broken while an override happens to be masking it.
-  // Only when it names something OTHER than whatever is currently winning:
-  // one broken selection reported twice reads as two separate failures.
-  const latentOrphan = stored && !has(stored) && stored !== override
-    ? { latentOrphan: stored }
-    : {};
-
-  if (override) {
-    if (has(override)) return { kind: 'slot', name: override, fromEnvironment: true, ...latentOrphan };
-    // The environment is ignored only where there is no slot table at all;
-    // otherwise it names a missing slot and the launch throws on it.
-    if (Object.keys(slots).length > 0) {
-      // Both can be broken at once, and fixing the variable then reveals the
-      // second failure. Carried here too, or unsetting the override trades one
-      // silent breakage for another.
-      return { kind: 'broken', name: override, fromEnvironment: true, ...latentOrphan };
+    if (environmentSelection) {
+      if (has(environmentSelection)) {
+        return {
+          kind: 'slot',
+          name: environmentSelection,
+          fromEnvironment: true,
+          ...latentOrphan,
+        };
+      }
+      // An environment selector only chooses among named slots. With no slot
+      // table it is ignored, exactly as applySelectedOAuthAccount ignores it;
+      // a stored selector remains independently authoritative and may fail.
+      if (Object.keys(slots).length > 0) {
+        return {
+          kind: 'broken',
+          name: environmentSelection,
+          fromEnvironment: true,
+          ...latentOrphan,
+        };
+      }
     }
+
+    if (!stored) return { kind: 'default' };
+    if (has(stored)) return { kind: 'slot', name: stored, fromEnvironment: false };
+    return { kind: 'broken', name: stored, fromEnvironment: false };
+  };
+
+  // Non-OAuth providers never apply this selector, even when enabled. Ignore
+  // the process-wide OAuth override and expose only stale/saved registry state.
+  if (provider.authType !== 'oauth') {
+    return { ...projectOAuthSelection(undefined), inactiveReason: 'non-oauth' };
   }
 
-  if (!stored) return { kind: 'default' };
-  if (has(stored)) return { kind: 'slot', name: stored, fromEnvironment: false };
-  return { kind: 'broken', name: stored, fromEnvironment: false };
+  const projected = projectOAuthSelection(override);
+  return provider.enabled
+    ? projected
+    : { ...projected, inactiveReason: 'disabled' };
 }
 
 export async function resolveProvidersForDisplay(): Promise<ProviderDisplayEntry[]> {
@@ -200,10 +205,18 @@ export async function resolveProvidersForDisplay(): Promise<ProviderDisplayEntry
     // misreport the live identity in exactly the persistent shell this feature
     // is meant to make visible.
     const effective = resolveActiveAccount(provider);
-    // `(active)` is a claim about what a launch will do, so a dormant provider
-    // gets `(selected)` instead — the account is saved, nothing is running.
-    const active = effective.kind === 'slot' && !effective.dormant ? effective.name : undefined;
-    const selected = effective.kind === 'slot' && effective.dormant ? effective.name : undefined;
+    // `(active)` is a claim about what a launch will do now. Disabled OAuth
+    // providers expose a projected selection instead; non-OAuth providers say
+    // explicitly that the stale OAuth state is inactive.
+    const active = effective.kind === 'slot' && !effective.inactiveReason
+      ? effective.name
+      : undefined;
+    const projected = effective.kind === 'slot' && effective.inactiveReason === 'disabled'
+      ? effective.name
+      : undefined;
+    const storedButInapplicable = effective.kind === 'slot' && effective.inactiveReason === 'non-oauth'
+      ? effective.name
+      : undefined;
     const overrideApplies = effective.kind !== 'default' && effective.fromEnvironment;
     // A broken selection is the reason every launch for this provider fails,
     // so it is the LAST thing the listing should hide — and it is read from the
@@ -216,24 +229,47 @@ export async function resolveProvidersForDisplay(): Promise<ProviderDisplayEntry
     // Reported on a broken override too: the stored selection behind it is a
     // second, independent failure that survives fixing the variable.
     const latent = effective.latentOrphan;
-    const label = (name: string, isActive: boolean): string => {
-      if (!isActive) return name;
-      return overrideApplies
-        ? `${name} (active, from ${OAUTH_ACCOUNT_ENV})`
-        : `${name} (active)`;
+    const label = (name: string): string => {
+      if (name === active) {
+        return overrideApplies
+          ? `${name} (active, from ${OAUTH_ACCOUNT_ENV})`
+          : `${name} (active)`;
+      }
+      if (name === projected) {
+        return overrideApplies
+          ? `${name} (selected, from ${OAUTH_ACCOUNT_ENV}; provider disabled)`
+          : `${name} (selected; provider disabled)`;
+      }
+      if (name === storedButInapplicable) {
+        return `${name} (stored; provider is not OAuth)`;
+      }
+      return name;
     };
+    const defaultLabel = effective.kind !== 'default'
+      ? PROVIDER_DEFAULT_ACCOUNT_LABEL
+      : effective.inactiveReason === 'disabled'
+        ? `${PROVIDER_DEFAULT_ACCOUNT_LABEL} (selected; provider disabled)`
+        : effective.inactiveReason === 'non-oauth'
+          ? `${PROVIDER_DEFAULT_ACCOUNT_LABEL} (OAuth selection inactive; provider is not OAuth)`
+          : `${PROVIDER_DEFAULT_ACCOUNT_LABEL} (active)`;
+    const brokenConsequence = effective.inactiveReason === 'disabled'
+      ? 'will fail if this provider is enabled'
+      : effective.inactiveReason === 'non-oauth'
+        ? 'ignored because this provider is not OAuth'
+        : 'every launch fails';
     const accountList = [
-      label(PROVIDER_DEFAULT_ACCOUNT_LABEL, effective.kind === 'default' && !effective.dormant),
-      ...accountNames.map(name => (name === selected ? `${name} (selected)` : label(name, name === active))),
-      // A provider that cannot launch gets saved-state wording, not live-outcome
-      // wording: "every launch fails" is untrue of something that is not
-      // launching, and materialization excludes it entirely.
+      defaultLabel,
+      ...accountNames.map(label),
+      // An inactive account selection gets saved-state wording, not a current
+      // OAuth outcome. A disabled provider is excluded from materialization;
+      // a non-OAuth provider may launch, but never applies these selectors.
       ...(broken
-        ? [`${broken.name} (selected${broken.fromEnvironment ? ` via ${OAUTH_ACCOUNT_ENV}` : ''}, MISSING — `
-          + `${effective.dormant ? 'will fail if this provider is enabled' : 'every launch fails'})`]
+        ? [`${broken.name} (${effective.inactiveReason === 'non-oauth' ? 'stored' : 'selected'}${broken.fromEnvironment ? ` via ${OAUTH_ACCOUNT_ENV}` : ''}, MISSING — `
+          + `${brokenConsequence})`]
         : []),
       ...(latent
-        ? [`${latent} (stored, MISSING — masked by ${OAUTH_ACCOUNT_ENV}; launches fail without it)`]
+        ? [`${latent} (stored, MISSING — masked by ${OAUTH_ACCOUNT_ENV}; `
+          + `${effective.inactiveReason === 'disabled' ? 'will fail if enabled without it' : 'launches fail without it'})`]
         : []),
     ].join(', ');
     const authLabel = accountNames.length || broken || latent

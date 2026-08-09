@@ -7,8 +7,10 @@ import open from 'open';
 import {
   probeProviderCredentialStore,
   provisionProviderCredential,
+  resolveProviderCredential,
   saveProviderCredential,
 } from '../env.js';
+import { OAUTH_ACCOUNT_ENV } from '../oauth-account-selection.js';
 import { credentialInstanceAuthRef } from '../credential-helper.js';
 import { runOpenAiDeviceCodeFlow } from '../oauth/openai.js';
 import {
@@ -32,7 +34,7 @@ import {
   withProviderMutationLock,
   withRegistryWriteLock,
 } from './lock.js';
-import { refreshProviderModels } from './refresh-models.js';
+import { refreshProviderModelsWithCredential } from './refresh-models.js';
 import { OAUTH_ACCOUNT_NAME_RE, type RegistryProvider } from './types.js';
 
 export type { StoredOAuthCredential } from '../oauth/types.js';
@@ -325,8 +327,18 @@ export async function authenticateProvider(
   const refreshSpinner = p.spinner();
   refreshSpinner.start('Refreshing model list...');
   try {
-    await refreshProviderModels(registryId, cred.access);
-    refreshSpinner.stop('Models refreshed');
+    // Refresh the account launches actually use, which may differ from the
+    // credential just authenticated (stored selection or one-process env
+    // override). Capture the override once, then fence both provider routing
+    // and the selected credential generation before any discovery request.
+    const accountOverride = process.env[OAUTH_ACCOUNT_ENV] ?? null;
+    const refreshResult = await refreshProviderModelsWithCredential(
+      registryId,
+      async provider => resolveProviderCredential(provider.id, provider.authRef),
+      accountOverride,
+    );
+    if (refreshResult.ok) refreshSpinner.stop('Models refreshed');
+    else refreshSpinner.stop(`Could not refresh models${refreshResult.reason ? ` — ${refreshResult.reason}` : ''}`);
   } catch {
     refreshSpinner.stop('Could not refresh models — run clodex providers refresh-models later');
   }

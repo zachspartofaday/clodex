@@ -185,15 +185,18 @@ describe('provider-catalog-display', () => {
       expect(entries[0]?.inRegistry).toBe(true);
     });
 
-    function saveSlotted(activeAuthAccount?: string): void {
+    function saveSlotted(
+      activeAuthAccount?: string,
+      overrides: { enabled?: boolean; authType?: 'oauth' | 'api' | 'none' } = {},
+    ): void {
       const registry = emptyRegistry();
       registry.providers.push({
         id: 'openai-oauth',
         templateId: 'openai',
         name: 'OpenAI (ChatGPT)',
-        enabled: true,
+        enabled: overrides.enabled ?? true,
         authRef: 'keyring:oauth:provider:openai-oauth::credential::v1:default',
-        authType: 'oauth',
+        authType: overrides.authType ?? 'oauth',
         authAccounts: {
           varmez: { authRef: 'keyring:oauth:provider:openai-oauth:account:varmez::credential::v1:v', addedAt: new Date().toISOString() },
         },
@@ -246,6 +249,26 @@ describe('provider-catalog-display', () => {
       } finally {
         delete process.env['CLODEX_OAUTH_ACCOUNT'];
       }
+    });
+
+    it('projects an invalid environment override for a disabled OAuth provider', async () => {
+      saveSlotted('varmez', { enabled: false });
+      process.env['CLODEX_OAUTH_ACCOUNT'] = 'ghost';
+      try {
+        const label = (await resolveProvidersForDisplay())[0]?.authLabel ?? '';
+        expect(label).toContain('ghost (selected via CLODEX_OAUTH_ACCOUNT, MISSING');
+        expect(label).toContain('will fail if this provider is enabled');
+        expect(label).not.toContain('every launch fails');
+      } finally {
+        delete process.env['CLODEX_OAUTH_ACCOUNT'];
+      }
+    });
+
+    it('does not claim a non-OAuth provider is merely disabled', async () => {
+      saveSlotted('varmez', { authType: 'api' });
+      const label = (await resolveProvidersForDisplay())[0]?.authLabel ?? '';
+      expect(label).toContain('varmez (stored; provider is not OAuth)');
+      expect(label).not.toContain('provider disabled');
     });
 
     it('does not confuse a slot literally named default with the provider default', async () => {

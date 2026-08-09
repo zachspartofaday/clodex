@@ -371,13 +371,30 @@ describe('setActiveOAuthAccount', () => {
   });
 
   it('persists the chosen account', () => {
-    expect(setActiveOAuthAccount('openai-oauth', 'varmez')).toEqual({ updated: true, account: 'varmez' });
+    const result = setActiveOAuthAccount('openai-oauth', 'varmez');
+    expect(result).toMatchObject({ updated: true, changed: true, account: 'varmez' });
+    expect(result.provider?.activeAuthAccount).toBe('varmez');
     expect(registryState.current.providers[0]?.activeAuthAccount).toBe('varmez');
+  });
+
+  it('reports an unchanged selection as a no-op', () => {
+    registryState.current.providers[0]!.activeAuthAccount = 'varmez';
+
+    const result = setActiveOAuthAccount('openai-oauth', 'varmez');
+
+    expect(result).toMatchObject({
+      updated: true,
+      changed: false,
+      account: 'varmez',
+    });
+    expect(result.provider?.activeAuthAccount).toBe('varmez');
   });
 
   it('clears the field rather than storing a sentinel when returning to the default', () => {
     setActiveOAuthAccount('openai-oauth', 'varmez');
-    expect(setActiveOAuthAccount('openai-oauth', undefined)).toEqual({ updated: true });
+    const result = setActiveOAuthAccount('openai-oauth', undefined);
+    expect(result).toMatchObject({ updated: true });
+    expect(result.provider?.activeAuthAccount).toBeUndefined();
     // Absent, not 'default': a slot may legitimately be NAMED "default", so a
     // stored sentinel would be indistinguishable from selecting that slot.
     expect('activeAuthAccount' in registryState.current.providers[0]!).toBe(false);

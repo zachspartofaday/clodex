@@ -30,6 +30,7 @@ import { spawn } from 'node:child_process';
 import { accessSync, constants as fsConstants, statSync } from 'node:fs';
 import { constants as osConstants } from 'node:os';
 import { SESSION_PROXY_ENV } from './builtin-alias-env.js';
+import { OAUTH_ACCOUNT_ENV } from './oauth-account-selection.js';
 import { findClaudeBinary } from './launch.js';
 import { waitForTcpListener, waitForTcpListenerCandidate } from './listener-ready.js';
 import {
@@ -191,6 +192,14 @@ async function main(): Promise<void> {
 
   if (!hasLiveBridge && wrapperRequiresServer(process.env)) {
     process.stderr.write('clodex-claude: no live clodex server is available\n');
+    process.exit(1);
+  }
+  if (state && process.env[OAUTH_ACCOUNT_ENV]?.trim()) {
+    process.stderr.write(
+      `clodex-claude: ${OAUTH_ACCOUNT_ENV} cannot override the credential snapshot of an already-running `
+      + 'standalone server; restart that server with the override and then launch without the variable, '
+      + 'or use clodex claude --proxy\n',
+    );
     process.exit(1);
   }
   // Built-in remaps for standalone servers come from the SERVER's runtime

@@ -3,7 +3,12 @@ import { mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { applySelectedOAuthAccount } from '../src/registry/materialize.js';
-import { accountSwitchHint, accountSwitchOutcome, shouldOfferAccountSwitch } from '../src/providers-command.js';
+import {
+  accountSwitchHint,
+  accountSwitchOutcome,
+  accountSwitchServerRestartWarning,
+  shouldOfferAccountSwitch,
+} from '../src/providers-command.js';
 import { resolveActiveAccount } from '../src/provider-catalog.js';
 import { emptyRegistry, loadRegistry, loadRegistryStrict, saveRegistry } from '../src/registry/io.js';
 import { credentialIsReferenced } from '../src/registry/credential-lifecycle.js';
@@ -387,19 +392,19 @@ describe('resolveActiveAccount', () => {
     // provider handed back `{ kind: 'slot' }` without checking membership, so
     // an orphaned selection was invisible until someone enabled the provider
     // and every launch began failing.
-    for (const provider of [
-      { ...withSlots, enabled: false, activeAuthAccount: 'ghost' },
-      { ...withSlots, authType: 'api' as const, activeAuthAccount: 'ghost' },
-    ]) {
+    for (const [provider, inactiveReason] of [
+      [{ ...withSlots, enabled: false, activeAuthAccount: 'ghost' }, 'disabled'],
+      [{ ...withSlots, authType: 'api' as const, activeAuthAccount: 'ghost' }, 'non-oauth'],
+    ] as const) {
       expect(resolveActiveAccount(provider as RegistryProvider, {}))
-        .toEqual({ kind: 'broken', name: 'ghost', fromEnvironment: false, dormant: true });
+        .toEqual({ kind: 'broken', name: 'ghost', fromEnvironment: false, inactiveReason });
       // ...and it still does not throw, which is why the property above is
       // one-directional rather than an iff.
       expect(() => applySelectedOAuthAccount(provider as RegistryProvider, undefined)).not.toThrow();
     }
     // A healthy selection on a disabled provider is still just a slot.
     expect(resolveActiveAccount({ ...withSlots, enabled: false, activeAuthAccount: 'work' } as RegistryProvider, {}))
-      .toEqual({ kind: 'slot', name: 'work', fromEnvironment: false, dormant: true });
+      .toEqual({ kind: 'slot', name: 'work', fromEnvironment: false, inactiveReason: 'disabled' });
   });
 
   it('keeps a stored orphan visible when an override is masking it', () => {
@@ -449,9 +454,9 @@ describe('resolveActiveAccount', () => {
     const dormant = resolveActiveAccount(
       { ...withSlots, enabled: false, activeAuthAccount: 'ghost' } as RegistryProvider, {},
     );
-    expect(dormant).toMatchObject({ kind: 'broken', dormant: true });
+    expect(dormant).toMatchObject({ kind: 'broken', inactiveReason: 'disabled' });
     const hint = accountSwitchHint({ activeAuthAccount: 'ghost' }, dormant);
-    expect(hint).toContain('will fail if this provider is enabled');
+    expect(hint).toContain('enabling this provider will fail');
     expect(hint).not.toContain('every launch fails');
   });
 
@@ -469,6 +474,64 @@ describe('resolveActiveAccount', () => {
 
   it('reports the provider default as its own kind, never as a name', () => {
     expect(resolveActiveAccount(withSlots, {})).toEqual({ kind: 'default' });
+  });
+
+  it('exhausts the auth-type/enabled/slots/stored/environment state grid', () => {
+    const authTypes: Array<RegistryProvider['authType']> = ['oauth', 'api', 'none', undefined];
+    const slotStates = [false, true];
+    const storedStates = [undefined, 'work', 'ghost'];
+    const environmentStates = [undefined, 'work', 'ghost'];
+    let cases = 0;
+
+    for (const authType of authTypes) {
+      for (const enabled of [false, true]) {
+        for (const hasSlots of slotStates) {
+          for (const activeAuthAccount of storedStates) {
+            for (const environmentAccount of environmentStates) {
+              cases++;
+              const provider: RegistryProvider = {
+                ...base,
+                enabled,
+                authType,
+                ...(hasSlots ? { authAccounts: withSlots.authAccounts } : { authAccounts: undefined }),
+                ...(activeAuthAccount ? { activeAuthAccount } : { activeAuthAccount: undefined }),
+              };
+              const env = environmentAccount
+                ? { CLODEX_OAUTH_ACCOUNT: environmentAccount }
+                : {};
+              const shown = resolveActiveAccount(provider, env);
+
+              if (authType === 'oauth' && enabled) {
+                expect(shown.inactiveReason, `active OAuth case ${cases}`).toBeUndefined();
+                try {
+                  const applied = applySelectedOAuthAccount(provider, environmentAccount);
+                  const selectedSlot = Object.entries(provider.authAccounts ?? {})
+                    .find(([, slot]) => slot.authRef === applied.authRef)?.[0];
+                  expect(shown.kind, `active OAuth case ${cases}`).toBe(selectedSlot ? 'slot' : 'default');
+                  if (shown.kind === 'slot') expect(shown.name).toBe(selectedSlot);
+                } catch {
+                  expect(shown.kind, `throwing OAuth case ${cases}`).toBe('broken');
+                }
+                continue;
+              }
+
+              if (authType === 'oauth') {
+                expect(shown.inactiveReason, `disabled OAuth case ${cases}`).toBe('disabled');
+                const { inactiveReason: _ignored, ...projected } = shown;
+                expect(projected).toEqual(resolveActiveAccount({ ...provider, enabled: true }, env));
+                continue;
+              }
+
+              expect(shown.inactiveReason, `non-OAuth case ${cases}`).toBe('non-oauth');
+              expect(shown).toEqual(resolveActiveAccount(provider, {}));
+              if (shown.kind !== 'default') expect(shown.fromEnvironment).toBe(false);
+            }
+          }
+        }
+      }
+    }
+
+    expect(cases).toBe(144);
   });
 });
 
@@ -544,5 +607,45 @@ describe('accountSwitchOutcome', () => {
     ] as const) {
       expect(accountSwitchOutcome('OpenAI', 'work', effective).ok).toBe(true);
     }
+  });
+
+  it('uses saved-state wording for disabled providers and projects environment failures', () => {
+    expect(accountSwitchOutcome('OpenAI', 'work', {
+      kind: 'slot', name: 'work', fromEnvironment: false, inactiveReason: 'disabled',
+    })).toEqual({ ok: true, message: 'Saved work for OpenAI (provider disabled).' });
+
+    const broken = accountSwitchOutcome('OpenAI', 'work', {
+      kind: 'broken', name: 'ghost', fromEnvironment: true, inactiveReason: 'disabled',
+    });
+    expect(broken.ok).toBe(false);
+    expect(broken.message).toContain('enabling it in this shell will fail');
+    expect(broken.message).not.toContain('every launch fails');
+  });
+
+  it('does not describe a non-OAuth provider as disabled', () => {
+    const effective = resolveActiveAccount({
+      ...withSlots, authType: 'api', activeAuthAccount: 'work',
+    } as RegistryProvider, { CLODEX_OAUTH_ACCOUNT: 'ghost' });
+    expect(effective).toMatchObject({
+      kind: 'slot', name: 'work', fromEnvironment: false, inactiveReason: 'non-oauth',
+    });
+    expect(accountSwitchHint({ activeAuthAccount: 'work' }, effective)).toContain('not configured for OAuth');
+    expect(accountSwitchHint({ activeAuthAccount: 'work' }, effective)).not.toContain('disabled');
+  });
+});
+
+describe('accountSwitchServerRestartWarning', () => {
+  it('warns for each live standalone server snapshot', () => {
+    expect(accountSwitchServerRestartWarning(1)).toContain('Restart 1 running standalone clodex server');
+    expect(accountSwitchServerRestartWarning(1)).toContain('retains the previous provider and credential snapshot');
+    expect(accountSwitchServerRestartWarning(2)).toContain('Restart 2 running standalone clodex servers');
+  });
+
+  it('stays silent when no live standalone server is advertised', () => {
+    expect(accountSwitchServerRestartWarning(0)).toBeNull();
+  });
+
+  it('stays silent for a no-op selection even when a server is live', () => {
+    expect(accountSwitchServerRestartWarning(1, false)).toBeNull();
   });
 });

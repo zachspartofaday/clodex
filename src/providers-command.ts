@@ -25,14 +25,15 @@ import {
 import { reconcilePendingCredentialDeletes } from './registry/credential-lifecycle.js';
 import { loadRegistry } from './registry/io.js';
 import type { RegistryProvider } from './registry/types.js';
-import { refreshAllProviderModels, refreshProviderModels } from './registry/refresh-models.js';
-import { resolveRefreshCredential } from './registry/refresh-credentials.js';
+import { refreshAllProviderModels, refreshProviderModelsWithCredential } from './registry/refresh-models.js';
 import { authenticateProvider, providerAuthHelpText, validateOAuthAccountName, type ProviderAuthMethod } from './registry/provider-auth.js';
 import { supportsNativeOAuth } from './oauth/types.js';
 import { browseAllModels } from './prompts.js';
-import { cachedModelToLocal, OAUTH_ACCOUNT_ENV } from './registry/materialize.js';
+import { cachedModelToLocal } from './registry/materialize.js';
+import { OAUTH_ACCOUNT_ENV } from './oauth-account-selection.js';
 import { loadPreferences } from './config.js';
 import type { LocalProvider } from './types.js';
+import { readLiveServerRuntimeStates } from './server-runtime.js';
 import {
   fmtEnabledStar,
   fmtProvider,
@@ -197,6 +198,38 @@ export function accountSwitchOutcome(
   effective: ActiveAccount,
 ): { ok: boolean; message: string } {
   const savedLabel = saved ?? PROVIDER_DEFAULT_ACCOUNT_LABEL;
+
+  if (effective.inactiveReason === 'non-oauth') {
+    return {
+      ok: true,
+      message: `Saved ${savedLabel} for ${providerName}, but this provider is not configured for OAuth account selection.`,
+    };
+  }
+
+  if (effective.inactiveReason === 'disabled') {
+    if (effective.kind === 'broken') {
+      return {
+        ok: false,
+        message: effective.fromEnvironment
+          ? `Saved ${savedLabel} for ${providerName} (provider disabled), but ${OAUTH_ACCOUNT_ENV}=${effective.name} `
+            + 'names no such account — enabling it in this shell will fail until the variable is unset or corrected.'
+          : `Saved ${savedLabel} for ${providerName} (provider disabled), but that account no longer exists — `
+            + 'enabling the provider will fail.',
+      };
+    }
+    if (effective.kind === 'slot' && effective.fromEnvironment && effective.name !== saved) {
+      return {
+        ok: true,
+        message: `Saved ${savedLabel} for ${providerName} (provider disabled); if enabled in this shell, `
+          + `${OAUTH_ACCOUNT_ENV}=${effective.name} will override it.`,
+      };
+    }
+    return {
+      ok: true,
+      message: `Saved ${savedLabel} for ${providerName} (provider disabled).`,
+    };
+  }
+
   if (effective.kind === 'broken') {
     return {
       ok: false,
@@ -217,6 +250,15 @@ export function accountSwitchOutcome(
   return { ok: true, message: `${providerName} will launch as ${savedLabel}.` };
 }
 
+export function accountSwitchServerRestartWarning(
+  liveServerCount: number,
+  selectionChanged = true,
+): string | null {
+  if (!selectionChanged || !Number.isInteger(liveServerCount) || liveServerCount <= 0) return null;
+  return `Restart ${liveServerCount} running standalone clodex server${liveServerCount === 1 ? '' : 's'} `
+    + `${liveServerCount === 1 ? 'because it retains' : 'because they retain'} the previous provider and credential snapshot.`;
+}
+
 /**
  * The detail-menu hint for "Switch account", derived from the SAME resolver the
  * listing reads. A broken selection has to read as broken here: this is the
@@ -227,22 +269,34 @@ export function accountSwitchHint(
   provider: Pick<RegistryProvider, 'activeAuthAccount'>,
   effective: ActiveAccount,
 ): string {
-  // Saved state, not a live outcome: this provider is not launching at all.
-  if (effective.dormant) {
-    // Saved state, not a live outcome: this provider is not launching at all.
-  if (effective.dormant) {
+  if (effective.inactiveReason === 'non-oauth') {
     if (effective.kind === 'broken') {
-      return `Selected account "${effective.name}" no longer exists — will fail if this provider is enabled`;
+      return `Stored OAuth account "${effective.name}" no longer exists — provider is not configured for OAuth selection`;
     }
-    if (effective.kind === 'slot') return `Saved account: ${effective.name} (provider not enabled)`;
-    return `Saved account: ${PROVIDER_DEFAULT_ACCOUNT_LABEL} (provider not enabled)`;
-  }
-  if (effective.kind === 'broken') {
-      return `Selected account "${effective.name}" no longer exists — will fail if this provider is enabled`;
+    if (effective.kind === 'slot') {
+      return `Stored OAuth account: ${effective.name} (provider is not configured for OAuth selection)`;
     }
-    if (effective.kind === 'slot') return `Saved account: ${effective.name} (provider not enabled)`;
-    return `Saved account: ${PROVIDER_DEFAULT_ACCOUNT_LABEL} (provider not enabled)`;
+    return 'OAuth account selection inactive (provider is not configured for OAuth)';
   }
+
+  if (effective.inactiveReason === 'disabled') {
+    const masked = effective.latentOrphan
+      ? `; stored "${effective.latentOrphan}" is missing and will fail if enabled without the override`
+      : '';
+    if (effective.kind === 'broken') {
+      return effective.fromEnvironment
+        ? `${OAUTH_ACCOUNT_ENV}=${effective.name} names no such account — enabling this provider will fail${masked}`
+        : `Selected account "${effective.name}" no longer exists — enabling this provider will fail`;
+    }
+    if (effective.kind === 'slot') {
+      return effective.fromEnvironment
+        ? `If enabled, ${OAUTH_ACCOUNT_ENV}=${effective.name} overrides the stored `
+          + `${provider.activeAuthAccount ?? PROVIDER_DEFAULT_ACCOUNT_LABEL}${masked}`
+        : `Saved account: ${effective.name} (provider disabled)`;
+    }
+    return `Saved account: ${PROVIDER_DEFAULT_ACCOUNT_LABEL} (provider disabled)`;
+  }
+
   if (effective.kind === 'broken') {
     // A broken override can hide a second, independent breakage: the stored
     // selection behind it. Unsetting the variable would otherwise just swap
@@ -325,10 +379,19 @@ export async function runProvidersRefreshModels(providerId?: string): Promise<nu
     }
     const spinner = p.spinner();
     spinner.start(`Refreshing ${provider.name}...`);
-    const key = await resolveRefreshCredential(provider, async p =>
-      resolveProviderCredential(p.id, p.authRef),
-    );
-    const result = await refreshProviderModels(providerId, key);
+    const accountOverride = process.env[OAUTH_ACCOUNT_ENV] ?? null;
+    let result: Awaited<ReturnType<typeof refreshProviderModelsWithCredential>>;
+    try {
+      result = await refreshProviderModelsWithCredential(
+        providerId,
+        async candidate => resolveProviderCredential(candidate.id, candidate.authRef),
+        accountOverride,
+      );
+    } catch (err) {
+      spinner.stop('');
+      p.log.error(err instanceof Error ? err.message : String(err));
+      return 1;
+    }
     spinner.stop('');
     if (result.skipped) {
       const countNote = result.modelCount ? ` (${result.modelCount} cached models kept)` : '';
@@ -686,6 +749,10 @@ async function runProviderDetail(id: string): Promise<'back' | 'removed'> {
       p.log.error(result.error ?? 'Could not switch account.');
       return 'back';
     }
+    if (!result.provider) {
+      p.log.error('Account selection was saved, but the resulting provider state could not be read.');
+      return 'back';
+    }
     // Re-resolved against the SAVED state rather than reported from the picker
     // choice. Checking only whether the variable is present said "will launch
     // as X" while an override naming a missing slot made every launch throw —
@@ -693,10 +760,15 @@ async function runProviderDetail(id: string): Promise<'back' | 'removed'> {
     const outcome = accountSwitchOutcome(
       provider.name,
       result.account,
-      resolveActiveAccount({ ...provider, activeAuthAccount: result.account }),
+      resolveActiveAccount(result.provider),
     );
     if (outcome.ok) p.log.success(outcome.message);
     else p.log.warn(outcome.message);
+    const restartWarning = accountSwitchServerRestartWarning(
+      readLiveServerRuntimeStates().length,
+      result.changed,
+    );
+    if (restartWarning) p.log.warn(restartWarning);
     return 'back';
   }
 
