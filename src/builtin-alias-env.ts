@@ -144,13 +144,26 @@ export function clearInheritedBuiltinOverrides(
 ): void {
   for (const [alias, recorded] of inheritedInjections(baseEnv)) {
     const envName = BUILTIN_ALIAS_ENV[alias as BuiltinAliasName];
-    if (envName && stillOurs(baseEnv, envName, recorded)) {
-      if (alias === 'sonnet'
-        && baseEnv[SONNET_DEFAULT_PROBE_MARKER_ENV] === baseEnv[envName]) {
-        delete env[SONNET_DEFAULT_PROBE_MARKER_ENV];
-      }
-      delete env[envName];
+    if (!envName) continue;
+    if (alias === 'sonnet') {
+      // Judged against what the sentinel says WE injected, not against the
+      // current value. A descendant that replaces or unsets the Sonnet default
+      // makes `stillOurs` false — correctly, since the replacement is now
+      // user-explicit — but the marker beside it is still ours, and the
+      // sentinel that identifies it is deleted below. Tying the marker's fate
+      // to the value's strands it with no provenance, and a later explicit
+      // default equal to that stale value then reads to Claude Code as a
+      // clodex injection and is bypassed for auto-mode classification.
+      //
+      // An older match-any sentinel entry records no value, so there the
+      // current value is the only evidence available.
+      const marker = baseEnv[SONNET_DEFAULT_PROBE_MARKER_ENV];
+      const markerIsOurs = recorded === null
+        ? marker !== undefined && marker === baseEnv[envName]
+        : marker === recorded;
+      if (markerIsOurs) delete env[SONNET_DEFAULT_PROBE_MARKER_ENV];
     }
+    if (stillOurs(baseEnv, envName, recorded)) delete env[envName];
   }
   delete env[WRAPPER_INJECTED_BUILTINS_ENV];
 }
