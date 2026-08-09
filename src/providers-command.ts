@@ -182,6 +182,42 @@ ${pc.bold('Subcommands:')}
  * and leave re-authenticating or hand-editing the registry as the only ways out.
  */
 /**
+ * What to tell the user after a selection is saved.
+ *
+ * Resolved from the saved state, not from the picker choice: persisting
+ * succeeds under the write lock while a nonblank CLODEX_OAUTH_ACCOUNT naming a
+ * missing slot still makes every launch throw. Reporting the choice back
+ * verbatim therefore confirms a repair that did not happen — the third surface
+ * in this file to decide a launch outcome without asking the resolver, so it
+ * asks the resolver.
+ */
+export function accountSwitchOutcome(
+  providerName: string,
+  saved: string | undefined,
+  effective: ActiveAccount,
+): { ok: boolean; message: string } {
+  const savedLabel = saved ?? PROVIDER_DEFAULT_ACCOUNT_LABEL;
+  if (effective.kind === 'broken') {
+    return {
+      ok: false,
+      message: effective.fromEnvironment
+        ? `Saved ${savedLabel} for ${providerName}, but ${OAUTH_ACCOUNT_ENV}=${effective.name} `
+          + 'names no such account — every launch fails until it is unset or corrected.'
+        : `Saved ${savedLabel} for ${providerName}, but it names no existing account — `
+          + 'every launch fails.',
+    };
+  }
+  if (effective.kind === 'slot' && effective.fromEnvironment && effective.name !== saved) {
+    return {
+      ok: true,
+      message: `Saved ${savedLabel} for ${providerName}, but ${OAUTH_ACCOUNT_ENV}=${effective.name} `
+        + 'overrides it in this shell.',
+    };
+  }
+  return { ok: true, message: `${providerName} will launch as ${savedLabel}.` };
+}
+
+/**
  * The detail-menu hint for "Switch account", derived from the SAME resolver the
  * listing reads. A broken selection has to read as broken here: this is the
  * screen the launch error sends people to, so telling them the missing account
@@ -613,12 +649,17 @@ async function runProviderDetail(id: string): Promise<'back' | 'removed'> {
       p.log.error(result.error ?? 'Could not switch account.');
       return 'back';
     }
-    p.log.success(
-      `${provider.name} will launch as ${result.account ?? PROVIDER_DEFAULT_ACCOUNT_LABEL}.`
-      + (process.env[OAUTH_ACCOUNT_ENV]
-        ? ` (${OAUTH_ACCOUNT_ENV} is set in this shell and overrides it.)`
-        : ''),
+    // Re-resolved against the SAVED state rather than reported from the picker
+    // choice. Checking only whether the variable is present said "will launch
+    // as X" while an override naming a missing slot made every launch throw —
+    // an apparent repair that fixed nothing and said nothing.
+    const outcome = accountSwitchOutcome(
+      provider.name,
+      result.account,
+      resolveActiveAccount({ ...provider, activeAuthAccount: result.account }),
     );
+    if (outcome.ok) p.log.success(outcome.message);
+    else p.log.warn(outcome.message);
     return 'back';
   }
 

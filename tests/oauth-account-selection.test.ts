@@ -3,7 +3,7 @@ import { mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { applySelectedOAuthAccount } from '../src/registry/materialize.js';
-import { accountSwitchHint, shouldOfferAccountSwitch } from '../src/providers-command.js';
+import { accountSwitchHint, accountSwitchOutcome, shouldOfferAccountSwitch } from '../src/providers-command.js';
 import { resolveActiveAccount } from '../src/provider-catalog.js';
 import { emptyRegistry, loadRegistry, loadRegistryStrict, saveRegistry } from '../src/registry/io.js';
 import { credentialIsReferenced } from '../src/registry/credential-lifecycle.js';
@@ -395,5 +395,56 @@ describe('accountSwitchHint', () => {
     expect(accountSwitchHint({ activeAuthAccount: 'alt' }, { kind: 'slot', name: 'alt', fromEnvironment: false }))
       .toContain('currently uses alt');
     expect(accountSwitchHint({}, { kind: 'default' })).toContain('(provider default)');
+  });
+});
+
+describe('accountSwitchOutcome', () => {
+  it('warns instead of confirming when the saved choice still cannot launch', () => {
+    // Persisting succeeds under the write lock while a nonblank
+    // CLODEX_OAUTH_ACCOUNT naming a missing slot still makes every launch
+    // throw. Reporting the picker choice back verbatim confirmed a repair that
+    // had not happened.
+    const outcome = accountSwitchOutcome('OpenAI', 'work', {
+      kind: 'broken', name: 'ghost', fromEnvironment: true,
+    });
+    expect(outcome.ok).toBe(false);
+    expect(outcome.message).toContain('names no such account');
+    expect(outcome.message).toContain('every launch fails');
+  });
+
+  it('flags an override that shadows what was just saved', () => {
+    const outcome = accountSwitchOutcome('OpenAI', 'work', {
+      kind: 'slot', name: 'alt', fromEnvironment: true,
+    });
+    expect(outcome.ok).toBe(true);
+    expect(outcome.message).toContain('overrides it in this shell');
+  });
+
+  it('confirms plainly when the saved choice is what will launch', () => {
+    expect(accountSwitchOutcome('OpenAI', 'work', { kind: 'slot', name: 'work', fromEnvironment: false }))
+      .toEqual({ ok: true, message: 'OpenAI will launch as work.' });
+    // An override naming the SAME account is not worth a caveat.
+    expect(accountSwitchOutcome('OpenAI', 'work', { kind: 'slot', name: 'work', fromEnvironment: true }).ok)
+      .toBe(true);
+    expect(accountSwitchOutcome('OpenAI', undefined, { kind: 'default' }).message)
+      .toContain('(provider default)');
+  });
+
+  it('never confirms an outcome the resolver calls broken', () => {
+    // The property, not the phrasing: this is the third surface to have decided
+    // a launch outcome on its own, so the guard is that ok tracks the resolver.
+    for (const effective of [
+      { kind: 'broken', name: 'ghost', fromEnvironment: true },
+      { kind: 'broken', name: 'ghost', fromEnvironment: false },
+    ] as const) {
+      expect(accountSwitchOutcome('OpenAI', 'work', effective).ok).toBe(false);
+    }
+    for (const effective of [
+      { kind: 'default' },
+      { kind: 'slot', name: 'work', fromEnvironment: false },
+      { kind: 'slot', name: 'alt', fromEnvironment: true },
+    ] as const) {
+      expect(accountSwitchOutcome('OpenAI', 'work', effective).ok).toBe(true);
+    }
   });
 });
