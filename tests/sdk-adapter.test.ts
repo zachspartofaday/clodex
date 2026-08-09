@@ -1039,6 +1039,56 @@ describe('writeAnthropicStream', () => {
     expect(toolInputFromEvents(events)).toEqual({ query: 'who won' });
   });
 
+  const readTools = translateTools([{
+    name: 'Read',
+    description: 'Read a file',
+    input_schema: {
+      type: 'object',
+      properties: {
+        file_path: { type: 'string' },
+        offset: { type: 'number' },
+        pages: { type: 'string' },
+      },
+      required: ['file_path'],
+    },
+  }]);
+
+  it('strips non-PDF Read.pages after split streamed input is assembled', async () => {
+    const input = { file_path: '/repo/file.swift', offset: 1, pages: '1' };
+    const encoded = JSON.stringify(input);
+    const { events } = await collect([
+      { type: 'start' },
+      { type: 'tool-input-start', id: 'call_read', toolName: 'Read' },
+      { type: 'tool-input-delta', id: 'call_read', delta: encoded.slice(0, 24) },
+      { type: 'tool-input-delta', id: 'call_read', delta: encoded.slice(24) },
+      { type: 'tool-input-end', id: 'call_read' },
+      { type: 'tool-call', toolCallId: 'call_read', toolName: 'Read', input },
+      { type: 'finish', finishReason: 'tool-calls' },
+    ], 'm', undefined, readTools);
+    expect(toolInputFromEvents(events)).toEqual({ file_path: '/repo/file.swift', offset: 1 });
+  });
+
+  it('strips non-PDF Read.pages from the complete-buffer fallback', async () => {
+    const input = { file_path: '/repo/file.json', pages: '' };
+    const { events } = await collect([
+      { type: 'start' },
+      { type: 'tool-input-start', id: 'call_read', toolName: 'Read' },
+      { type: 'tool-input-delta', id: 'call_read', delta: JSON.stringify(input) },
+      { type: 'tool-input-end', id: 'call_read' },
+      { type: 'finish', finishReason: 'tool-calls' },
+    ], 'm', undefined, readTools);
+    expect(toolInputFromEvents(events)).toEqual({ file_path: '/repo/file.json' });
+  });
+
+  it('preserves Read.pages for PDFs', async () => {
+    const { events } = await collect([
+      { type: 'start' },
+      { type: 'tool-call', toolCallId: 'call_pdf', toolName: 'Read', input: { file_path: '/repo/FILE.PDF', pages: '1-3' } },
+      { type: 'finish', finishReason: 'tool-calls' },
+    ], 'm', undefined, readTools);
+    expect(toolInputFromEvents(events)).toEqual({ file_path: '/repo/FILE.PDF', pages: '1-3' });
+  });
+
   it('preserves an intentional empty array for a schema-required property', async () => {
     const todoTools = translateTools([{
       name: 'TodoWrite',

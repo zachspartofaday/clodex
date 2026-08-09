@@ -549,12 +549,13 @@ function toolArgumentNormalizationGap(
   const callId = left.call_id;
   if (typeof callId !== 'string' || !callId || callId !== right.call_id) return undefined;
   if (typeof left.name !== 'string' || left.name !== right.name) return undefined;
+  const toolName = left.name;
   // Same call, same tool, different bytes. Compare NORMALIZED arguments so the
   // canonical-JSON reconciliation this file already applies is not re-reported.
   if (canonicalJson(normalizeToolCallJson(left)) === canonicalJson(normalizeToolCallJson(right))) {
     return undefined;
   }
-  const required = requiredProps().get(left.name);
+  const required = requiredProps().get(toolName);
   const stripped = (item: JsonObject): string | undefined => {
     if (typeof item.arguments !== 'string') return undefined;
     const raw = item.arguments.trim();
@@ -565,14 +566,18 @@ function toolArgumentNormalizationGap(
       // `arguments` cannot be reported as the filler-strip rule having forked.
       return canonicalJson({
         ...(normalizeToolCallJson(item) as JsonObject),
-        arguments: canonicalJson(sanitizeToolInput(parsed as Record<string, unknown>, required)),
+        arguments: canonicalJson(sanitizeToolInput(
+          parsed as Record<string, unknown>,
+          required,
+          toolName,
+        )),
       });
     } catch { return undefined; }
   };
   const leftStripped = stripped(left);
   const rightStripped = stripped(right);
   return {
-    tool: left.name,
+    tool: toolName,
     equalAfterStrip: leftStripped !== undefined && leftStripped === rightStripped,
   };
 }
@@ -1228,7 +1233,11 @@ function sanitizedCallArguments(item: JsonObject, requiredProps: Map<string, Set
   const required = requiredProps.get(typeof item.name === 'string' ? item.name : '');
   return {
     ...item,
-    arguments: JSON.stringify(sanitizeToolInput(parsed as Record<string, unknown>, required)),
+    arguments: JSON.stringify(sanitizeToolInput(
+      parsed as Record<string, unknown>,
+      required,
+      typeof item.name === 'string' ? item.name : undefined,
+    )),
   };
 }
 
