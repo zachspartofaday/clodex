@@ -207,7 +207,7 @@ describe('provider-catalog-display', () => {
     it('marks which account a launch will actually use', async () => {
       saveSlotted('varmez');
       const entries = await resolveProvidersForDisplay();
-      expect(entries[0]?.authLabel).toContain('accounts: default, varmez (active)');
+      expect(entries[0]?.authLabel).toContain('accounts: (provider default), varmez (active)');
     });
 
     it('marks the provider default as active when nothing is stored', async () => {
@@ -215,7 +215,61 @@ describe('provider-catalog-display', () => {
       // run as an unintended identity for hours without anything showing it.
       saveSlotted(undefined);
       const entries = await resolveProvidersForDisplay();
-      expect(entries[0]?.authLabel).toContain('accounts: default (active), varmez');
+      expect(entries[0]?.authLabel).toContain('accounts: (provider default) (active), varmez');
+    });
+
+    it('reports the environment override, not the stored selection', async () => {
+      // CLODEX_OAUTH_ACCOUNT wins at launch, so it must win here: showing the
+      // stored one while a variable overrides it misreports the live identity
+      // in exactly the persistent shell this listing exists to clarify.
+      saveSlotted(undefined);
+      process.env['CLODEX_OAUTH_ACCOUNT'] = 'varmez';
+      try {
+        const entries = await resolveProvidersForDisplay();
+        expect(entries[0]?.authLabel).toContain('varmez (active, from CLODEX_OAUTH_ACCOUNT)');
+        expect(entries[0]?.authLabel).not.toContain('(provider default) (active)');
+      } finally {
+        delete process.env['CLODEX_OAUTH_ACCOUNT'];
+      }
+    });
+
+    it('ignores an environment override that names no existing slot', async () => {
+      saveSlotted('varmez');
+      process.env['CLODEX_OAUTH_ACCOUNT'] = 'ghost';
+      try {
+        // applySelectedOAuthAccount throws on this at launch; the listing must
+        // not invent an active row for a slot that does not exist.
+        const entries = await resolveProvidersForDisplay();
+        expect(entries[0]?.authLabel).toContain('varmez (active)');
+      } finally {
+        delete process.env['CLODEX_OAUTH_ACCOUNT'];
+      }
+    });
+
+    it('does not confuse a slot literally named default with the provider default', async () => {
+      // `default` is a valid slot name. Labelling the provider's own
+      // credential "default" too would render two identical entries and mark
+      // both active, leaving the listing unable to answer its only question.
+      const registry = emptyRegistry();
+      registry.providers.push({
+        id: 'openai-oauth',
+        templateId: 'openai',
+        name: 'OpenAI (ChatGPT)',
+        enabled: true,
+        authRef: 'keyring:oauth:provider:openai-oauth::credential::v1:default',
+        authType: 'oauth',
+        authAccounts: {
+          default: { authRef: 'keyring:oauth:provider:openai-oauth:account:default::credential::v1:d', addedAt: new Date().toISOString() },
+        },
+        activeAuthAccount: 'default',
+        api: { npm: '@ai-sdk/openai' },
+        addedAt: new Date().toISOString(),
+      });
+      withRegistryWriteLockSync(() => saveRegistry(registry));
+
+      const label = (await resolveProvidersForDisplay())[0]?.authLabel ?? '';
+      expect(label).toContain('accounts: (provider default), default (active)');
+      expect(label.match(/\(active\)/g)).toHaveLength(1);
     });
   });
 });

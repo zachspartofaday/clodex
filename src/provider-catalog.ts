@@ -3,7 +3,7 @@ import type { CompatibilityAgent } from './model-compatibility.js';
 import { oauthAuthRef } from './registry/import-build.js';
 import { loadRegistry } from './registry/io.js';
 import { loadRegistryProviders } from './registry/load.js';
-import { isAnonymousProvider } from './registry/materialize.js';
+import { isAnonymousProvider, OAUTH_ACCOUNT_ENV } from './registry/materialize.js';
 import { getTemplateById } from './provider-templates.js';
 import type { LocalProvider } from './types.js';
 import type { ServerModelInfo } from './server/models.js';
@@ -76,6 +76,15 @@ export interface ProviderDisplayEntry {
   inRegistry: boolean;
 }
 
+/**
+ * How the provider's own credential is named wherever accounts are listed.
+ *
+ * Deliberately not "default": OAUTH_ACCOUNT_NAME_RE accepts `default` as a
+ * real slot name, so any label a user could also type would be ambiguous with
+ * a slot they created. The parenthesised form cannot collide.
+ */
+export const PROVIDER_DEFAULT_ACCOUNT_LABEL = '(provider default)';
+
 export async function resolveProvidersForDisplay(): Promise<ProviderDisplayEntry[]> {
   const reg = loadRegistry();
   const entries: ProviderDisplayEntry[] = [];
@@ -85,10 +94,32 @@ export async function resolveProvidersForDisplay(): Promise<ProviderDisplayEntry
     // Which identity a launch actually uses is the point of listing the slots
     // at all, so it is marked inline rather than left to be inferred from a
     // variable the operator has to remember setting.
-    const active = provider.activeAuthAccount ?? 'default';
-    const accountList = ['default', ...accountNames]
-      .map(name => (name === active ? `${name} (active)` : name))
-      .join(', ');
+    //
+    // The provider's own credential is labelled "(provider default)", never
+    // "default": `default` is a VALID slot name, so reusing it would render
+    // two identical entries and mark both active, leaving the listing unable
+    // to say which credential launches — the one question it exists to answer.
+    //
+    // The environment wins over the stored selection at launch, so it wins
+    // here too; showing the stored one while a variable overrides it would
+    // misreport the live identity in exactly the persistent shell this feature
+    // is meant to make visible.
+    const override = process.env[OAUTH_ACCOUNT_ENV]?.trim();
+    const overrideApplies = Boolean(override)
+      && provider.authType === 'oauth'
+      && provider.enabled
+      && accountNames.includes(override!);
+    const active = overrideApplies ? override! : provider.activeAuthAccount;
+    const label = (name: string, isActive: boolean): string => {
+      if (!isActive) return name;
+      return overrideApplies
+        ? `${name} (active, from ${OAUTH_ACCOUNT_ENV})`
+        : `${name} (active)`;
+    };
+    const accountList = [
+      label(PROVIDER_DEFAULT_ACCOUNT_LABEL, active === undefined),
+      ...accountNames.map(name => label(name, name === active)),
+    ].join(', ');
     const authLabel = accountNames.length
       ? `${formatRegistryAuthLabel(provider)}; accounts: ${accountList}`
       : formatRegistryAuthLabel(provider);

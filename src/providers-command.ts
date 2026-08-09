@@ -5,6 +5,7 @@ import * as p from '@clack/prompts';
 import { resolveProviderCredential } from './env.js';
 import {
   formatRegistryAuthLabel,
+  PROVIDER_DEFAULT_ACCOUNT_LABEL,
   resolveProvidersForDisplay,
   type ProviderDisplayEntry,
 } from './provider-catalog.js';
@@ -486,7 +487,7 @@ async function runProviderDetail(id: string): Promise<'back' | 'removed'> {
     detailOptions.push({
       value: 'account',
       label: 'Switch account',
-      hint: `Every launch currently uses ${provider.activeAuthAccount ?? 'default'}`,
+      hint: `Every launch currently uses ${provider.activeAuthAccount ?? PROVIDER_DEFAULT_ACCOUNT_LABEL}`,
     });
   }
   detailOptions.push(
@@ -542,7 +543,7 @@ async function runProviderDetail(id: string): Promise<'back' | 'removed'> {
       options: [
         {
           value: providerDefault,
-          label: 'default',
+          label: PROVIDER_DEFAULT_ACCOUNT_LABEL,
           hint: "the provider's original sign-in",
         },
         ...accountSlots.map(name => ({
@@ -560,7 +561,7 @@ async function runProviderDetail(id: string): Promise<'back' | 'removed'> {
       return 'back';
     }
     p.log.success(
-      `${provider.name} will launch as ${result.account ?? 'the default account'}.`
+      `${provider.name} will launch as ${result.account ?? PROVIDER_DEFAULT_ACCOUNT_LABEL}.`
       + (process.env[OAUTH_ACCOUNT_ENV]
         ? ` (${OAUTH_ACCOUNT_ENV} is set in this shell and overrides it.)`
         : ''),

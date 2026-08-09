@@ -17,6 +17,19 @@ export const REGISTRY_SCHEMA_VERSION = 1;
 export const REGISTRY_SCHEMA_VERSION_WITH_ACCOUNT_SLOTS = 2;
 
 /**
+ * Written whenever any provider carries `activeAuthAccount`.
+ *
+ * A DISTINCT version, not a reuse of the slot version: a build from before the
+ * stored selector existed accepts version 2, parses the slots, silently
+ * ignores the unknown `activeAuthAccount`, and saves the registry back without
+ * it — after which every launch quietly reverts to the provider default
+ * identity. Only a version that older build rejects actually fences the
+ * selector. A registry whose selector is cleared falls back to 2 (or 1), so
+ * older builds interoperate again as soon as no selector state exists.
+ */
+export const REGISTRY_SCHEMA_VERSION_WITH_ACTIVE_ACCOUNT = 3;
+
+/**
  * Shape rule for a named OAuth account-slot name — the single home. Slot
  * names land in credential-store scopes and env values, and the registry
  * parser must accept exactly what `validateOAuthAccountName` admits, or a

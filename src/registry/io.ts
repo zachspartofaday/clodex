@@ -17,7 +17,12 @@ import {
 import { dirname } from 'node:path';
 import { getAppHome, getProvidersPath } from '../paths.js';
 import type { ProviderRegistry, RegistryProvider } from './types.js';
-import { OAUTH_ACCOUNT_NAME_RE, REGISTRY_SCHEMA_VERSION, REGISTRY_SCHEMA_VERSION_WITH_ACCOUNT_SLOTS } from './types.js';
+import {
+  OAUTH_ACCOUNT_NAME_RE,
+  REGISTRY_SCHEMA_VERSION,
+  REGISTRY_SCHEMA_VERSION_WITH_ACCOUNT_SLOTS,
+  REGISTRY_SCHEMA_VERSION_WITH_ACTIVE_ACCOUNT,
+} from './types.js';
 import {
   assertRegistryWriteOwnership,
   withRegistryWriteLockSync,
@@ -241,6 +246,7 @@ function parseRegistryStrict(raw: unknown): ProviderRegistry {
   if (
     data.schemaVersion !== REGISTRY_SCHEMA_VERSION
     && data.schemaVersion !== REGISTRY_SCHEMA_VERSION_WITH_ACCOUNT_SLOTS
+    && data.schemaVersion !== REGISTRY_SCHEMA_VERSION_WITH_ACTIVE_ACCOUNT
   ) {
     throw new Error('Provider registry has an unsupported schema version.');
   }
@@ -302,15 +308,19 @@ export function saveRegistry(registry: ProviderRegistry, path = getProvidersPath
   assertRegistryWriteOwnership(path);
   // Slot state fences older writers via the schema version (see types.ts);
   // slot-free registries return to v1 so old builds interoperate again.
-  // `activeAuthAccount` counts as slot state: a writer that fenced only on the
-  // slots themselves could emit v1 carrying a selector, and an old build would
-  // load it, ignore the unknown field, and silently run the default identity —
-  // the exact substitution the fence exists to prevent.
+  // Highest state present wins, and the selector needs its OWN version: a
+  // build predating it accepts version 2, parses the slots, drops the unknown
+  // `activeAuthAccount`, and saves back — silently reverting every later
+  // launch to the provider default. Only a version it rejects fences that.
+  const hasSelector = registry.providers.some(provider => provider.activeAuthAccount !== undefined);
   const hasSlots = registry.providers.some(
-    provider => (provider.authAccounts && Object.keys(provider.authAccounts).length > 0)
-      || provider.activeAuthAccount !== undefined,
+    provider => provider.authAccounts && Object.keys(provider.authAccounts).length > 0,
   );
-  const schemaVersion = hasSlots ? REGISTRY_SCHEMA_VERSION_WITH_ACCOUNT_SLOTS : REGISTRY_SCHEMA_VERSION;
+  const schemaVersion = hasSelector
+    ? REGISTRY_SCHEMA_VERSION_WITH_ACTIVE_ACCOUNT
+    : hasSlots
+      ? REGISTRY_SCHEMA_VERSION_WITH_ACCOUNT_SLOTS
+      : REGISTRY_SCHEMA_VERSION;
   const payload = `${JSON.stringify({ ...registry, schemaVersion }, null, 2)}\n`;
   const backup = `${path}.bak`;
   if (existsSync(path)) {

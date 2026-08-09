@@ -104,6 +104,25 @@ describe('the stored account selection', () => {
     const disabled: RegistryProvider = { ...withSlots, enabled: false, activeAuthAccount: 'personal' };
     expect(applySelectedOAuthAccount(disabled, undefined)).toBe(disabled);
   });
+
+  it('fails loudly when the stored selector has no slot table left at all', () => {
+    // The registry serializes selector-only state as valid, so an empty or
+    // absent slot table is reachable. Returning the provider default here
+    // would run every launch as the wrong identity in silence — the whole
+    // failure this feature exists to prevent.
+    const orphaned: RegistryProvider = { ...base, activeAuthAccount: 'varmez' };
+    expect(() => applySelectedOAuthAccount(orphaned, undefined)).toThrow(
+      /has no named accounts.*clodex providers/s,
+    );
+    const emptyTable: RegistryProvider = { ...base, authAccounts: {}, activeAuthAccount: 'varmez' };
+    expect(() => applySelectedOAuthAccount(emptyTable, undefined)).toThrow(/has no named accounts/);
+  });
+
+  it('still ignores an ENVIRONMENT selector on a provider with no slots', () => {
+    // Unchanged contract: the variable only ever chooses among slots, and a
+    // stale one must not take down a catalog load for providers that can run.
+    expect(applySelectedOAuthAccount(base, 'varmez')).toBe(base);
+  });
 });
 
 describe('selection on disabled providers', () => {
@@ -182,7 +201,7 @@ describe('authAccounts registry persistence', () => {
     withRegistryWriteLockSync(() => saveRegistry(slotFree, path), { lockPath: `${path}.lock` });
     expect(JSON.parse(readFileSync(path, 'utf8')).schemaVersion).toBe(1);
 
-    writeFileSync(path, `${JSON.stringify({ schemaVersion: 3, providers: [] })}\n`);
+    writeFileSync(path, `${JSON.stringify({ schemaVersion: 9, providers: [] })}\n`);
     expect(() => loadRegistryStrict(path)).toThrow(/unsupported schema version/);
   });
 
@@ -211,14 +230,30 @@ describe('authAccounts registry persistence', () => {
     expect(() => loadRegistryStrict(path)).toThrow();
   });
 
-  it('fences older writers on a selection even with no slots left to fence on', () => {
-    // A v1 write carrying a selector would load fine on an old build, which
-    // ignores the unknown field and runs the default identity — the silent
-    // substitution the whole feature exists to prevent.
-    const selectorOnly = { ...base, activeAuthAccount: 'alt' };
-    const registry = { ...emptyRegistry(), providers: [selectorOnly as RegistryProvider] };
+  it('fences a selection behind its OWN schema version, not the slot version', () => {
+    // Version 2 is not a fence for this: a build from before the selector
+    // existed ACCEPTS 2, parses the slots, drops the unknown
+    // `activeAuthAccount`, and saves back without it — after which every
+    // launch quietly reverts to the provider default. Only a version that
+    // build rejects actually protects the selection.
+    const registry = {
+      ...emptyRegistry(),
+      providers: [{ ...withSlots, activeAuthAccount: 'alt' } as RegistryProvider],
+    };
     withRegistryWriteLockSync(() => saveRegistry(registry, path), { lockPath: `${path}.lock` });
+    expect(JSON.parse(readFileSync(path, 'utf8')).schemaVersion).toBe(3);
+    expect(loadRegistryStrict(path).providers[0]!.activeAuthAccount).toBe('alt');
+
+    // Clearing the selection returns to the slot version, so older builds
+    // interoperate again the moment no selector state exists.
+    const cleared = { ...emptyRegistry(), providers: [structuredClone(withSlots)] };
+    withRegistryWriteLockSync(() => saveRegistry(cleared, path), { lockPath: `${path}.lock` });
     expect(JSON.parse(readFileSync(path, 'utf8')).schemaVersion).toBe(2);
+  });
+
+  it('rejects a schema version newer than this build understands', () => {
+    writeFileSync(path, `${JSON.stringify({ schemaVersion: 4, providers: [] })}\n`);
+    expect(() => loadRegistryStrict(path)).toThrow(/unsupported schema version/);
   });
 
   it('slot credentials count as live references for reconciliation', () => {
