@@ -72,6 +72,18 @@ export interface RegistryProvider {
    * launch without touching the default `authRef`.
    */
   authAccounts?: Record<string, { authRef: string; addedAt: string; oauthAccountId?: string }>;
+  /**
+   * The `authAccounts` slot every launch uses, so the running identity does not
+   * depend on remembering an environment variable. Absent means the provider's
+   * own default credential. CLODEX_OAUTH_ACCOUNT still overrides it for a
+   * single run.
+   *
+   * Only the NAME SHAPE is enforced when the registry loads. A name that no
+   * longer matches a slot is rejected at apply time instead: rejecting it at
+   * load would drop the entire provider record, so a stale selector would make
+   * the provider silently vanish from the CLI rather than say what is wrong.
+   */
+  activeAuthAccount?: string;
   subscriptionFilter?: RegistrySubscriptionFilter;
   /** Keep provider/curated costs instead of replacing them with the global pricing cache. */
   preserveModelPricing?: boolean;

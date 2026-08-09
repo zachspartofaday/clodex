@@ -68,6 +68,44 @@ describe('applySelectedOAuthAccount', () => {
   });
 });
 
+describe('the stored account selection', () => {
+  const withActive: RegistryProvider = { ...withSlots, activeAuthAccount: 'alt' };
+
+  it('launches as the stored account when nothing is passed', () => {
+    // The whole point of persisting it: no environment variable to remember,
+    // and forgetting one no longer silently runs the default identity.
+    expect(applySelectedOAuthAccount(withActive, undefined).authRef)
+      .toBe(withSlots.authAccounts!.alt!.authRef);
+  });
+
+  it('lets an explicit selector override the stored one for a single run', () => {
+    expect(applySelectedOAuthAccount(withActive, 'work').authRef)
+      .toBe(withSlots.authAccounts!.work!.authRef);
+    // ...without disturbing the stored choice every other launch reads.
+    expect(withActive.activeAuthAccount).toBe('alt');
+  });
+
+  it('still returns the provider default when neither is set', () => {
+    expect(applySelectedOAuthAccount(withSlots, undefined)).toBe(withSlots);
+  });
+
+  it('points a stale stored selector at the repair path, not the add path', () => {
+    // Distinct from the environment message on purpose: this account was
+    // chosen deliberately and its slot is gone, so the fix is to choose
+    // again — and it must never quietly fall back to the default identity.
+    const stale: RegistryProvider = { ...withSlots, activeAuthAccount: 'personal' };
+    expect(() => applySelectedOAuthAccount(stale, undefined)).toThrow(
+      /is set to use account "personal", which no longer exists \(available: alt, work\).*clodex providers/s,
+    );
+    expect(() => applySelectedOAuthAccount(stale, undefined)).not.toThrow(/CLODEX_OAUTH_ACCOUNT=/);
+  });
+
+  it('ignores a stored selector on a provider that cannot launch', () => {
+    const disabled: RegistryProvider = { ...withSlots, enabled: false, activeAuthAccount: 'personal' };
+    expect(applySelectedOAuthAccount(disabled, undefined)).toBe(disabled);
+  });
+});
+
 describe('selection on disabled providers', () => {
   it('ignores the selector on a disabled provider instead of throwing', () => {
     // A disabled slotted provider cannot participate in the launch; a stale
@@ -146,6 +184,41 @@ describe('authAccounts registry persistence', () => {
 
     writeFileSync(path, `${JSON.stringify({ schemaVersion: 3, providers: [] })}\n`);
     expect(() => loadRegistryStrict(path)).toThrow(/unsupported schema version/);
+  });
+
+  it('the stored selection survives load → save-back → load', () => {
+    writeFileSync(path, registryWith({ ...withSlots, activeAuthAccount: 'alt' }));
+    const loaded = loadRegistry(path);
+    expect(loaded.providers[0]!.activeAuthAccount).toBe('alt');
+    withRegistryWriteLockSync(() => saveRegistry(loaded, path), { lockPath: `${path}.lock` });
+    expect(loadRegistryStrict(path).providers[0]!.activeAuthAccount).toBe('alt');
+  });
+
+  it('keeps a stale-but-well-formed selection loadable so the provider can be repaired', () => {
+    // Rejecting it at load would drop the provider record entirely, so the
+    // account would vanish from `clodex providers` — the one screen that can
+    // fix it. It has to survive the load and fail when a launch applies it.
+    writeFileSync(path, registryWith({ ...withSlots, activeAuthAccount: 'ghost' }));
+    const loaded = loadRegistry(path);
+    expect(loaded.providers).toHaveLength(1);
+    expect(loaded.providers[0]!.activeAuthAccount).toBe('ghost');
+    expect(() => applySelectedOAuthAccount(loaded.providers[0]!, undefined)).toThrow(/no longer exists/);
+  });
+
+  it('fails closed on a selection the picker could never have written', () => {
+    writeFileSync(path, registryWith({ ...withSlots, activeAuthAccount: 'Bad Name!' }));
+    expect(loadRegistry(path).providers).toHaveLength(0);
+    expect(() => loadRegistryStrict(path)).toThrow();
+  });
+
+  it('fences older writers on a selection even with no slots left to fence on', () => {
+    // A v1 write carrying a selector would load fine on an old build, which
+    // ignores the unknown field and runs the default identity — the silent
+    // substitution the whole feature exists to prevent.
+    const selectorOnly = { ...base, activeAuthAccount: 'alt' };
+    const registry = { ...emptyRegistry(), providers: [selectorOnly as RegistryProvider] };
+    withRegistryWriteLockSync(() => saveRegistry(registry, path), { lockPath: `${path}.lock` });
+    expect(JSON.parse(readFileSync(path, 'utf8')).schemaVersion).toBe(2);
   });
 
   it('slot credentials count as live references for reconciliation', () => {

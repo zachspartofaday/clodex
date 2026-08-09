@@ -103,11 +103,22 @@ vi.mock('../src/registry/lock.js', () => ({
       }
     }
   }),
-  withRegistryWriteLockSync: vi.fn(),
+  // Runs the operation for real and holds the lock flag while it does, so the
+  // saveRegistry mock's "write escaped its lock" assertion covers sync
+  // mutations too. A bare vi.fn() stub silently swallows the callback and
+  // returns undefined, which reads as a mutation helper that does nothing.
+  withRegistryWriteLockSync: vi.fn(<T>(operation: () => T): T => {
+    lockState.active = true;
+    try {
+      return operation();
+    } finally {
+      lockState.active = false;
+    }
+  }),
 }));
 
 import { deleteProviderCredential } from '../src/env.js';
-import { removeProviderFromRegistry } from '../src/registry/crud.js';
+import { removeProviderFromRegistry, setActiveOAuthAccount } from '../src/registry/crud.js';
 import {
   withCredentialMutationLock,
   withProviderMutationLock,
@@ -332,5 +343,59 @@ describe('registry provider removal', () => {
 
     expect(registryState.current.providers).toHaveLength(1);
     expect(registryState.current.providers[0]?.authRef).toContain('new-helper');
+  });
+});
+
+describe('setActiveOAuthAccount', () => {
+  beforeEach(() => {
+    lockState.active = false;
+    lockState.registryTail = Promise.resolve();
+    registryState.current = {
+      schemaVersion: 2,
+      providers: [
+        {
+          id: 'openai-oauth',
+          templateId: 'openai',
+          name: 'OpenAI (ChatGPT)',
+          enabled: true,
+          authRef: 'keyring:oauth:provider:openai-oauth::credential::v1:default',
+          authType: 'oauth',
+          authAccounts: {
+            varmez: { authRef: 'keyring:oauth:provider:openai-oauth:account:varmez::credential::v1:v', addedAt: '2026-08-09T00:00:00.000Z' },
+          },
+          api: { npm: '@ai-sdk/openai', url: 'https://api.openai.com/v1' },
+          addedAt: '2026-08-09T00:00:00.000Z',
+        },
+      ],
+    };
+  });
+
+  it('persists the chosen account', () => {
+    expect(setActiveOAuthAccount('openai-oauth', 'varmez')).toEqual({ updated: true, account: 'varmez' });
+    expect(registryState.current.providers[0]?.activeAuthAccount).toBe('varmez');
+  });
+
+  it('clears the field rather than storing a sentinel when returning to the default', () => {
+    setActiveOAuthAccount('openai-oauth', 'varmez');
+    expect(setActiveOAuthAccount('openai-oauth', undefined)).toEqual({ updated: true });
+    // Absent, not 'default': a slot may legitimately be NAMED "default", so a
+    // stored sentinel would be indistinguishable from selecting that slot.
+    expect('activeAuthAccount' in registryState.current.providers[0]!).toBe(false);
+  });
+
+  it('refuses a name with no slot so the registry cannot point at a missing account', () => {
+    // The state applySelectedOAuthAccount has to refuse to launch on, so it
+    // must be unreachable through the picker rather than merely diagnosed.
+    const result = setActiveOAuthAccount('openai-oauth', 'ghost');
+    expect(result.updated).toBe(false);
+    expect(result.error).toMatch(/no account named "ghost" \(available: varmez\)/);
+    expect(registryState.current.providers[0]?.activeAuthAccount).toBeUndefined();
+  });
+
+  it('reports an unknown provider instead of writing', () => {
+    expect(setActiveOAuthAccount('nope', 'varmez')).toEqual({
+      updated: false,
+      error: 'Provider not found: nope',
+    });
   });
 });

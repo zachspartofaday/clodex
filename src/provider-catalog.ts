@@ -82,8 +82,15 @@ export async function resolveProvidersForDisplay(): Promise<ProviderDisplayEntry
 
   for (const provider of reg.providers) {
     const accountNames = Object.keys(provider.authAccounts ?? {}).sort();
+    // Which identity a launch actually uses is the point of listing the slots
+    // at all, so it is marked inline rather than left to be inferred from a
+    // variable the operator has to remember setting.
+    const active = provider.activeAuthAccount ?? 'default';
+    const accountList = ['default', ...accountNames]
+      .map(name => (name === active ? `${name} (active)` : name))
+      .join(', ');
     const authLabel = accountNames.length
-      ? `${formatRegistryAuthLabel(provider)}; accounts: default, ${accountNames.join(', ')}`
+      ? `${formatRegistryAuthLabel(provider)}; accounts: ${accountList}`
       : formatRegistryAuthLabel(provider);
     entries.push({
       id: provider.id,

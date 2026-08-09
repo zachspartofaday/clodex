@@ -112,6 +112,10 @@ function parseProvider(raw: unknown): RegistryProvider | null {
     if (slots === null) return null;
     provider.authAccounts = slots;
   }
+  if (hasOwn(p, 'activeAuthAccount')) {
+    if (!isAccountName(p.activeAuthAccount)) return null;
+    provider.activeAuthAccount = p.activeAuthAccount;
+  }
   if (typeof p.refreshedAt === 'string') provider.refreshedAt = p.refreshedAt;
   if (p.modelsCache && typeof p.modelsCache === 'object') {
     const cache = p.modelsCache as { fetchedAt?: string; models?: unknown[] };
@@ -138,6 +142,15 @@ function hasOwn(record: Record<string, unknown>, key: string): boolean {
  * slot's tokens as unreferenced. A malformed slot therefore invalidates the
  * whole provider record instead of being skipped.
  */
+/**
+ * Shape check only, deliberately not a slot-membership check: see the
+ * `activeAuthAccount` doc comment on RegistryProvider for why a stale-but-
+ * well-formed name must survive the load and fail at apply time instead.
+ */
+function isAccountName(raw: unknown): raw is string {
+  return typeof raw === 'string' && OAUTH_ACCOUNT_NAME_RE.test(raw);
+}
+
 function parseAuthAccounts(raw: unknown): RegistryProvider['authAccounts'] | null {
   if (!raw || typeof raw !== 'object' || Array.isArray(raw)) return null;
   const out: NonNullable<RegistryProvider['authAccounts']> = {};
@@ -180,6 +193,9 @@ function hasValidStrictProviderFields(raw: unknown): boolean {
     return false;
   }
   if (hasOwn(provider, 'authAccounts') && parseAuthAccounts(provider.authAccounts) === null) {
+    return false;
+  }
+  if (hasOwn(provider, 'activeAuthAccount') && !isAccountName(provider.activeAuthAccount)) {
     return false;
   }
   if (hasOwn(provider, 'modelsCache')) {
@@ -286,8 +302,13 @@ export function saveRegistry(registry: ProviderRegistry, path = getProvidersPath
   assertRegistryWriteOwnership(path);
   // Slot state fences older writers via the schema version (see types.ts);
   // slot-free registries return to v1 so old builds interoperate again.
+  // `activeAuthAccount` counts as slot state: a writer that fenced only on the
+  // slots themselves could emit v1 carrying a selector, and an old build would
+  // load it, ignore the unknown field, and silently run the default identity —
+  // the exact substitution the fence exists to prevent.
   const hasSlots = registry.providers.some(
-    provider => provider.authAccounts && Object.keys(provider.authAccounts).length > 0,
+    provider => (provider.authAccounts && Object.keys(provider.authAccounts).length > 0)
+      || provider.activeAuthAccount !== undefined,
   );
   const schemaVersion = hasSlots ? REGISTRY_SCHEMA_VERSION_WITH_ACCOUNT_SLOTS : REGISTRY_SCHEMA_VERSION;
   const payload = `${JSON.stringify({ ...registry, schemaVersion }, null, 2)}\n`;

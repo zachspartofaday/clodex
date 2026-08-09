@@ -103,9 +103,10 @@ function isLegacyAnonymousCustomEndpoint(
 export const OAUTH_ACCOUNT_ENV = 'CLODEX_OAUTH_ACCOUNT';
 
 /**
- * Resolve the launch-selected OAuth account slot for a provider.
- * CLODEX_OAUTH_ACCOUNT=<name> swaps the provider's authRef for the named
- * slot's, so every downstream consumer — credential resolution, OAuth
+ * Resolve the selected OAuth account slot for a provider, highest precedence
+ * first: CLODEX_OAUTH_ACCOUNT, then the provider's stored `activeAuthAccount`,
+ * then its own default credential. The winner swaps the provider's authRef for
+ * that slot's, so every downstream consumer — credential resolution, OAuth
  * metadata, token refresh persistence — transparently uses that account.
  * Providers without slots ignore the selector (it only chooses among slots
  * where slots exist); naming a missing slot on a provider that has slots is
@@ -116,7 +117,11 @@ export function applySelectedOAuthAccount(
   provider: RegistryProvider,
   selected: string | undefined = process.env[OAUTH_ACCOUNT_ENV],
 ): RegistryProvider {
-  const name = selected?.trim();
+  const requested = selected?.trim();
+  // The environment wins so a single command can borrow another identity
+  // without disturbing the stored choice every other launch depends on.
+  const fromEnvironment = Boolean(requested);
+  const name = requested || provider.activeAuthAccount?.trim();
   if (!name) return provider;
   // A disabled provider cannot participate in the launch, so a stale selector
   // aimed at it must not throw and take the whole catalog load down.
@@ -126,9 +131,16 @@ export function applySelectedOAuthAccount(
   if (!slots || Object.keys(slots).length === 0) return provider;
   if (!Object.prototype.hasOwnProperty.call(slots, name)) {
     const available = Object.keys(slots).sort().join(', ');
+    // The stored selector reaches here only once its slot is gone, so it needs
+    // the repair path rather than the add-an-account one: the account was
+    // chosen deliberately, and falling back to the default would run every
+    // future launch as the wrong identity without ever saying so.
     throw new Error(
-      `CLODEX_OAUTH_ACCOUNT=${name}: provider "${provider.id}" has no account named "${name}" (available: ${available}). `
-      + 'Add it with: clodex providers auth openai --account ' + name,
+      fromEnvironment
+        ? `CLODEX_OAUTH_ACCOUNT=${name}: provider "${provider.id}" has no account named "${name}" (available: ${available}). `
+          + 'Add it with: clodex providers auth openai --account ' + name
+        : `Provider "${provider.id}" is set to use account "${name}", which no longer exists (available: ${available}). `
+          + 'Choose another with: clodex providers',
     );
   }
   return { ...provider, authRef: slots[name]!.authRef };

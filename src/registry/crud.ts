@@ -102,6 +102,41 @@ export async function removeProviderFromRegistry(
   return withProviderMutationLock(id, () => removeProviderWithinLifecycle(id, opts));
 }
 
+/**
+ * Persist which OAuth account slot the provider launches as. `undefined`
+ * restores the provider's own default credential.
+ *
+ * Membership is checked here, under the write lock, so the registry can never
+ * be left pointing at a slot that does not exist — the one state
+ * `applySelectedOAuthAccount` has to refuse to launch on.
+ */
+export function setActiveOAuthAccount(
+  id: string,
+  account: string | undefined,
+): { updated: boolean; account?: string; error?: string } {
+  return withRegistryWriteLockSync(() => {
+    const registry = loadRegistryStrict();
+    const provider = registry.providers.find(p => p.id === id);
+    if (!provider) return { updated: false, error: `Provider not found: ${id}` };
+    const name = account?.trim();
+    if (name) {
+      const slots = provider.authAccounts ?? {};
+      if (!Object.prototype.hasOwnProperty.call(slots, name)) {
+        const available = Object.keys(slots).sort().join(', ') || 'none';
+        return {
+          updated: false,
+          error: `${provider.name} has no account named "${name}" (available: ${available}).`,
+        };
+      }
+      provider.activeAuthAccount = name;
+    } else {
+      delete provider.activeAuthAccount;
+    }
+    saveRegistry(registry);
+    return { updated: true, ...(name ? { account: name } : {}) };
+  });
+}
+
 export function toggleProviderEnabled(id: string): { toggled: boolean; enabled?: boolean; error?: string } {
   return withRegistryWriteLockSync(() => {
     const registry = loadRegistryStrict();

@@ -184,5 +184,38 @@ describe('provider-catalog-display', () => {
       expect(entries[0]?.name).toBe('Groq');
       expect(entries[0]?.inRegistry).toBe(true);
     });
+
+    function saveSlotted(activeAuthAccount?: string): void {
+      const registry = emptyRegistry();
+      registry.providers.push({
+        id: 'openai-oauth',
+        templateId: 'openai',
+        name: 'OpenAI (ChatGPT)',
+        enabled: true,
+        authRef: 'keyring:oauth:provider:openai-oauth::credential::v1:default',
+        authType: 'oauth',
+        authAccounts: {
+          varmez: { authRef: 'keyring:oauth:provider:openai-oauth:account:varmez::credential::v1:v', addedAt: new Date().toISOString() },
+        },
+        ...(activeAuthAccount ? { activeAuthAccount } : {}),
+        api: { npm: '@ai-sdk/openai' },
+        addedAt: new Date().toISOString(),
+      });
+      withRegistryWriteLockSync(() => saveRegistry(registry));
+    }
+
+    it('marks which account a launch will actually use', async () => {
+      saveSlotted('varmez');
+      const entries = await resolveProvidersForDisplay();
+      expect(entries[0]?.authLabel).toContain('accounts: default, varmez (active)');
+    });
+
+    it('marks the provider default as active when nothing is stored', async () => {
+      // Listing the slots without saying which one runs is what let a session
+      // run as an unintended identity for hours without anything showing it.
+      saveSlotted(undefined);
+      const entries = await resolveProvidersForDisplay();
+      expect(entries[0]?.authLabel).toContain('accounts: default (active), varmez');
+    });
   });
 });

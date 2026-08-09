@@ -16,6 +16,7 @@ import {
 import { addProviderFromTemplate } from './registry/add-template.js';
 import {
   removeProviderFromRegistry,
+  setActiveOAuthAccount,
   toggleProviderEnabled,
 } from './registry/crud.js';
 import { reconcilePendingCredentialDeletes } from './registry/credential-lifecycle.js';
@@ -25,7 +26,7 @@ import { resolveRefreshCredential } from './registry/refresh-credentials.js';
 import { authenticateProvider, providerAuthHelpText, validateOAuthAccountName, type ProviderAuthMethod } from './registry/provider-auth.js';
 import { supportsNativeOAuth } from './oauth/types.js';
 import { browseAllModels } from './prompts.js';
-import { cachedModelToLocal } from './registry/materialize.js';
+import { cachedModelToLocal, OAUTH_ACCOUNT_ENV } from './registry/materialize.js';
 import { loadPreferences } from './config.js';
 import type { LocalProvider } from './types.js';
 import {
@@ -185,7 +186,7 @@ async function runProvidersAuthWithCleanupState(
     const slot = account === undefined ? undefined : validateOAuthAccountName(account);
     p.log.success(
       slot
-        ? `Signed in to ${result.registryProvider.name} (account "${slot}") — select it at launch with CLODEX_OAUTH_ACCOUNT=${slot}.`
+        ? `Signed in to ${result.registryProvider.name} (account "${slot}") — make it the account every launch uses with: clodex providers`
         : `Signed in to ${result.registryProvider.name} — credential saved to the credential store.`,
     );
     reportCredentialCleanup(result.credentialCleanupPending, cleanupState, true);
@@ -477,7 +478,15 @@ async function runProviderDetail(id: string): Promise<'back' | 'removed'> {
     detailOptions.push({
       value: 'auth',
       label: 'Sign in again (OAuth)',
-      hint: 'Refresh OAuth tokens or switch accounts',
+      hint: 'Refresh OAuth tokens or add another account',
+    });
+  }
+  const accountSlots = Object.keys(provider.authAccounts ?? {}).sort();
+  if (accountSlots.length > 0) {
+    detailOptions.push({
+      value: 'account',
+      label: 'Switch account',
+      hint: `Every launch currently uses ${provider.activeAuthAccount ?? 'default'}`,
     });
   }
   detailOptions.push(
@@ -522,6 +531,43 @@ async function runProviderDetail(id: string): Promise<'back' | 'removed'> {
     return 'back';
   }
 
+  if (action === 'account') {
+    // Not a bare 'default': OAUTH_ACCOUNT_NAME_RE accepts "default" as a slot
+    // name, so a real account could shadow the sentinel. This value cannot.
+    const providerDefault = '<default>';
+    const current = provider.activeAuthAccount ?? providerDefault;
+    const chosen = await p.select({
+      message: 'Which account should every launch use?',
+      initialValue: current,
+      options: [
+        {
+          value: providerDefault,
+          label: 'default',
+          hint: "the provider's original sign-in",
+        },
+        ...accountSlots.map(name => ({
+          value: name,
+          label: name,
+          hint: name === provider.activeAuthAccount ? 'current' : '',
+        })),
+      ],
+    });
+    // Only isCancel: a falsy check would read the sentinel as a cancellation.
+    if (p.isCancel(chosen)) return 'back';
+    const result = setActiveOAuthAccount(id, chosen === providerDefault ? undefined : chosen);
+    if (!result.updated) {
+      p.log.error(result.error ?? 'Could not switch account.');
+      return 'back';
+    }
+    p.log.success(
+      `${provider.name} will launch as ${result.account ?? 'the default account'}.`
+      + (process.env[OAUTH_ACCOUNT_ENV]
+        ? ` (${OAUTH_ACCOUNT_ENV} is set in this shell and overrides it.)`
+        : ''),
+    );
+    return 'back';
+  }
+
   if (action === 'toggle') {
     const result = toggleProviderEnabled(id);
     if (result.toggled) {
@@ -559,7 +605,7 @@ export async function runProvidersHub(): Promise<number> {
       options.push({
         value: 'auth-account',
         label: '→ Add another ChatGPT account',
-        hint: 'named slot; select at launch with CLODEX_OAUTH_ACCOUNT=<name>',
+        hint: 'named slot; pick which one launches via Switch account',
       });
     }
     if (entries.length > 0) {
@@ -589,7 +635,7 @@ export async function runProvidersHub(): Promise<number> {
     }
     if (choice === 'auth-account') {
       const name = await p.text({
-        message: 'Name for this account (you will select it at launch with CLODEX_OAUTH_ACCOUNT=<name>)',
+        message: 'Name for this account (choose which one launches with: clodex providers)',
         placeholder: 'work',
         validate: value => {
           try {
