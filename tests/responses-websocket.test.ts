@@ -1357,6 +1357,39 @@ describe('createResponsesWebSocketFetch', () => {
     expect(await classifyThroughSdk(await readAll(res))).toMatchObject({ statusCode: 429 });
   });
 
+  it('keeps a content-free fingerprint of what upstream actually said', async () => {
+    // The prose never reaches the client or the log, so the fingerprint is the
+    // ONLY evidence distinguishing two failures with the same type and code.
+    // failContext fingerprints the message it is given after spreading the
+    // details, so an errorMessage* pair passed in is overwritten by the
+    // summary's — the upstream one has to travel under its own keys.
+    const diagnostics: ResponsesWebSocketDiagnosticEvent[] = [];
+    const wsFetch = createResponsesWebSocketFetch(WS_URL, undefined, {
+      onDiagnostic: event => diagnostics.push(event),
+    });
+    const res = await wsFetch('https://x', { method: 'POST', headers: {}, body: '{}' });
+    const socket = lastSocket();
+    socket.emit('open');
+    socket.emit('message', Buffer.from(JSON.stringify({
+      type: 'response.failed',
+      response: {
+        id: 'r',
+        status: 'failed',
+        error: { type: 'server_error', message: 'sensitive backend explanation' },
+      },
+    })));
+    await readAll(res);
+
+    const record = diagnostics.find(event => event.event === 'ws_response_error') as
+      Record<string, unknown> | undefined;
+    expect(record).toBeTruthy();
+    expect(record!.upstreamMessageBytes).toBe(29);
+    expect(record!.upstreamMessageHash).toMatch(/^[a-f0-9]{16}$/);
+    // ...alongside, not instead of, the fingerprint of what the client was told.
+    expect(record!.errorMessageBytes).not.toBe(29);
+    expect(JSON.stringify(record)).not.toContain('sensitive backend explanation');
+  });
+
   it('names the upstream cause in the diagnostic when a terminal emitted nothing', async () => {
     const diagnostics: ResponsesWebSocketDiagnosticEvent[] = [];
     const wsFetch = createResponsesWebSocketFetch(WS_URL, undefined, {

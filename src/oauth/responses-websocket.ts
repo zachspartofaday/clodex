@@ -887,7 +887,7 @@ function boundedDiagnosticIdentifier(value: unknown): string | undefined {
 }
 
 function diagnosticTextFingerprint(
-  field: 'errorMessage' | 'closeReason',
+  field: 'errorMessage' | 'closeReason' | 'upstreamMessage',
   value: unknown,
 ): Record<string, unknown> {
   if (typeof value !== 'string' || value.length === 0) return {};
@@ -1760,6 +1760,14 @@ function handleSocketMessage(entry: ConnectionEntry, data: RawData): void {
         source: 'empty_failure_terminal',
         upstreamEventType: type,
         ...details,
+        // Under DISTINCT keys. `failContext` fingerprints the message it was
+        // given after spreading these, so an `errorMessage*` pair here is
+        // overwritten by the summary's — which would silently discard the only
+        // content-free evidence of what upstream actually said, and leave two
+        // failures with the same type and code indistinguishable. `errorMessage*`
+        // now means "what the client was told", `upstreamMessage*` means "what
+        // upstream said", and both survive.
+        ...diagnosticTextFingerprint('upstreamMessage', responseErrorMessage(event)),
       },
       statusCode,
       retryAfterSeconds,
