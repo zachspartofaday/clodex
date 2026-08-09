@@ -1607,10 +1607,30 @@ function handleSocketMessage(entry: ConnectionEntry, data: RawData): void {
   const errorStatus = type === 'error' && !ctx.emittedModelData
     ? responseErrorStatus(event)
     : undefined;
+  // A failure terminal with no HTTP status to map (`response.failed`,
+  // `response.incomplete`, or a bare `error` frame that named no status) is the
+  // same defect one layer over: forwarded verbatim it ends the stream having
+  // emitted nothing, so downstream reads a SUCCESSFUL, EMPTY 200 and renders a
+  // turn in which the model said nothing. That is indistinguishable from a
+  // deliberately silent turn, so the actual reason — a usage limit, a rejected
+  // reconstruction, an aborted response — never reaches the operator and the
+  // session simply appears to stop answering, one prompt after another.
+  //
+  // Gated on `!emittedModelData` for the same reason as the branch above: once
+  // model data is downstream the stream is committed and the existing
+  // partial-output path must keep handling it.
+  const emptyFailureTerminal = FAILURE_EVENT_TYPES.has(type ?? '')
+    && errorStatus === undefined
+    && !willRetry
+    && !ctx.emittedModelData;
   // One rejection, one diagnostic record. Without this gate a rejected request
   // emits both this record and `failContext`'s, under different `source` values
   // with disjoint fields, reading as two failures of one request.
-  if (FAILURE_EVENT_TYPES.has(type ?? '') && (errorStatus === undefined || willRetry)) {
+  if (
+    FAILURE_EVENT_TYPES.has(type ?? '')
+    && (errorStatus === undefined || willRetry)
+    && !emptyFailureTerminal
+  ) {
     emitResponseErrorDiagnostic(entry, ctx, {
       source: 'response_event',
       upstreamEventType: type,
@@ -1663,6 +1683,35 @@ function handleSocketMessage(entry: ConnectionEntry, data: RawData): void {
       },
       errorStatus,
       retryAfterSeconds,
+    );
+    return;
+  }
+
+  if (emptyFailureTerminal) {
+    const details = responseFailureDetails(event);
+    // The bounded identifiers are the whole diagnostic value here: they are what
+    // names `usage_limit_reached` (or whatever else) in the debug log the next
+    // time a session goes silent, without dumping upstream text.
+    const named = [details.errorType, details.errorCode, details.incompleteReason]
+      .filter((value): value is string => typeof value === 'string');
+    const reason = responseErrorMessage(event)
+      ?? `OpenAI ended the response with no output`
+        + (named.length ? ` (${named.join(' / ')})` : ` (${type})`);
+    // A usage limit is a real 429 however upstream chose to spell it. Mapping it
+    // to 502 instead would present an exhausted account as a server fault and
+    // spend the client's whole retry budget re-asking a question already answered.
+    const usageLimited = named.some(value => value.includes('usage_limit'));
+    failContext(
+      entry,
+      ctx,
+      reason,
+      {
+        source: 'empty_failure_terminal',
+        upstreamEventType: type,
+        ...details,
+      },
+      usageLimited ? 429 : 502,
+      usageLimited ? clampRetryAfterSeconds(responseRetryAfterSeconds(event)) : undefined,
     );
     return;
   }

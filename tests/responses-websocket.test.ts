@@ -1117,7 +1117,7 @@ describe('createResponsesWebSocketFetch', () => {
     // anyway, so only this shape can catch a future edit that starts consulting
     // that field and reports a lifecycle position as a status.
     ['a numeric response status', { type: 'error', error: { type: 'server_error', message: 'keep me' }, response: { status: 400 } }],
-  ])('leaves a frame carrying %s to the existing path', async (_label, frame) => {
+  ])('does not adopt %s as the mapped status', async (_label, frame) => {
     const wsFetch = createResponsesWebSocketFetch(WS_URL);
     const res = await wsFetch('https://x', {
       method: 'POST', headers: {}, body: JSON.stringify(sessionPayload([])),
@@ -1128,10 +1128,13 @@ describe('createResponsesWebSocketFetch', () => {
 
     const body = await readAll(res);
     expect(body).toContain('keep me');
-    // Not rewritten into a synthetic frame: no status was recovered, so the
-    // original is forwarded exactly as before this branch existed.
-    expect(body).not.toContain('"code":"200"');
-    expect(await classifyThroughSdk(body)).toBeUndefined();
+    // No status was recovered, so none of these shapes may be adopted as one.
+    // They now fail as a generic 502 rather than being forwarded verbatim: an
+    // `error` frame ends the stream, and forwarding it with nothing emitted
+    // hands the client a successful, EMPTY 200 — the silent-no-response defect.
+    // Pinning 502 keeps the original guard intact too, since an edit that
+    // started reading these fields would surface as 200/400 here.
+    expect(await classifyThroughSdk(body)).toMatchObject({ statusCode: 502 });
   });
 
   // Each message source the helper consults, pinned separately — otherwise a
@@ -1190,6 +1193,81 @@ describe('createResponsesWebSocketFetch', () => {
     expect(body).toContain('late failure');
     expect(body).toContain('"status":500');
     expect(body).not.toContain('"code":"500"');
+  });
+
+  // The silent-no-response defect. A failure terminal that names no HTTP status
+  // used to be forwarded verbatim with nothing emitted, so the client received a
+  // successful, EMPTY 200 and rendered a turn where the model said nothing —
+  // indistinguishable from deliberate silence, and the reason never surfaced.
+  it.each([
+    ['response.failed', {
+      type: 'response.failed',
+      response: { id: 'resp_x', status: 'failed', error: { type: 'server_error', message: 'why it died' } },
+    }],
+    ['response.incomplete', {
+      type: 'response.incomplete',
+      response: { id: 'resp_x', status: 'incomplete', incomplete_details: { reason: 'content_filter' } },
+    }],
+  ])('fails a %s terminal that emitted nothing instead of ending the stream empty', async (_label, frame) => {
+    const wsFetch = createResponsesWebSocketFetch(WS_URL);
+    const res = await wsFetch('https://x', { method: 'POST', headers: {}, body: '{}' });
+    const socket = lastSocket();
+    socket.emit('open');
+    socket.emit('message', Buffer.from(JSON.stringify(frame)));
+
+    expect(await classifyThroughSdk(await readAll(res))).toMatchObject({ statusCode: 502 });
+  });
+
+  it('maps an output-less usage limit to 429 rather than a server fault', async () => {
+    const wsFetch = createResponsesWebSocketFetch(WS_URL);
+    const res = await wsFetch('https://x', { method: 'POST', headers: {}, body: '{}' });
+    const socket = lastSocket();
+    socket.emit('open');
+    socket.emit('message', Buffer.from(JSON.stringify({
+      type: 'response.failed',
+      response: {
+        id: 'resp_x',
+        status: 'failed',
+        error: { type: 'usage_limit_reached', message: 'plan limit reached' },
+      },
+    })));
+
+    // An exhausted account is not a server fault: 502 would spend the client's
+    // whole retry budget re-asking a question upstream has already answered.
+    expect(await classifyThroughSdk(await readAll(res))).toMatchObject({ statusCode: 429 });
+  });
+
+  it('names the upstream cause in the diagnostic when a terminal emitted nothing', async () => {
+    const diagnostics: ResponsesWebSocketDiagnosticEvent[] = [];
+    const wsFetch = createResponsesWebSocketFetch(WS_URL, undefined, {
+      onDiagnostic: event => diagnostics.push(event),
+    });
+    const res = await withResponsesWebSocketDiagnosticContext(
+      { requestId: 'req-empty-terminal' },
+      () => wsFetch('https://x', { method: 'POST', headers: {}, body: '{}' }),
+    );
+    const socket = lastSocket();
+    socket.emit('open');
+    socket.emit('message', Buffer.from(JSON.stringify({
+      type: 'response.failed',
+      response: {
+        id: 'resp_x',
+        status: 'failed',
+        error: { type: 'usage_limit_reached', code: 'usage_limit_reached', message: 'plan limit reached' },
+      },
+    })));
+    await readAll(res);
+
+    // Exactly one record for one failure, carrying the bounded identifier that
+    // names the cause — this is what a silent session will be diagnosed from.
+    const records = diagnostics.filter(event => event.event === 'ws_response_error');
+    expect(records).toHaveLength(1);
+    expect(records[0]).toMatchObject({
+      source: 'empty_failure_terminal',
+      upstreamEventType: 'response.failed',
+      errorType: 'usage_limit_reached',
+      emittedModelData: false,
+    });
   });
 
   it('logs sanitized upstream response failure details after partial output', async () => {
