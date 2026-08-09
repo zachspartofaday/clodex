@@ -415,6 +415,27 @@ describe('resolveActiveAccount', () => {
       .toEqual({ kind: 'broken', name: 'ghost', fromEnvironment: false });
   });
 
+  it('keeps BOTH failures visible when the override is broken too', () => {
+    // Two independent breakages at once. Reporting only the override meant
+    // unsetting the variable traded one unexplained failure for another —
+    // the stored selection behind it was never mentioned.
+    const both = { ...withSlots, activeAuthAccount: 'ghost' } as RegistryProvider;
+    expect(resolveActiveAccount(both, { CLODEX_OAUTH_ACCOUNT: 'phantom' }))
+      .toEqual({ kind: 'broken', name: 'phantom', fromEnvironment: true, latentOrphan: 'ghost' });
+    // The hint says both, so fixing the variable is not a surprise halfway.
+    expect(accountSwitchHint(
+      { activeAuthAccount: 'ghost' },
+      { kind: 'broken', name: 'phantom', fromEnvironment: true, latentOrphan: 'ghost' },
+    )).toContain('stored "ghost" is missing too');
+  });
+
+  it('does not duplicate the name when only the stored selection is broken', () => {
+    // The broken name IS the stored one here; repeating it as a latent orphan
+    // would report one failure as two.
+    expect(resolveActiveAccount({ ...withSlots, activeAuthAccount: 'ghost' } as RegistryProvider, {}))
+      .toEqual({ kind: 'broken', name: 'ghost', fromEnvironment: false });
+  });
+
   it('does not invent a latent orphan for a healthy stored selection', () => {
     expect(resolveActiveAccount(oauth, { CLODEX_OAUTH_ACCOUNT: 'work' }))
       .toEqual({ kind: 'slot', name: 'work', fromEnvironment: true });

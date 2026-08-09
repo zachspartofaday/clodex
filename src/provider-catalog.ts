@@ -102,7 +102,7 @@ export type ActiveAccount =
   /** Launches on this named slot. */
   | { kind: 'slot'; name: string; fromEnvironment: boolean; latentOrphan?: string }
   /** Launches on nothing: this selector names no such slot. */
-  | { kind: 'broken'; name: string; fromEnvironment: boolean };
+  | { kind: 'broken'; name: string; fromEnvironment: boolean; latentOrphan?: string };
 
 /**
  * `latentOrphan` — a STORED selection that names no slot while something else
@@ -153,7 +153,10 @@ export function resolveActiveAccount(
     // The environment is ignored only where there is no slot table at all;
     // otherwise it names a missing slot and the launch throws on it.
     if (Object.keys(slots).length > 0) {
-      return { kind: 'broken', name: override, fromEnvironment: true };
+      // Both can be broken at once, and fixing the variable then reveals the
+      // second failure. Carried here too, or unsetting the override trades one
+      // silent breakage for another.
+      return { kind: 'broken', name: override, fromEnvironment: true, ...latentOrphan };
     }
   }
 
@@ -192,7 +195,9 @@ export async function resolveProvidersForDisplay(): Promise<ProviderDisplayEntry
     // Masked, not fixed. An override hides a broken stored selection only while
     // the variable is set; the listing has to say so, or it reads as healthy
     // right up until someone opens a shell without it.
-    const latent = effective.kind !== 'broken' ? effective.latentOrphan : undefined;
+    // Reported on a broken override too: the stored selection behind it is a
+    // second, independent failure that survives fixing the variable.
+    const latent = effective.latentOrphan;
     const label = (name: string, isActive: boolean): string => {
       if (!isActive) return name;
       return overrideApplies

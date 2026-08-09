@@ -228,8 +228,14 @@ export function accountSwitchHint(
   effective: ActiveAccount,
 ): string {
   if (effective.kind === 'broken') {
+    // A broken override can hide a second, independent breakage: the stored
+    // selection behind it. Unsetting the variable would otherwise just swap
+    // one unexplained failure for another.
+    const also = effective.latentOrphan
+      ? ` (and stored "${effective.latentOrphan}" is missing too)`
+      : '';
     return effective.fromEnvironment
-      ? `${OAUTH_ACCOUNT_ENV}=${effective.name} names no such account — every launch fails`
+      ? `${OAUTH_ACCOUNT_ENV}=${effective.name} names no such account — every launch fails${also}`
       : `Selected account "${effective.name}" no longer exists — every launch fails; clear it here`;
   }
   // A stored selection an override is masking is still broken; say so, or this
