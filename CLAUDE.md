@@ -135,5 +135,5 @@ Registry writes use atomic hard-link lock publication, so the filesystem contain
 - The `::ts::` separator in tool_use ids encodes reasoning signatures for round-tripping; would only break if a signature literally contained `::ts::`.
 - In endpoint switch-menu mode the displayed context window reflects the **launch** model and does not update on live `/model` switch (Claude Code fetches `/v1/models` once at startup). Proxy mode + `clodex patch` reports correct per-model windows.
 - Cost display in Claude Code is always inaccurate for OpenAI models (Claude Code applies its own pricing table).
-- `MAX_MODEL_CATALOG = 20` (`constants.ts`) — favorites cap and max catalog routes.
+- `MAX_FAVORITES = 100` is the persisted curation cap; `MAX_MODEL_CATALOG = 20` is the separate Claude-facing route, discovery, and patch cap. Every surface uses the first saved favorites in order and reports exact capacity omissions; an endpoint launch's separately exposed starting model consumes one catalog slot.
 - OpenAI catalog ids may differ from upstream API ids — `upstreamModelId` carries the real API id.
