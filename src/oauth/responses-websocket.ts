@@ -1312,17 +1312,9 @@ function failContext(
   diagnosticDetails: Record<string, unknown>,
   statusCode?: number,
   retryAfterSeconds?: number,
-  /**
-   * What to write to the persistent debug log, when that must differ from what
-   * the client is told. `message` reaches the operator's screen and can carry
-   * upstream prose worth reading; the log is a file users attach to bug
-   * reports, and `redactTraceLine` only strips known credential shapes.
-   * Defaults to `message`.
-   */
-  logMessage: string = message,
 ): void {
   if (ctx.closed || entry.current !== ctx) return;
-  entry.debug(`fail: ${logMessage}`);
+  entry.debug(`fail: ${message}`);
   emitResponseErrorDiagnostic(entry, ctx, {
     ...diagnosticDetails,
     ...diagnosticTextFingerprint('errorMessage', message),
@@ -1730,7 +1722,16 @@ function handleSocketMessage(entry: ConnectionEntry, data: RawData): void {
     // request upstream has already answered.
     const settledReason = details.incompleteReason === 'content_filter'
       || details.incompleteReason === 'max_output_tokens';
-    const classified = discriminator ? frameStatusCode(undefined, discriminator) : 500;
+    // errorCode passed as the CODE argument, not folded into the discriminator:
+    // frameStatusCode recognises a numeric HTTP code only through that first
+    // parameter, and clodex's own synthetic frames set `code` to the
+    // stringified status. Fold it in as prose instead and a terminal carrying
+    // `code: '401'` matches no rule, lands on the 500 default, and gets
+    // rewritten as a retryable 502.
+    const numericOrNamed = typeof details.errorCode === 'string' ? details.errorCode : undefined;
+    const classified = numericOrNamed !== undefined || discriminator
+      ? frameStatusCode(numericOrNamed, discriminator)
+      : 500;
     const statusCode = classified !== 500
       ? classified
       : settledReason ? 400 : 502;
@@ -1742,11 +1743,19 @@ function handleSocketMessage(entry: ConnectionEntry, data: RawData): void {
     const retryAfterSeconds = usageLimited && responseRetryAfterSeconds(event) !== undefined
       ? clampRetryAfterSeconds(responseRetryAfterSeconds(event))
       : undefined;
-    const reason = responseErrorMessage(event) ?? summary;
+    // The BOUNDED summary is the message, upstream's prose is not used at all.
+    // A `response.failed` body can echo request content or backend detail, and
+    // it does not stay in one place: the synthetic error is rethrown by the SDK
+    // and `proxy.ts` writes both the formatted message and `errorContent` to the
+    // persistent proxy log, which `redactTraceLine` only scrubs of known
+    // credential shapes. Protecting the immediate `fail:` line while the same
+    // text reaches disk one frame later is not protection. The summary names
+    // the cause — the identifiers are what diagnose a silent session — and the
+    // raw message survives as a length+hash in the diagnostic.
     failContext(
       entry,
       ctx,
-      retryAfterSeconds === undefined ? reason : `${reason}; retry after ${retryAfterSeconds}s`,
+      retryAfterSeconds === undefined ? summary : `${summary}; retry after ${retryAfterSeconds}s`,
       {
         source: 'empty_failure_terminal',
         upstreamEventType: type,
@@ -1754,12 +1763,6 @@ function handleSocketMessage(entry: ConnectionEntry, data: RawData): void {
       },
       statusCode,
       retryAfterSeconds,
-      // Logged INSTEAD of the reason. A `response.failed` body can echo request
-      // content or backend detail, and `redactTraceLine` only removes known
-      // credential shapes — so the raw text would survive on disk in a file
-      // users attach to bug reports. The bounded summary names the cause; the
-      // raw message is still recorded as a length+hash in the diagnostic.
-      summary,
     );
     return;
   }

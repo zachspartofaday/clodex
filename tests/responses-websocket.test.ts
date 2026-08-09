@@ -1127,14 +1127,17 @@ describe('createResponsesWebSocketFetch', () => {
     socket.emit('message', Buffer.from(JSON.stringify(frame)));
 
     const body = await readAll(res);
-    expect(body).toContain('keep me');
     // No status was recovered, so none of these shapes may be adopted as one.
-    // They now fail as a generic 502 rather than being forwarded verbatim: an
+    // They fail as a generic 502 rather than being forwarded verbatim: an
     // `error` frame ends the stream, and forwarding it with nothing emitted
     // hands the client a successful, EMPTY 200 — the silent-no-response defect.
     // Pinning 502 keeps the original guard intact too, since an edit that
     // started reading these fields would surface as 200/400 here.
     expect(await classifyThroughSdk(body)).toMatchObject({ statusCode: 502 });
+    // The cause is named from the bounded identifiers; upstream's own prose is
+    // deliberately not carried (see the log-safety test below).
+    expect(body).toContain('server_error');
+    expect(body).not.toContain('keep me');
   });
 
   // Each message source the helper consults, pinned separately — otherwise a
@@ -1262,6 +1265,20 @@ describe('createResponsesWebSocketFetch', () => {
     expect(overload).toMatchObject({ statusCode: 503 });
   });
 
+  it('routes a numeric error code through the classifier, not past it', async () => {
+    // frameStatusCode recognises a numeric HTTP code only via its `code`
+    // argument — clodex's own synthetic frames use that exact channel. Folded
+    // into the discriminator as prose instead, `code: '401'` matches no rule,
+    // lands on the 500 default, and is rewritten as a RETRYABLE 502.
+    for (const [code, expected] of [['401', 401], ['429', 429], ['503', 503]] as const) {
+      const verdict = await classifyThroughSdk(await failWith({
+        type: 'response.failed',
+        response: { id: 'r', status: 'failed', error: { code, message: 'x' } },
+      }));
+      expect(verdict, code).toMatchObject({ statusCode: expected });
+    }
+  });
+
   it('carries an output-less usage-limit backoff in the message text', async () => {
     // The AI SDK's chunk schema is a closed zod object that strips
     // `retry_after_seconds`, so a hint carried only in the frame field never
@@ -1289,10 +1306,15 @@ describe('createResponsesWebSocketFetch', () => {
     expect(await classifyThroughSdk(body)).toMatchObject({ statusCode: 429 });
   });
 
-  it('keeps an upstream failure message out of the debug log', async () => {
-    // A response.failed body can echo request content, and redactTraceLine only
-    // strips known credential shapes — so the raw text would survive on disk in
-    // a file users attach to bug reports. The client still sees it.
+  it('never carries upstream failure prose to the log OR the client', async () => {
+    // A response.failed body can echo request content, and it does not stay in
+    // one place: the synthetic error is rethrown by the SDK and proxy.ts writes
+    // both the formatted message and errorContent to the persistent proxy log,
+    // which redactTraceLine only scrubs of known credential shapes. Guarding
+    // the immediate `fail:` line while the same text reaches disk one frame
+    // later is not a guard — so the prose is not used at all. The bounded
+    // identifiers name the cause, and the raw text survives as a length+hash
+    // in the structured diagnostic.
     const logged: string[] = [];
     const wsFetch = createResponsesWebSocketFetch(WS_URL, line => logged.push(line));
     const res = await wsFetch('https://x', { method: 'POST', headers: {}, body: '{}' });
@@ -1308,10 +1330,11 @@ describe('createResponsesWebSocketFetch', () => {
     })));
     const body = await readAll(res);
 
-    expect(body).toContain('SECRET-ECHOED-PROMPT-CONTENT');
+    expect(body).not.toContain('SECRET-ECHOED-PROMPT-CONTENT');
+    expect(body).toContain('server_error');
+    expect(logged.join('\n')).not.toContain('SECRET-ECHOED-PROMPT-CONTENT');
     const failLines = logged.filter(line => line.includes('fail:'));
     expect(failLines.length).toBeGreaterThan(0);
-    expect(failLines.join('\n')).not.toContain('SECRET-ECHOED-PROMPT-CONTENT');
     expect(failLines.join('\n')).toContain('server_error');
   });
 
