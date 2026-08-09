@@ -310,8 +310,10 @@ export function saveRegistry(registry: ProviderRegistry, path = getProvidersPath
   // slot-free registries return to v1 so old builds interoperate again.
   // Highest state present wins, and the selector needs its OWN version: a
   // build predating it accepts version 2, parses the slots, drops the unknown
-  // `activeAuthAccount`, and saves back — silently reverting every later
-  // launch to the provider default. Only a version it rejects fences that.
+  // `activeAuthAccount`, and saves back without it. Version 3 stops that write.
+  // It does NOT stop such a build from LAUNCHING as the provider default —
+  // lenient loads never read this field — see the limitation on
+  // REGISTRY_SCHEMA_VERSION_WITH_ACTIVE_ACCOUNT.
   const hasSelector = registry.providers.some(provider => provider.activeAuthAccount !== undefined);
   const hasSlots = registry.providers.some(
     provider => provider.authAccounts && Object.keys(provider.authAccounts).length > 0,

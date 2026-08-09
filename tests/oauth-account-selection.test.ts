@@ -252,6 +252,22 @@ describe('authAccounts registry persistence', () => {
     expect(JSON.parse(readFileSync(path, 'utf8')).schemaVersion).toBe(2);
   });
 
+  it('fences MUTATION but not older launches, which no version number can', () => {
+    // The honest boundary. parseRegistryStrict throws on v3, so a pre-selector
+    // build cannot load-and-save the selector away. Its LENIENT loader never
+    // reads schemaVersion at all, so it still launches as the provider default
+    // — and that loader has already shipped, so no version can change it.
+    // Pinned so the limitation is a stated contract rather than a surprise.
+    writeFileSync(path, registryWith({ ...withSlots, activeAuthAccount: 'alt' })
+      .replace('"schemaVersion": 1', '"schemaVersion": 3'));
+    expect(loadRegistry(path).providers[0]!.activeAuthAccount).toBe('alt');
+    // A build that does not know v3 rejects it in every mutating path.
+    writeFileSync(path, `${JSON.stringify({ schemaVersion: 99, providers: [] })}\n`);
+    expect(() => loadRegistryStrict(path)).toThrow(/unsupported schema version/);
+    // ...while the lenient path shrugs, which is exactly the gap.
+    expect(loadRegistry(path).providers).toEqual([]);
+  });
+
   it('rejects a schema version newer than this build understands', () => {
     writeFileSync(path, `${JSON.stringify({ schemaVersion: 4, providers: [] })}\n`);
     expect(() => loadRegistryStrict(path)).toThrow(/unsupported schema version/);

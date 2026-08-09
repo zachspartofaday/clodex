@@ -22,10 +22,20 @@ export const REGISTRY_SCHEMA_VERSION_WITH_ACCOUNT_SLOTS = 2;
  * A DISTINCT version, not a reuse of the slot version: a build from before the
  * stored selector existed accepts version 2, parses the slots, silently
  * ignores the unknown `activeAuthAccount`, and saves the registry back without
- * it — after which every launch quietly reverts to the provider default
- * identity. Only a version that older build rejects actually fences the
- * selector. A registry whose selector is cleared falls back to 2 (or 1), so
- * older builds interoperate again as soon as no selector state exists.
+ * it. Version 3 stops that, because its strict loader throws on a version it
+ * does not know. A registry whose selector is cleared falls back to 2 (or 1),
+ * so older builds interoperate again as soon as no selector state exists.
+ *
+ * KNOWN LIMITATION — this fences MUTATION, not launches. Older builds reach
+ * the registry through the lenient `loadRegistry()`, which never reads
+ * `schemaVersion` at all, so a pre-selector installation sharing this
+ * CLODEX_HOME still parses the provider, discards the selector it does not
+ * know, and launches as the provider default. No version number can fix that:
+ * the loader that would have to reject it has already shipped. Closing it
+ * needs the persisted bytes to carry the selection somewhere an old build
+ * already reads — pointing `authRef` at the selected slot and parking the
+ * original elsewhere — which changes credential storage and is tracked
+ * separately rather than bolted on here.
  */
 export const REGISTRY_SCHEMA_VERSION_WITH_ACTIVE_ACCOUNT = 3;
 
