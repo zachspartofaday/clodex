@@ -22,6 +22,7 @@ import {
 } from './registry/crud.js';
 import { reconcilePendingCredentialDeletes } from './registry/credential-lifecycle.js';
 import { loadRegistry } from './registry/io.js';
+import type { RegistryProvider } from './registry/types.js';
 import { refreshAllProviderModels, refreshProviderModels } from './registry/refresh-models.js';
 import { resolveRefreshCredential } from './registry/refresh-credentials.js';
 import { authenticateProvider, providerAuthHelpText, validateOAuthAccountName, type ProviderAuthMethod } from './registry/provider-auth.js';
@@ -167,6 +168,22 @@ ${pc.bold('Subcommands:')}
   list        Show configured providers
   remove      Remove a provider by id
   refresh-models  Update cached model lists`;
+}
+
+/**
+ * Whether the provider detail menu offers "Switch account".
+ *
+ * Slots OR a stored selection — not slots alone. An orphaned selector (a
+ * selection whose slot table is gone, a state the parser and serializer
+ * deliberately accept) makes every launch fail with advice to come here and
+ * clear it, so gating on slots would hide the one repair the error recommends
+ * and leave re-authenticating or hand-editing the registry as the only ways out.
+ */
+export function shouldOfferAccountSwitch(
+  provider: Pick<RegistryProvider, 'authAccounts' | 'activeAuthAccount'>,
+): boolean {
+  return Object.keys(provider.authAccounts ?? {}).length > 0
+    || provider.activeAuthAccount !== undefined;
 }
 
 function providerLabel(name: string, modelCount: number, enabled: boolean): string {
@@ -483,11 +500,13 @@ async function runProviderDetail(id: string): Promise<'back' | 'removed'> {
     });
   }
   const accountSlots = Object.keys(provider.authAccounts ?? {}).sort();
-  if (accountSlots.length > 0) {
+  if (shouldOfferAccountSwitch(provider)) {
     detailOptions.push({
       value: 'account',
       label: 'Switch account',
-      hint: `Every launch currently uses ${provider.activeAuthAccount ?? PROVIDER_DEFAULT_ACCOUNT_LABEL}`,
+      hint: accountSlots.length === 0
+        ? `Selected account "${provider.activeAuthAccount}" no longer exists — clear it here`
+        : `Every launch currently uses ${provider.activeAuthAccount ?? PROVIDER_DEFAULT_ACCOUNT_LABEL}`,
     });
   }
   detailOptions.push(
@@ -536,7 +555,12 @@ async function runProviderDetail(id: string): Promise<'back' | 'removed'> {
     // Not a bare 'default': OAUTH_ACCOUNT_NAME_RE accepts "default" as a slot
     // name, so a real account could shadow the sentinel. This value cannot.
     const providerDefault = '<default>';
-    const current = provider.activeAuthAccount ?? providerDefault;
+    // An orphaned selector names a slot that is gone, so it cannot be the
+    // initial value — the widget would open on an option that is not in the
+    // list. Landing on the provider default is also the repair such a user came
+    // here to perform.
+    const stored = provider.activeAuthAccount;
+    const current = stored !== undefined && accountSlots.includes(stored) ? stored : providerDefault;
     const chosen = await p.select({
       message: 'Which account should every launch use?',
       initialValue: current,

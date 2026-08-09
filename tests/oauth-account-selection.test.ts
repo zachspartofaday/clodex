@@ -3,6 +3,7 @@ import { mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { applySelectedOAuthAccount } from '../src/registry/materialize.js';
+import { shouldOfferAccountSwitch } from '../src/providers-command.js';
 import { emptyRegistry, loadRegistry, loadRegistryStrict, saveRegistry } from '../src/registry/io.js';
 import { credentialIsReferenced } from '../src/registry/credential-lifecycle.js';
 import { withRegistryWriteLockSync } from '../src/registry/lock.js';
@@ -274,5 +275,24 @@ describe('oauthProviderIdFromAccount', () => {
     expect(oauthProviderIdFromAccount('oauth:provider:openai-oauth:account:work')).toBe('openai-oauth');
     expect(oauthProviderIdFromAccount('oauth:provider:openai-oauth')).toBe('openai-oauth');
     expect(oauthProviderIdFromAccount('provider:openai')).toBeNull();
+  });
+});
+
+describe('shouldOfferAccountSwitch', () => {
+  it('offers the switch when slots exist', () => {
+    expect(shouldOfferAccountSwitch({ authAccounts: { varmez: { authRef: 'k', addedAt: 'x' } } })).toBe(true);
+  });
+
+  it('offers the switch for an ORPHANED selector, so the advertised repair is reachable', () => {
+    // Launch now throws for this state and tells the user to fix it with
+    // `clodex providers`. Gating the action on slots would hide that repair and
+    // leave re-authenticating or hand-editing the registry as the only ways out.
+    expect(shouldOfferAccountSwitch({ activeAuthAccount: 'varmez' })).toBe(true);
+    expect(shouldOfferAccountSwitch({ authAccounts: {}, activeAuthAccount: 'varmez' })).toBe(true);
+  });
+
+  it('stays hidden for a provider with neither', () => {
+    expect(shouldOfferAccountSwitch({})).toBe(false);
+    expect(shouldOfferAccountSwitch({ authAccounts: {} })).toBe(false);
   });
 });
