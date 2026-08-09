@@ -1,6 +1,10 @@
 // src/env.ts
 import { CONFLICTING_ENV_VARS } from './constants.js';
-import { applyBuiltinModelOverridesWithProvenance, SESSION_PROXY_ENV } from './builtin-alias-env.js';
+import {
+  applyBuiltinModelOverridesWithProvenance,
+  SESSION_PROXY_ENV,
+  SONNET_DEFAULT_PROBE_MARKER_ENV,
+} from './builtin-alias-env.js';
 export { BUILTIN_ALIAS_ENV, applyBuiltinModelOverrides } from './builtin-alias-env.js';
 import {
   createCipheriv,
@@ -74,6 +78,16 @@ export function buildChildEnv(
   for (const name of CONFLICTING_ENV_VARS) {
     delete env[name];
   }
+  // That sweep always drops ANTHROPIC_DEFAULT_SONNET_MODEL, so a probe marker
+  // surviving it describes a value this env no longer has. Left in place it is
+  // inherited unpaired by endpoint descendants and later native launches, where
+  // an explicit ANTHROPIC_DEFAULT_SONNET_MODEL set to the same value would be
+  // mistaken for a clodex injection and bypassed for auto-mode classification.
+  //
+  // Deleted here rather than added to CONFLICTING_ENV_VARS on purpose:
+  // buildHttpProxyChildEnv sweeps the same list but PRESERVES an explicit
+  // sonnet default, and there the marker is the parent's own valid provenance.
+  delete env[SONNET_DEFAULT_PROBE_MARKER_ENV];
   env['ANTHROPIC_BASE_URL'] = proxyPort
     ? `http://127.0.0.1:${proxyPort}`
     : baseUrl;
