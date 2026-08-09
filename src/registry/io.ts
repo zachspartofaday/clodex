@@ -16,12 +16,13 @@ import {
 } from 'node:fs';
 import { dirname } from 'node:path';
 import { getAppHome, getProvidersPath } from '../paths.js';
-import type { ProviderRegistry, RegistryProvider } from './types.js';
+import type { ProviderRegistry, RegistryModelsCache, RegistryProvider } from './types.js';
 import {
   OAUTH_ACCOUNT_NAME_RE,
   REGISTRY_SCHEMA_VERSION,
   REGISTRY_SCHEMA_VERSION_WITH_ACCOUNT_SLOTS,
   REGISTRY_SCHEMA_VERSION_WITH_ACTIVE_ACCOUNT,
+  REGISTRY_SCHEMA_VERSION_WITH_ACCOUNT_MODEL_CACHES,
 } from './types.js';
 import {
   assertRegistryWriteOwnership,
@@ -122,17 +123,8 @@ function parseProvider(raw: unknown): RegistryProvider | null {
     provider.activeAuthAccount = p.activeAuthAccount;
   }
   if (typeof p.refreshedAt === 'string') provider.refreshedAt = p.refreshedAt;
-  if (p.modelsCache && typeof p.modelsCache === 'object') {
-    const cache = p.modelsCache as { fetchedAt?: string; models?: unknown[] };
-    if (typeof cache.fetchedAt === 'string' && Array.isArray(cache.models)) {
-      provider.modelsCache = {
-        fetchedAt: cache.fetchedAt,
-        models: cache.models.filter(m => m && typeof m === 'object') as RegistryProvider['modelsCache'] extends infer C
-          ? C extends { models: infer M } ? M : never
-          : never,
-      };
-    }
-  }
+  const modelsCache = parseModelsCache(p.modelsCache);
+  if (modelsCache) provider.modelsCache = modelsCache;
   return provider;
 }
 
@@ -140,13 +132,6 @@ function hasOwn(record: Record<string, unknown>, key: string): boolean {
   return Object.prototype.hasOwnProperty.call(record, key);
 }
 
-/**
- * Named OAuth account slots must survive a registry load intact and are
- * fail-closed: a silently dropped slot would revert a CLODEX_OAUTH_ACCOUNT
- * launch to the default identity and let credential reconciliation delete the
- * slot's tokens as unreferenced. A malformed slot therefore invalidates the
- * whole provider record instead of being skipped.
- */
 /**
  * Shape check only, deliberately not a slot-membership check: see the
  * `activeAuthAccount` doc comment on RegistryProvider for why a stale-but-
@@ -156,6 +141,26 @@ function isAccountName(raw: unknown): raw is string {
   return typeof raw === 'string' && OAUTH_ACCOUNT_NAME_RE.test(raw);
 }
 
+function parseModelsCache(raw: unknown): RegistryModelsCache | null {
+  if (!raw || typeof raw !== 'object' || Array.isArray(raw)) return null;
+  const cache = raw as Record<string, unknown>;
+  if (typeof cache.fetchedAt !== 'string' || !Array.isArray(cache.models)) return null;
+  if (cache.models.some(model => !model || typeof model !== 'object' || Array.isArray(model))) {
+    return null;
+  }
+  return {
+    fetchedAt: cache.fetchedAt,
+    models: cache.models as RegistryModelsCache['models'],
+  };
+}
+
+/**
+ * Named OAuth account slots must survive a registry load intact and are
+ * fail-closed: a silently dropped slot would revert a CLODEX_OAUTH_ACCOUNT
+ * launch to the default identity and let credential reconciliation delete the
+ * slot's tokens as unreferenced. A malformed slot therefore invalidates the
+ * whole provider record instead of being skipped.
+ */
 function parseAuthAccounts(raw: unknown): RegistryProvider['authAccounts'] | null {
   if (!raw || typeof raw !== 'object' || Array.isArray(raw)) return null;
   const out: NonNullable<RegistryProvider['authAccounts']> = {};
@@ -168,10 +173,15 @@ function parseAuthAccounts(raw: unknown): RegistryProvider['authAccounts'] | nul
     if (hasOwn(slot, 'oauthAccountId') && (typeof slot.oauthAccountId !== 'string' || !slot.oauthAccountId)) {
       return null;
     }
+    const modelsCache = hasOwn(slot, 'modelsCache')
+      ? parseModelsCache(slot.modelsCache)
+      : undefined;
+    if (hasOwn(slot, 'modelsCache') && !modelsCache) return null;
     out[name] = {
       authRef: slot.authRef,
       addedAt: slot.addedAt,
       ...(typeof slot.oauthAccountId === 'string' ? { oauthAccountId: slot.oauthAccountId } : {}),
+      ...(modelsCache ? { modelsCache } : {}),
     };
   }
   return out;
@@ -204,15 +214,7 @@ function hasValidStrictProviderFields(raw: unknown): boolean {
     return false;
   }
   if (hasOwn(provider, 'modelsCache')) {
-    const cache = provider.modelsCache;
-    if (!cache || typeof cache !== 'object' || Array.isArray(cache)) return false;
-    const fields = cache as Record<string, unknown>;
-    if (typeof fields.fetchedAt !== 'string' || !Array.isArray(fields.models)) {
-      return false;
-    }
-    if (fields.models.some(model => !model || typeof model !== 'object' || Array.isArray(model))) {
-      return false;
-    }
+    if (parseModelsCache(provider.modelsCache) === null) return false;
   }
   return true;
 }
@@ -247,6 +249,7 @@ function parseRegistryStrict(raw: unknown): ProviderRegistry {
     data.schemaVersion !== REGISTRY_SCHEMA_VERSION
     && data.schemaVersion !== REGISTRY_SCHEMA_VERSION_WITH_ACCOUNT_SLOTS
     && data.schemaVersion !== REGISTRY_SCHEMA_VERSION_WITH_ACTIVE_ACCOUNT
+    && data.schemaVersion !== REGISTRY_SCHEMA_VERSION_WITH_ACCOUNT_MODEL_CACHES
   ) {
     throw new Error('Provider registry has an unsupported schema version.');
   }
@@ -314,15 +317,20 @@ export function saveRegistry(registry: ProviderRegistry, path = getProvidersPath
   // It does NOT stop such a build from LAUNCHING as the provider default —
   // lenient loads never read this field — see the limitation on
   // REGISTRY_SCHEMA_VERSION_WITH_ACTIVE_ACCOUNT.
+  const hasAccountModelCaches = registry.providers.some(provider => (
+    Object.values(provider.authAccounts ?? {}).some(account => account.modelsCache !== undefined)
+  ));
   const hasSelector = registry.providers.some(provider => provider.activeAuthAccount !== undefined);
   const hasSlots = registry.providers.some(
     provider => provider.authAccounts && Object.keys(provider.authAccounts).length > 0,
   );
-  const schemaVersion = hasSelector
-    ? REGISTRY_SCHEMA_VERSION_WITH_ACTIVE_ACCOUNT
-    : hasSlots
-      ? REGISTRY_SCHEMA_VERSION_WITH_ACCOUNT_SLOTS
-      : REGISTRY_SCHEMA_VERSION;
+  const schemaVersion = hasAccountModelCaches
+    ? REGISTRY_SCHEMA_VERSION_WITH_ACCOUNT_MODEL_CACHES
+    : hasSelector
+      ? REGISTRY_SCHEMA_VERSION_WITH_ACTIVE_ACCOUNT
+      : hasSlots
+        ? REGISTRY_SCHEMA_VERSION_WITH_ACCOUNT_SLOTS
+        : REGISTRY_SCHEMA_VERSION;
   const payload = `${JSON.stringify({ ...registry, schemaVersion }, null, 2)}\n`;
   const backup = `${path}.bak`;
   if (existsSync(path)) {

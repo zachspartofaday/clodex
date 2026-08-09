@@ -29,7 +29,7 @@ import { refreshAllProviderModels, refreshProviderModelsWithCredential } from '.
 import { authenticateProvider, providerAuthHelpText, validateOAuthAccountName, type ProviderAuthMethod } from './registry/provider-auth.js';
 import { supportsNativeOAuth } from './oauth/types.js';
 import { browseAllModels } from './prompts.js';
-import { cachedModelToLocal } from './registry/materialize.js';
+import { applySelectedOAuthAccount, cachedModelToLocal } from './registry/materialize.js';
 import { OAUTH_ACCOUNT_ENV } from './oauth-account-selection.js';
 import { loadPreferences } from './config.js';
 import type { LocalProvider } from './types.js';
@@ -425,7 +425,10 @@ export async function runProvidersAuth(providerId: string, method?: ProviderAuth
 
 export async function runProvidersRefreshModels(
   providerId?: string,
-  options: { accountOverride?: string | null } = {},
+  options: {
+    accountOverride?: string | null;
+    ignoreProviderCredentialOverride?: boolean;
+  } = {},
 ): Promise<number> {
   const resolveKey = async (provider: import('./registry/types.js').RegistryProvider) =>
     resolveProviderCredentialWithSource(provider.id, provider.authRef);
@@ -446,8 +449,14 @@ export async function runProvidersRefreshModels(
     try {
       result = await refreshProviderModelsWithCredential(
         providerId,
-        async candidate => resolveProviderCredentialWithSource(candidate.id, candidate.authRef),
+        async candidate => resolveProviderCredentialWithSource(
+          candidate.id,
+          candidate.authRef,
+          undefined,
+          { ignoreProviderOverride: options.ignoreProviderCredentialOverride },
+        ),
         accountOverride,
+        { ignoreProviderOverride: options.ignoreProviderCredentialOverride },
       );
     } catch (err) {
       spinner.stop('');
@@ -689,7 +698,17 @@ async function runProviderDetail(id: string): Promise<'back' | 'removed'> {
   const provider = registry.providers.find(pr => pr.id === id);
   if (!provider) return 'back';
 
-  const modelCount = provider.modelsCache?.models.length ?? 0;
+  // The detail/browse surface must describe the same account a launch from
+  // this process will use. If the selection is broken, fail closed to an
+  // empty catalog while leaving the account controls available for repair.
+  let modelProvider: RegistryProvider;
+  try {
+    modelProvider = applySelectedOAuthAccount(provider);
+  } catch {
+    modelProvider = { ...provider };
+    delete modelProvider.modelsCache;
+  }
+  const modelCount = modelProvider.modelsCache?.models.length ?? 0;
   const authLabel = formatRegistryAuthLabel(provider);
   printProviderDetailPanel(provider.name, modelCount, authLabel);
 
@@ -751,9 +770,9 @@ async function runProviderDetail(id: string): Promise<'back' | 'removed'> {
   if (p.isCancel(action) || action === 'back') return 'back';
 
   if (action === 'browse') {
-    const cachedModels = provider.modelsCache?.models ?? [];
+    const cachedModels = modelProvider.modelsCache?.models ?? [];
     const localModels = cachedModels
-      .map(m => cachedModelToLocal(m, provider))
+      .map(m => cachedModelToLocal(m, modelProvider))
       .filter((m): m is NonNullable<typeof m> => m !== null);
     const localProvider: LocalProvider = {
       id: provider.id,
@@ -806,7 +825,7 @@ async function runProviderDetail(id: string): Promise<'back' | 'removed'> {
     });
     // Only isCancel: a falsy check would read the sentinel as a cancellation.
     if (p.isCancel(chosen)) return 'back';
-    const result = setActiveOAuthAccount(id, chosen === providerDefault ? undefined : chosen);
+    const result = await setActiveOAuthAccount(id, chosen === providerDefault ? undefined : chosen);
     if (!result.updated) {
       p.log.error(result.error ?? 'Could not switch account.');
       return 'back';
@@ -831,15 +850,20 @@ async function runProviderDetail(id: string): Promise<'back' | 'removed'> {
       result.changed,
     );
     if (restartWarning) p.log.warn(restartWarning);
-    // The catalog belongs to the credential identity. The write above clears
-    // it atomically on a real transition; refresh immediately so a failure
-    // leaves an empty cache rather than advertising the previous account's
-    // entitlements. A no-op preserves and does not re-fetch the valid cache.
+    // The catalog belongs to the credential identity. The write above parks
+    // the old account's cache and projects only a cache already owned by the
+    // selected identity; refresh immediately to rebuild or update it. A no-op
+    // preserves and does not re-fetch the valid cache.
     // This refresh belongs to the persisted transition, not to a temporary
     // per-process account override. Explicit refresh commands still honor the
     // environment; the switch refresh deliberately rebuilds the cache for the
     // identity every future launch will use after that override is unset.
-    if (result.changed) await runProvidersRefreshModels(id, { accountOverride: null });
+    if (result.changed) {
+      await runProvidersRefreshModels(id, {
+        accountOverride: null,
+        ignoreProviderCredentialOverride: true,
+      });
+    }
     return 'back';
   }
 

@@ -294,20 +294,52 @@ function updateProviderCache(
   providerId: string,
   models: CachedModel[],
   baseUrl?: string,
+  credentialSnapshot?: RefreshCredentialSnapshot,
 ): void {
   const idx = registry.providers.findIndex(p => p.id === providerId);
   if (idx < 0) return;
   const now = new Date().toISOString();
   const existing = registry.providers[idx]!;
+  const modelsCache = { fetchedAt: now, models };
+  const selectedAccount = credentialSnapshot?.selectedAccount;
+  const temporaryAccount = isTemporaryAccountSelection(credentialSnapshot);
+  const authAccounts = selectedAccount && existing.authAccounts?.[selectedAccount.name]
+    ? {
+        ...existing.authAccounts,
+        [selectedAccount.name]: {
+          ...existing.authAccounts[selectedAccount.name]!,
+          modelsCache,
+        },
+      }
+    : existing.authAccounts;
   registry.providers[idx] = {
     ...existing,
-    refreshedAt: now,
     api: baseUrl ? { ...existing.api, url: baseUrl } : existing.api,
-    modelsCache: {
-      fetchedAt: now,
-      models,
-    },
+    ...(authAccounts ? { authAccounts } : {}),
+    ...(!temporaryAccount ? { refreshedAt: now, modelsCache } : {}),
   };
+}
+
+function isTemporaryAccountSelection(snapshot?: RefreshCredentialSnapshot): boolean {
+  return Boolean(
+    snapshot?.environmentAccount
+    && snapshot.selectedAccount
+    && snapshot.environmentAccount !== snapshot.activeAuthAccount,
+  );
+}
+
+function providerWithRefreshCache(
+  provider: RegistryProvider,
+  snapshot?: RefreshCredentialSnapshot,
+): RegistryProvider {
+  const selected = snapshot?.selectedAccount;
+  const temporary = isTemporaryAccountSelection(snapshot);
+  if (!temporary || !selected) return provider;
+  const projected = { ...provider };
+  const cache = provider.authAccounts?.[selected.name]?.modelsCache;
+  if (cache) projected.modelsCache = cache;
+  else delete projected.modelsCache;
+  return projected;
 }
 
 function providerDiscoveryInputsMatch(
@@ -342,7 +374,11 @@ function assertRefreshCredentialStillCurrent(
   }
   let currentSnapshot: RefreshCredentialSnapshot;
   try {
-    currentSnapshot = refreshCredentialSnapshot(current, snapshot.environmentAccount ?? null);
+    currentSnapshot = refreshCredentialSnapshot(
+      current,
+      snapshot.environmentAccount ?? null,
+      { ignoreProviderOverride: snapshot.ignoreProviderOverride },
+    );
   } catch {
     throw new Error('Provider account selection changed while models were refreshing.');
   }
@@ -380,27 +416,15 @@ export async function refreshProviderModels(
       };
     }
   }
+  const cacheProvider = providerWithRefreshCache(provider, credentialSnapshot);
 
   if (credentialSnapshot?.credentialOverride) {
     return skipWithCachedModels(
-      provider,
+      cacheProvider,
       `${credentialSnapshot.credentialOverride.variable} is a process-scoped provider credential override — `
       + 'skipped the persistent model refresh so another shell cannot inherit this credential\'s catalog.',
     );
   }
-  if (
-    provider.authType === 'oauth'
-    && credentialSnapshot?.environmentAccount
-    && credentialSnapshot.selectedAccount
-    && credentialSnapshot.environmentAccount !== credentialSnapshot.activeAuthAccount
-  ) {
-    return skipWithCachedModels(
-      provider,
-      `${OAUTH_ACCOUNT_ENV}=${credentialSnapshot.environmentAccount} temporarily selects a different account — `
-      + 'skipped the persistent model refresh so launches without that override cannot inherit its catalog.',
-    );
-  }
-
   const source = resolveModelSource(provider);
   if (source === 'manual-only') {
     return {
@@ -413,7 +437,10 @@ export async function refreshProviderModels(
   }
 
   try {
-    const previousModelCount = provider.modelsCache?.models.length ?? 0;
+    const previousModelCount = cacheProvider.modelsCache?.models.length ?? 0;
+    const hadPreviousRefresh = isTemporaryAccountSelection(credentialSnapshot)
+      ? cacheProvider.modelsCache !== undefined
+      : provider.refreshedAt !== undefined;
     let models: CachedModel[] = [];
     let baseUrl: string | undefined;
     let oauthFallbackReason: string | undefined;
@@ -429,13 +456,13 @@ export async function refreshProviderModels(
           reason: 'OAuth token not available — try signing in again with clodex providers auth.',
         };
       }
-      const oauthResult = await refreshOAuthProvider(provider, apiKey);
+      const oauthResult = await refreshOAuthProvider(cacheProvider, apiKey);
       const failureDetail = oauthResult.failureReason ? ` (${oauthResult.failureReason})` : '';
-      if (oauthResult.source === 'seed' && cachedModelCount(provider) > 0) {
+      if (oauthResult.source === 'seed' && cachedModelCount(cacheProvider) > 0) {
         // Live discovery failed — keep the existing cache (which may already include
         // models newer than the built-in fallback list) instead of overwriting it.
         return skipWithCachedModels(
-          provider,
+          cacheProvider,
           `Live model discovery failed${failureDetail} — kept your existing cached model list instead of `
           + "overwriting it with clodex's built-in fallback list. Try refreshing again later.",
         );
@@ -458,9 +485,9 @@ export async function refreshProviderModels(
       const keyOptional = template?.apiKeyOptional === true;
       const effectiveKey = keyOptional && isLikelyPlaceholderKey(apiKey) ? '' : apiKey;
       if (!keyOptional && isLikelyPlaceholderKey(effectiveKey)) {
-        if (cachedModelCount(provider) > 0) {
+        if (cachedModelCount(cacheProvider) > 0) {
           return skipWithCachedModels(
-            provider,
+            cacheProvider,
             'A placeholder API key is configured — kept cached model list. '
             + 'Add this provider again via clodex providers add with a real key to refresh live.',
           );
@@ -484,11 +511,11 @@ export async function refreshProviderModels(
       if (fetched.error) {
         if (
           (fetched.error.includes('rejected') || fetched.error.includes('401') || fetched.error.includes('403'))
-          && cachedModelCount(provider) > 0
+          && cachedModelCount(cacheProvider) > 0
         ) {
           return skipWithCachedModels(
-            provider,
-            `${fetched.error} Kept ${cachedModelCount(provider)} cached model${cachedModelCount(provider) === 1 ? '' : 's'} from import. `
+            cacheProvider,
+            `${fetched.error} Kept ${cachedModelCount(cacheProvider)} cached model${cachedModelCount(cacheProvider) === 1 ? '' : 's'} from import. `
             + 'Update your API key via clodex providers add if you need a live refresh.',
           );
         }
@@ -517,7 +544,7 @@ export async function refreshProviderModels(
       if (credentialSnapshot) {
         assertRefreshCredentialStillCurrent(currentProvider, credentialSnapshot);
       }
-      updateProviderCache(currentRegistry, providerId, enriched, baseUrl);
+      updateProviderCache(currentRegistry, providerId, enriched, baseUrl, credentialSnapshot);
       saveRegistry(currentRegistry);
     });
     enrichPricingAsync();
@@ -527,7 +554,7 @@ export async function refreshProviderModels(
       name: provider.name,
       ok: true,
       modelCount: enriched.length,
-      previousModelCount: provider.refreshedAt ? previousModelCount : undefined,
+      previousModelCount: hadPreviousRefresh ? previousModelCount : undefined,
       reason: oauthFallbackReason,
     };
   } catch (err) {
@@ -551,7 +578,7 @@ export async function refreshProviderModelsWithCredential(
   providerId: string,
   resolveKey: RefreshCredentialResolver,
   selected: string | null | undefined = process.env[OAUTH_ACCOUNT_ENV],
-  options: { requireEnabled?: boolean } = {},
+  options: { requireEnabled?: boolean; ignoreProviderOverride?: boolean } = {},
 ): Promise<RefreshProviderResult> {
   return withProviderMutationLock(providerId, async () => {
     const provider = loadRegistryStrict().providers.find(candidate => candidate.id === providerId);
@@ -568,8 +595,15 @@ export async function refreshProviderModelsWithCredential(
       };
     }
     const accountOverride = selected === null ? null : selected ?? process.env[OAUTH_ACCOUNT_ENV] ?? null;
-    const snapshot = refreshCredentialSnapshot(provider, accountOverride);
-    const resolved = await resolveRefreshCredentialWithSource(provider, resolveKey, accountOverride);
+    const snapshot = refreshCredentialSnapshot(provider, accountOverride, {
+      ignoreProviderOverride: options.ignoreProviderOverride,
+    });
+    const resolved = await resolveRefreshCredentialWithSource(
+      provider,
+      resolveKey,
+      accountOverride,
+      { ignoreProviderOverride: options.ignoreProviderOverride },
+    );
     if (!isDeepStrictEqual(resolved.credentialOverride, snapshot.credentialOverride)) {
       return {
         id: provider.id,

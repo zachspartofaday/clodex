@@ -111,11 +111,15 @@ export async function removeProviderFromRegistry(
  * be left pointing at a slot that does not exist — the one state
  * `applySelectedOAuthAccount` has to refuse to launch on.
  */
-export function setActiveOAuthAccount(
+export async function setActiveOAuthAccount(
   id: string,
   account: string | undefined,
-): { updated: boolean; changed?: boolean; account?: string; provider?: RegistryProvider; error?: string } {
-  return withRegistryWriteLockSync(() => {
+): Promise<{ updated: boolean; changed?: boolean; account?: string; provider?: RegistryProvider; error?: string }> {
+  // Account cache ownership and OAuth credential replacement are one provider
+  // mutation domain. Without this outer lock, a concurrent reauthentication
+  // can replace a deterministic slot credential while this switch parks that
+  // slot's old catalog, leaving new credentials paired with stale entitlements.
+  return withProviderMutationLock(id, () => withRegistryWriteLock(() => {
     const registry = loadRegistryStrict();
     const provider = registry.providers.find(p => p.id === id);
     if (!provider) return { updated: false, error: `Provider not found: ${id}` };
@@ -136,18 +140,31 @@ export function setActiveOAuthAccount(
     }
     const changed = previous !== name;
     if (changed) {
-      // Model availability is credential/account-specific. Invalidate under
-      // the same registry lock as the selection so no reader can observe the
-      // new identity paired with the old identity's catalog. The interactive
-      // command immediately attempts a targeted refresh after this mutation.
-      delete provider.modelsCache;
+      // Model availability is credential/account-specific. Park a named
+      // account's current cache, then expose only the selected account's known
+      // cache under the same lock. A cache miss fails closed until the
+      // interactive command's targeted refresh completes.
+      if (previous && provider.modelsCache && provider.authAccounts?.[previous]) {
+        provider.authAccounts[previous] = {
+          ...provider.authAccounts[previous],
+          modelsCache: provider.modelsCache,
+        };
+      }
+      const selectedCache = name ? provider.authAccounts?.[name]?.modelsCache : undefined;
+      if (selectedCache) {
+        provider.modelsCache = selectedCache;
+        provider.refreshedAt = selectedCache.fetchedAt;
+      } else {
+        delete provider.modelsCache;
+        delete provider.refreshedAt;
+      }
       saveRegistry(registry);
     }
     // Return the state that actually won the write lock. The provider may have
     // been disabled, retyped, or otherwise changed while the picker was open;
     // post-switch messages must not be derived from the stale pre-prompt copy.
     return { updated: true, changed, ...(name ? { account: name } : {}), provider };
-  });
+  }));
 }
 
 export function toggleProviderEnabled(id: string): { toggled: boolean; enabled?: boolean; error?: string } {

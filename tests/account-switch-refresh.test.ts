@@ -19,12 +19,14 @@ describe('account-switch catalog lifecycle', () => {
   const previousHome = process.env.CLODEX_HOME;
   const previousProviderOverride = process.env.CLODEX_KEY_GROQ;
   const previousAccountOverride = process.env.CLODEX_OAUTH_ACCOUNT;
+  const previousStoredWorkToken = process.env.CLODEX_TEST_WORK_TOKEN;
 
   beforeEach(() => {
     home = mkdtempSync(join(tmpdir(), 'clodex-switch-refresh-'));
     process.env.CLODEX_HOME = home;
     delete process.env.CLODEX_KEY_GROQ;
     delete process.env.CLODEX_OAUTH_ACCOUNT;
+    delete process.env.CLODEX_TEST_WORK_TOKEN;
     vi.mocked(fetchTemplateModels).mockReset();
 
     const registry = emptyRegistry();
@@ -37,7 +39,7 @@ describe('account-switch catalog lifecycle', () => {
       authType: 'oauth',
       authAccounts: {
         work: {
-          authRef: 'keyring:provider:work',
+          authRef: 'env:CLODEX_TEST_WORK_TOKEN',
           addedAt: '2026-08-09T00:00:00.000Z',
         },
         alt: {
@@ -67,11 +69,13 @@ describe('account-switch catalog lifecycle', () => {
     else process.env.CLODEX_KEY_GROQ = previousProviderOverride;
     if (previousAccountOverride === undefined) delete process.env.CLODEX_OAUTH_ACCOUNT;
     else process.env.CLODEX_OAUTH_ACCOUNT = previousAccountOverride;
+    if (previousStoredWorkToken === undefined) delete process.env.CLODEX_TEST_WORK_TOKEN;
+    else process.env.CLODEX_TEST_WORK_TOKEN = previousStoredWorkToken;
     rmSync(home, { recursive: true, force: true });
   });
 
   it('keeps the switched cache empty when a provider-key override later disappears', async () => {
-    expect(setActiveOAuthAccount('groq', 'work')).toMatchObject({ changed: true });
+    expect(await setActiveOAuthAccount('groq', 'work')).toMatchObject({ changed: true });
     expect(loadRegistry().providers[0]?.modelsCache).toBeUndefined();
     process.env.CLODEX_KEY_GROQ = 'transient-provider-token';
 
@@ -91,9 +95,18 @@ describe('account-switch catalog lifecycle', () => {
     expect(loadRegistry().providers[0]?.modelsCache).toBeUndefined();
   });
 
-  it('keeps the switched cache empty when a different one-process account later disappears', async () => {
-    expect(setActiveOAuthAccount('groq', 'work')).toMatchObject({ changed: true });
+  it('stores a one-process account catalog without repopulating the switched account cache', async () => {
+    expect(await setActiveOAuthAccount('groq', 'work')).toMatchObject({ changed: true });
     process.env.CLODEX_OAUTH_ACCOUNT = 'alt';
+    vi.mocked(fetchTemplateModels).mockResolvedValue({
+      models: [{
+        id: 'alt-model',
+        name: 'Alt model',
+        upstreamModelId: 'alt-model',
+        modelFormat: 'openai',
+      }],
+      baseUrl: 'https://api.groq.com/openai/v1',
+    });
 
     const result = await refreshProviderModelsWithCredential(
       'groq',
@@ -102,18 +115,18 @@ describe('account-switch catalog lifecycle', () => {
     );
     delete process.env.CLODEX_OAUTH_ACCOUNT;
 
-    expect(result).toMatchObject({
-      ok: true,
-      skipped: true,
-      reason: expect.stringContaining('CLODEX_OAUTH_ACCOUNT=alt temporarily selects a different account'),
-    });
-    expect(fetchTemplateModels).not.toHaveBeenCalled();
-    expect(loadRegistry().providers[0]?.modelsCache).toBeUndefined();
+    expect(result).toMatchObject({ ok: true, modelCount: 1 });
+    expect(fetchTemplateModels).toHaveBeenCalledOnce();
+    const persisted = loadRegistry().providers[0]!;
+    expect(persisted.modelsCache).toBeUndefined();
+    expect(persisted.authAccounts?.alt?.modelsCache?.models[0]?.id).toBe('alt-model');
   });
 
-  it('rebuilds the switched account cache when a different process account is selected', async () => {
-    expect(setActiveOAuthAccount('groq', 'work')).toMatchObject({ changed: true });
+  it('rebuilds the switched account cache while bypassing both process overrides', async () => {
+    expect(await setActiveOAuthAccount('groq', 'work')).toMatchObject({ changed: true });
     process.env.CLODEX_OAUTH_ACCOUNT = 'alt';
+    process.env.CLODEX_KEY_GROQ = 'temporary-provider-token';
+    process.env.CLODEX_TEST_WORK_TOKEN = 'persisted-work-token';
     vi.mocked(fetchTemplateModels).mockResolvedValue({
       models: [{
         id: 'work-model',
@@ -127,16 +140,24 @@ describe('account-switch catalog lifecycle', () => {
     const result = await refreshProviderModelsWithCredential(
       'groq',
       async provider => {
-        expect(provider.authRef).toBe('keyring:provider:work');
-        return 'persisted-work-token';
+        expect(provider.authRef).toBe('env:CLODEX_TEST_WORK_TOKEN');
+        return resolveProviderCredentialWithSource(
+          provider.id,
+          provider.authRef,
+          undefined,
+          { ignoreProviderOverride: true },
+        );
       },
       null,
+      { ignoreProviderOverride: true },
     );
 
     expect(result).toMatchObject({ ok: true, modelCount: 1 });
     expect(fetchTemplateModels).toHaveBeenCalledOnce();
-    expect(loadRegistry().providers[0]?.modelsCache?.models.map(model => model.id)).toEqual([
+    const persisted = loadRegistry().providers[0]!;
+    expect(persisted.modelsCache?.models.map(model => model.id)).toEqual([
       'work-model',
     ]);
+    expect(persisted.authAccounts?.work?.modelsCache?.models[0]?.id).toBe('work-model');
   });
 });

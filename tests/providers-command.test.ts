@@ -377,6 +377,7 @@ describe('interactive OAuth account switching', () => {
       'openai-oauth',
       expect.any(Function),
       null,
+      { ignoreProviderOverride: true },
     );
     expect(loadRegistry().providers[0]).toMatchObject({ activeAuthAccount: 'work' });
     expect(loadRegistry().providers[0]?.modelsCache).toBeUndefined();
@@ -407,6 +408,7 @@ describe('interactive OAuth account switching', () => {
       'openai-oauth',
       expect.any(Function),
       null,
+      { ignoreProviderOverride: true },
     );
   });
 

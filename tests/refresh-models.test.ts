@@ -394,7 +394,7 @@ describe('refreshProviderModels', () => {
     }));
   });
 
-  it('does not refresh an inactive named account merely because it was just authenticated', async () => {
+  it('uses the provider default when refresh is called without an account override', async () => {
     const provider = {
       id: 'groq',
       templateId: 'groq',
@@ -424,7 +424,89 @@ describe('refreshProviderModels', () => {
     }));
   });
 
-  it('resolves but does not persist a transient environment account catalog', async () => {
+  it('persists a transient environment account catalog only in that account slot', async () => {
+    const provider = {
+      id: 'groq',
+      templateId: 'groq',
+      name: 'Groq',
+      enabled: true,
+      authRef: 'keyring:provider:default',
+      authType: 'oauth' as const,
+      activeAuthAccount: 'work',
+      authAccounts: {
+        work: {
+          authRef: 'keyring:provider:work',
+          addedAt: '2026-08-09T00:00:00.000Z',
+          modelsCache: {
+            fetchedAt: '2026-08-09T00:00:00.000Z',
+            models: [{
+              id: 'work-only',
+              name: 'Work only',
+              upstreamModelId: 'work-only',
+              modelFormat: 'openai' as const,
+            }],
+          },
+        },
+        alt: { authRef: 'keyring:provider:alt', addedAt: '2026-08-09T00:00:00.000Z' },
+      },
+      api: { npm: '@ai-sdk/groq', url: 'https://api.groq.com/openai/v1' },
+      refreshedAt: '2026-08-09T00:00:00.000Z',
+      modelsCache: {
+        fetchedAt: '2026-08-09T00:00:00.000Z',
+        models: [{
+          id: 'work-only',
+          name: 'Work only',
+          upstreamModelId: 'work-only',
+          modelFormat: 'openai' as const,
+        }],
+      },
+      addedAt: '2026-01-01T00:00:00.000Z',
+    };
+    const registry: ProviderRegistry = { schemaVersion: 4, providers: [provider] };
+    vi.mocked(loadRegistryStrict).mockReturnValue(registry);
+    vi.mocked(fetchTemplateModels)
+      .mockResolvedValueOnce({
+        baseUrl: 'https://api.groq.com/openai/v1',
+        models: [{
+          id: 'alt-only',
+          name: 'Alt only',
+          upstreamModelId: 'alt-only',
+          modelFormat: 'openai',
+        }],
+      })
+      .mockResolvedValueOnce({
+        baseUrl: 'https://api.groq.com/openai/v1',
+        models: [],
+        error: 'API key rejected (401).',
+      });
+    const resolveKey = vi.fn(async () => {
+      expect(providerMutationState.active).toBe(true);
+      return 'alt-token';
+    });
+
+    const result = await refreshProviderModelsWithCredential('groq', resolveKey, 'alt');
+
+    expect(result).toMatchObject({ ok: true, modelCount: 1 });
+    expect(resolveKey).toHaveBeenCalledWith(expect.objectContaining({
+      authRef: 'keyring:provider:alt',
+    }));
+    expect(fetchTemplateModels).toHaveBeenCalledOnce();
+    expect(saveRegistry).toHaveBeenCalledOnce();
+    expect(registry.providers[0]?.modelsCache?.models.map(model => model.id)).toEqual(['work-only']);
+    expect(registry.providers[0]?.authAccounts?.alt?.modelsCache?.models.map(model => model.id))
+      .toEqual(['alt-only']);
+
+    const retry = await refreshProviderModelsWithCredential('groq', resolveKey, 'alt');
+    expect(retry).toMatchObject({ ok: true, skipped: true, modelCount: 1 });
+    expect(registry.providers[0]?.modelsCache?.models.map(model => model.id)).toEqual(['work-only']);
+    expect(registry.providers[0]?.authAccounts?.alt?.modelsCache?.models.map(model => model.id))
+      .toEqual(['alt-only']);
+    expect(fetchTemplateModels).toHaveBeenCalledTimes(2);
+    expect(saveRegistry).toHaveBeenCalledOnce();
+    expect(providerMutationState.active).toBe(false);
+  });
+
+  it('bypasses CLODEX_KEY_* consistently for a persisted-account refresh', async () => {
     const provider = {
       id: 'groq',
       templateId: 'groq',
@@ -435,31 +517,34 @@ describe('refreshProviderModels', () => {
       activeAuthAccount: 'work',
       authAccounts: {
         work: { authRef: 'keyring:provider:work', addedAt: '2026-08-09T00:00:00.000Z' },
-        alt: { authRef: 'keyring:provider:alt', addedAt: '2026-08-09T00:00:00.000Z' },
       },
       api: { npm: '@ai-sdk/groq', url: 'https://api.groq.com/openai/v1' },
       addedAt: '2026-01-01T00:00:00.000Z',
     };
     const registry: ProviderRegistry = { schemaVersion: 3, providers: [provider] };
     vi.mocked(loadRegistryStrict).mockReturnValue(registry);
-    const resolveKey = vi.fn(async () => {
-      expect(providerMutationState.active).toBe(true);
-      return 'alt-token';
+    vi.mocked(fetchTemplateModels).mockResolvedValue({
+      baseUrl: 'https://api.groq.com/openai/v1',
+      models: [{ id: 'work-only', name: 'Work only', upstreamModelId: 'work-only', modelFormat: 'openai' }],
     });
+    const previous = process.env.CLODEX_KEY_GROQ;
+    process.env.CLODEX_KEY_GROQ = 'temporary-provider-key';
+    try {
+      const result = await refreshProviderModelsWithCredential(
+        'groq',
+        async () => 'persisted-work-token',
+        null,
+        { ignoreProviderOverride: true },
+      );
 
-    const result = await refreshProviderModelsWithCredential('groq', resolveKey, 'alt');
-
-    expect(result).toMatchObject({
-      ok: true,
-      skipped: true,
-      reason: expect.stringContaining('CLODEX_OAUTH_ACCOUNT=alt temporarily selects a different account'),
-    });
-    expect(resolveKey).toHaveBeenCalledWith(expect.objectContaining({
-      authRef: 'keyring:provider:alt',
-    }));
-    expect(fetchTemplateModels).not.toHaveBeenCalled();
-    expect(saveRegistry).not.toHaveBeenCalled();
-    expect(providerMutationState.active).toBe(false);
+      expect(result).toMatchObject({ ok: true, modelCount: 1 });
+      expect(fetchTemplateModels).toHaveBeenCalledOnce();
+      expect(registry.providers[0]?.modelsCache?.models[0]?.id).toBe('work-only');
+      expect(registry.providers[0]?.authAccounts?.work?.modelsCache?.models[0]?.id).toBe('work-only');
+    } finally {
+      if (previous === undefined) delete process.env.CLODEX_KEY_GROQ;
+      else process.env.CLODEX_KEY_GROQ = previous;
+    }
   });
 
   it('rejects the resolved provider-override generation even if the environment changes back', async () => {

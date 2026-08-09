@@ -166,7 +166,21 @@ export function applySelectedOAuthAccount(
           + 'Choose another with: clodex providers',
     );
   }
-  return { ...provider, authRef: slots[name]!.authRef };
+  const account = slots[name]!;
+  const projected = { ...provider, authRef: account.authRef };
+  if (fromEnvironment && name !== stored) {
+    // The top-level cache belongs to the persisted selection. A temporary
+    // account must use only the catalog discovered with that slot; pairing its
+    // credential with another account's entitlements can advertise inaccessible
+    // models or hide models it owns. No slot cache means fail closed.
+    if (account.modelsCache) projected.modelsCache = account.modelsCache;
+    else delete projected.modelsCache;
+  } else if (!projected.modelsCache && account.modelsCache) {
+    // A slot-specific refresh may have populated the safe cache before this
+    // account became the persisted selection.
+    projected.modelsCache = account.modelsCache;
+  }
+  return projected;
 }
 
 function materializeOne(

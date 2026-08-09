@@ -5,6 +5,7 @@ import {
   isPlaceholderProviderKey,
   refreshCredentialSnapshot,
   resolveRefreshCredential,
+  resolveRefreshCredentialWithSource,
 } from '../src/registry/refresh-credentials.js';
 import type { RegistryProvider } from '../src/registry/types.js';
 
@@ -57,6 +58,27 @@ describe('resolveRefreshCredential', () => {
         fingerprint: createHash('sha256').update(credential).digest('hex'),
       });
       expect(JSON.stringify(snapshot)).not.toContain(credential);
+    } finally {
+      if (previous === undefined) delete process.env.CLODEX_KEY_OPENAI;
+      else process.env.CLODEX_KEY_OPENAI = previous;
+    }
+  });
+
+  it('can deliberately resolve the persisted store without attributing CLODEX_KEY_*', async () => {
+    const previous = process.env.CLODEX_KEY_OPENAI;
+    process.env.CLODEX_KEY_OPENAI = 'temporary-provider-key';
+    try {
+      const provider = makeProvider();
+      expect(refreshCredentialSnapshot(provider, null, { ignoreProviderOverride: true }))
+        .toMatchObject({ ignoreProviderOverride: true });
+      expect(refreshCredentialSnapshot(provider, null, { ignoreProviderOverride: true }).credentialOverride)
+        .toBeUndefined();
+      await expect(resolveRefreshCredentialWithSource(
+        provider,
+        async () => 'persisted-oauth-token',
+        null,
+        { ignoreProviderOverride: true },
+      )).resolves.toEqual({ credential: 'persisted-oauth-token' });
     } finally {
       if (previous === undefined) delete process.env.CLODEX_KEY_OPENAI;
       else process.env.CLODEX_KEY_OPENAI = previous;

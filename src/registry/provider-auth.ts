@@ -128,6 +128,10 @@ async function upsertOAuthAccountSlot(
         },
       },
     };
+    if (entry.activeAuthAccount === account) {
+      delete updated.modelsCache;
+      delete updated.refreshedAt;
+    }
     const idx = registry.providers.findIndex(provider => provider.id === registryId);
     registry.providers[idx] = updated;
     if (previousAuthRef && previousAuthRef !== authRef) {
@@ -203,6 +207,10 @@ async function upsertOAuthProvider(
       };
     } else {
       entry = { ...entry, authType: 'oauth', authRef, templateId };
+      if (!entry.activeAuthAccount) {
+        delete entry.modelsCache;
+        delete entry.refreshedAt;
+      }
     }
 
     const idx = registry.providers.findIndex(provider => provider.id === registryId);
@@ -327,15 +335,26 @@ export async function authenticateProvider(
   const refreshSpinner = p.spinner();
   refreshSpinner.start('Refreshing model list...');
   try {
-    // Refresh the account launches actually use, which may differ from the
-    // credential just authenticated (stored selection or one-process env
-    // override). Capture the override once, then fence both provider routing
-    // and the selected credential generation before any discovery request.
-    const accountOverride = process.env[OAUTH_ACCOUNT_ENV] ?? null;
+    // A named sign-in invalidates that slot's account-specific cache, so
+    // rebuild that exact slot even when another account currently wins. A
+    // default sign-in with no stored slot likewise invalidates the top-level
+    // cache and must ignore a one-process account selection. When a stored
+    // slot remains active, its top-level cache is still valid and the normal
+    // per-process selection can be refreshed instead.
+    const accountOverride = accountName
+      ?? (persisted.registryProvider.activeAuthAccount === undefined
+        ? null
+        : process.env[OAUTH_ACCOUNT_ENV] ?? null);
     const refreshResult = await refreshProviderModelsWithCredential(
       registryId,
-      async provider => resolveProviderCredentialWithSource(provider.id, provider.authRef),
+      async provider => resolveProviderCredentialWithSource(
+        provider.id,
+        provider.authRef,
+        undefined,
+        { ignoreProviderOverride: true },
+      ),
       accountOverride,
+      { ignoreProviderOverride: true },
     );
     if (refreshResult.skipped) {
       refreshSpinner.stop(`Models not refreshed${refreshResult.reason ? ` — ${refreshResult.reason}` : ''}`);

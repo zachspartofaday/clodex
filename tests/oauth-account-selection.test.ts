@@ -2,7 +2,7 @@ import { afterEach, beforeEach, describe, expect, it } from 'vitest';
 import { mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { applySelectedOAuthAccount } from '../src/registry/materialize.js';
+import { applySelectedOAuthAccount, materializeRegistry } from '../src/registry/materialize.js';
 import {
   accountSwitchHint,
   accountSwitchOutcome,
@@ -14,7 +14,19 @@ import { emptyRegistry, loadRegistry, loadRegistryStrict, saveRegistry } from '.
 import { credentialIsReferenced } from '../src/registry/credential-lifecycle.js';
 import { withRegistryWriteLockSync } from '../src/registry/lock.js';
 import { oauthProviderIdFromAccount } from '../src/env.js';
-import type { RegistryProvider } from '../src/registry/types.js';
+import type { RegistryModelsCache, RegistryProvider } from '../src/registry/types.js';
+
+function modelsCache(...ids: string[]): RegistryModelsCache {
+  return {
+    fetchedAt: '2026-08-09T00:00:00.000Z',
+    models: ids.map(id => ({
+      id,
+      name: id,
+      upstreamModelId: id,
+      modelFormat: 'openai' as const,
+    })),
+  };
+}
 
 const base: RegistryProvider = {
   id: 'openai-oauth',
@@ -50,6 +62,42 @@ describe('applySelectedOAuthAccount', () => {
     // Everything else is untouched, so models/aliases/partitions are stable.
     expect(selected.id).toBe(withSlots.id);
     expect(selected.authAccounts).toBe(withSlots.authAccounts);
+  });
+
+  it('projects only the temporary account cache into runtime materialization', () => {
+    const provider: RegistryProvider = {
+      ...withSlots,
+      activeAuthAccount: 'work',
+      modelsCache: modelsCache('work-only'),
+      authAccounts: {
+        ...withSlots.authAccounts,
+        work: { ...withSlots.authAccounts!.work!, modelsCache: modelsCache('work-only') },
+        alt: { ...withSlots.authAccounts!.alt!, modelsCache: modelsCache('alt-only') },
+      },
+    };
+
+    const selected = applySelectedOAuthAccount(provider, 'alt');
+    expect(selected.modelsCache?.models.map(model => model.id)).toEqual(['alt-only']);
+    expect(provider.modelsCache?.models.map(model => model.id)).toEqual(['work-only']);
+    expect(materializeRegistry(
+      { schemaVersion: 4, providers: [selected] },
+      () => 'alt-token',
+    )[0]?.models.map(model => model.id)).toEqual(['alt-only']);
+  });
+
+  it('fails closed instead of pairing a temporary account with another account cache', () => {
+    const provider: RegistryProvider = {
+      ...withSlots,
+      activeAuthAccount: 'work',
+      modelsCache: modelsCache('work-only'),
+    };
+
+    const selected = applySelectedOAuthAccount(provider, 'alt');
+    expect(selected.modelsCache).toBeUndefined();
+    expect(materializeRegistry(
+      { schemaVersion: 3, providers: [selected] },
+      () => 'alt-token',
+    )).toEqual([]);
   });
 
   it('ignores the selector on providers without slots', () => {
@@ -187,6 +235,41 @@ describe('authAccounts registry persistence', () => {
     expect(loadRegistryStrict(path).providers[0]!.authAccounts).toEqual(withSlots.authAccounts);
   });
 
+  it('persists account-specific caches behind the v4 writer fence', () => {
+    const cachedProvider: RegistryProvider = {
+      ...withSlots,
+      activeAuthAccount: 'work',
+      modelsCache: modelsCache('work-only'),
+      authAccounts: {
+        ...withSlots.authAccounts,
+        work: { ...withSlots.authAccounts!.work!, modelsCache: modelsCache('work-only') },
+        alt: { ...withSlots.authAccounts!.alt!, modelsCache: modelsCache('alt-only') },
+      },
+    };
+    const registry = { ...emptyRegistry(), providers: [cachedProvider] };
+
+    withRegistryWriteLockSync(() => saveRegistry(registry, path), { lockPath: `${path}.lock` });
+
+    expect(JSON.parse(readFileSync(path, 'utf8')).schemaVersion).toBe(4);
+    const loaded = loadRegistryStrict(path).providers[0]!;
+    expect(loaded.authAccounts?.work?.modelsCache?.models[0]?.id).toBe('work-only');
+    expect(loaded.authAccounts?.alt?.modelsCache?.models[0]?.id).toBe('alt-only');
+  });
+
+  it('fails closed on a malformed account-specific cache', () => {
+    const malformed = {
+      ...withSlots,
+      authAccounts: {
+        ...withSlots.authAccounts,
+        work: { ...withSlots.authAccounts!.work!, modelsCache: { fetchedAt: 'now', models: [null] } },
+      },
+    };
+    writeFileSync(path, registryWith(malformed));
+
+    expect(loadRegistry(path).providers).toHaveLength(0);
+    expect(() => loadRegistryStrict(path)).toThrow(/invalid provider entry/);
+  });
+
   it('fails closed on a malformed slot instead of silently dropping it', () => {
     const malformed = {
       ...withSlots,
@@ -289,7 +372,7 @@ describe('authAccounts registry persistence', () => {
   });
 
   it('rejects a schema version newer than this build understands', () => {
-    writeFileSync(path, `${JSON.stringify({ schemaVersion: 4, providers: [] })}\n`);
+    writeFileSync(path, `${JSON.stringify({ schemaVersion: 5, providers: [] })}\n`);
     expect(() => loadRegistryStrict(path)).toThrow(/unsupported schema version/);
   });
 

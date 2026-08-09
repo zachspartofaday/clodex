@@ -116,6 +116,32 @@ describe('provider credentials', () => {
     delete process.env[clodexKeyEnvVar('openai')];
   });
 
+  it('can resolve the configured credential while bypassing CLODEX_KEY_*', async () => {
+    const variable = clodexKeyEnvVar('openai');
+    const previousOverride = process.env[variable];
+    const previousStored = process.env.CLODEX_STORED_OPENAI_KEY;
+    process.env[variable] = 'temporary-provider-key';
+    process.env.CLODEX_STORED_OPENAI_KEY = 'stored-openai-key';
+    try {
+      await expect(resolveProviderCredential(
+        'openai',
+        'env:CLODEX_STORED_OPENAI_KEY',
+        undefined,
+        { ignoreProviderOverride: true },
+      )).resolves.toBe('stored-openai-key');
+      expect(resolveProviderCredentialOverrideState(
+        'openai',
+        process.env,
+        { ignoreProviderOverride: true },
+      )).toBeNull();
+    } finally {
+      if (previousOverride === undefined) delete process.env[variable];
+      else process.env[variable] = previousOverride;
+      if (previousStored === undefined) delete process.env.CLODEX_STORED_OPENAI_KEY;
+      else process.env.CLODEX_STORED_OPENAI_KEY = previousStored;
+    }
+  });
+
   it('exposes only redaction-safe state for the usable provider override', async () => {
     const providerId = 'source-state-test';
     const variable = clodexKeyEnvVar(providerId);

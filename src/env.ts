@@ -265,6 +265,8 @@ function isReservedKeyringAccount(account: string): boolean {
 
 export interface ResolveCredentialOptions {
   rejectedAccessToken?: string;
+  /** Resolve the configured credential store without a CLODEX_KEY_* override. */
+  ignoreProviderOverride?: boolean;
 }
 
 /**
@@ -353,6 +355,7 @@ function readProviderCredentialOverride(
   env: NodeJS.ProcessEnv,
   options: ResolveCredentialOptions,
 ): { credential: string; state: ProviderCredentialOverrideState } | null {
+  if (options.ignoreProviderOverride) return null;
   const variable = clodexKeyEnvVar(providerId);
   const credential = usableEnvCredential(
     `provider:${providerId}`,

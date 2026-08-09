@@ -7,7 +7,7 @@ import type { CompatibilityAgent } from './model-compatibility.js';
 import { oauthAuthRef } from './registry/import-build.js';
 import { loadRegistry } from './registry/io.js';
 import { loadRegistryProviders } from './registry/load.js';
-import { isAnonymousProvider } from './registry/materialize.js';
+import { applySelectedOAuthAccount, isAnonymousProvider } from './registry/materialize.js';
 import { OAUTH_ACCOUNT_ENV } from './oauth-account-selection.js';
 import { getTemplateById } from './provider-templates.js';
 import type { LocalProvider } from './types.js';
@@ -347,7 +347,16 @@ export async function resolveProvidersForDisplay(): Promise<ProviderDisplayEntry
     entries.push({
       id: provider.id,
       name: provider.name,
-      modelCount: provider.modelsCache?.models.length ?? 0,
+      // Model counts describe the identity this process would launch, not the
+      // persisted account hidden behind CLODEX_OAUTH_ACCOUNT. A broken
+      // selection has no safe catalog to advertise.
+      modelCount: (() => {
+        try {
+          return applySelectedOAuthAccount(provider).modelsCache?.models.length ?? 0;
+        } catch {
+          return 0;
+        }
+      })(),
       enabled: provider.enabled,
       authLabel,
       inRegistry: true,

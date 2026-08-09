@@ -34,6 +34,13 @@ export interface RefreshCredentialSnapshot {
   };
   /** Redaction-safe identity of the namespaced provider key, when it wins. */
   credentialOverride?: ProviderCredentialOverrideState;
+  /** The refresh deliberately resolved the persisted store, not CLODEX_KEY_*. */
+  ignoreProviderOverride?: true;
+}
+
+export interface RefreshCredentialOptions {
+  /** Resolve the persisted credential rather than a process-scoped CLODEX_KEY_* override. */
+  ignoreProviderOverride?: boolean;
 }
 
 function providerForRefresh(
@@ -57,6 +64,7 @@ function providerForRefresh(
 export function refreshCredentialSnapshot(
   provider: RegistryProvider,
   selected: string | null | undefined = process.env[OAUTH_ACCOUNT_ENV],
+  options: RefreshCredentialOptions = {},
 ): RefreshCredentialSnapshot {
   const environmentAccount = selected === null ? undefined : selected?.trim() || undefined;
   const effective = providerForRefresh(provider, environmentAccount);
@@ -67,7 +75,9 @@ export function refreshCredentialSnapshot(
     : undefined;
   const credentialOverride = effective.authType !== 'none'
     && effective.authRef !== 'none:anonymous'
-    ? resolveProviderCredentialOverrideState(effective.id)
+    ? resolveProviderCredentialOverrideState(effective.id, process.env, {
+        ignoreProviderOverride: options.ignoreProviderOverride,
+      })
     : null;
   return {
     provider: {
@@ -97,6 +107,7 @@ export function refreshCredentialSnapshot(
         }
       : {}),
     ...(credentialOverride ? { credentialOverride } : {}),
+    ...(options.ignoreProviderOverride ? { ignoreProviderOverride: true as const } : {}),
   };
 }
 
@@ -158,6 +169,7 @@ export async function resolveRefreshCredentialWithSource(
   provider: RegistryProvider,
   resolveKey: RefreshCredentialResolver,
   selected: string | null | undefined = process.env[OAUTH_ACCOUNT_ENV],
+  options: RefreshCredentialOptions = {},
 ): Promise<ResolvedProviderCredential> {
   // Model entitlements are account-specific. Resolve exactly the provider
   // identity a launch in this process would use, never the registry's default
@@ -186,7 +198,11 @@ export async function resolveRefreshCredentialWithSource(
           ...(result
             ? {
                 credentialOverride:
-                  resolveProviderCredentialOverrideState(effectiveProvider.id) ?? undefined,
+                  resolveProviderCredentialOverrideState(
+                    effectiveProvider.id,
+                    process.env,
+                    { ignoreProviderOverride: options.ignoreProviderOverride },
+                  ) ?? undefined,
               }
             : {}),
         };
@@ -211,6 +227,7 @@ export async function resolveRefreshCredential(
   provider: RegistryProvider,
   resolveKey: RefreshCredentialResolver,
   selected: string | null | undefined = process.env[OAUTH_ACCOUNT_ENV],
+  options: RefreshCredentialOptions = {},
 ): Promise<string | null> {
-  return (await resolveRefreshCredentialWithSource(provider, resolveKey, selected)).credential;
+  return (await resolveRefreshCredentialWithSource(provider, resolveKey, selected, options)).credential;
 }

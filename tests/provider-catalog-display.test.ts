@@ -20,11 +20,13 @@ describe('provider-catalog-display', () => {
   const prevHome = process.env.CLODEX_HOME;
   const prevHelper = process.env.CLODEX_CREDENTIAL_HELPER;
   const prevProviderOverride = process.env.CLODEX_KEY_OPENAI_OAUTH;
+  const prevAccountOverride = process.env.CLODEX_OAUTH_ACCOUNT;
 
   beforeEach(() => {
     home = mkdtempSync(join(tmpdir(), 'clodex-display-'));
     process.env.CLODEX_HOME = home;
     delete process.env.CLODEX_KEY_OPENAI_OAUTH;
+    delete process.env.CLODEX_OAUTH_ACCOUNT;
   });
 
   afterEach(() => {
@@ -34,6 +36,8 @@ describe('provider-catalog-display', () => {
     else process.env.CLODEX_CREDENTIAL_HELPER = prevHelper;
     if (prevProviderOverride === undefined) delete process.env.CLODEX_KEY_OPENAI_OAUTH;
     else process.env.CLODEX_KEY_OPENAI_OAUTH = prevProviderOverride;
+    if (prevAccountOverride === undefined) delete process.env.CLODEX_OAUTH_ACCOUNT;
+    else process.env.CLODEX_OAUTH_ACCOUNT = prevAccountOverride;
     rmSync(home, { recursive: true, force: true });
     vi.restoreAllMocks();
   });
@@ -238,6 +242,49 @@ describe('provider-catalog-display', () => {
       } finally {
         delete process.env['CLODEX_OAUTH_ACCOUNT'];
       }
+    });
+
+    it('counts only models cached for the temporary account', async () => {
+      const model = (id: string) => ({
+        id,
+        name: id,
+        upstreamModelId: id,
+        modelFormat: 'openai' as const,
+      });
+      const registry = emptyRegistry();
+      registry.providers.push({
+        id: 'openai-oauth',
+        templateId: 'openai',
+        name: 'OpenAI (ChatGPT)',
+        enabled: true,
+        authRef: 'keyring:oauth:provider:openai-oauth::credential::v1:default',
+        authType: 'oauth',
+        activeAuthAccount: 'work',
+        authAccounts: {
+          work: {
+            authRef: 'keyring:oauth:provider:openai-oauth:account:work::credential::v1:w',
+            addedAt: '2026-08-09T00:00:00.000Z',
+          },
+          alt: {
+            authRef: 'keyring:oauth:provider:openai-oauth:account:alt::credential::v1:a',
+            addedAt: '2026-08-09T00:00:00.000Z',
+            modelsCache: {
+              fetchedAt: '2026-08-09T00:00:00.000Z',
+              models: [model('alt-only')],
+            },
+          },
+        },
+        api: { npm: '@ai-sdk/openai' },
+        addedAt: '2026-08-09T00:00:00.000Z',
+        modelsCache: {
+          fetchedAt: '2026-08-09T00:00:00.000Z',
+          models: [model('work-a'), model('work-b')],
+        },
+      });
+      withRegistryWriteLockSync(() => saveRegistry(registry));
+      process.env.CLODEX_OAUTH_ACCOUNT = 'alt';
+
+      expect((await resolveProvidersForDisplay())[0]?.modelCount).toBe(1);
     });
 
     it('reports the provider key as active without marking a slot active', async () => {

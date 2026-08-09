@@ -350,6 +350,8 @@ describe('setActiveOAuthAccount', () => {
   beforeEach(() => {
     lockState.active = false;
     lockState.registryTail = Promise.resolve();
+    lockState.providerActive = false;
+    lockState.providerTails.clear();
     registryState.current = {
       schemaVersion: 2,
       providers: [
@@ -370,7 +372,7 @@ describe('setActiveOAuthAccount', () => {
     };
   });
 
-  it('persists the chosen account', () => {
+  it('persists the chosen account', async () => {
     registryState.current.providers[0]!.modelsCache = {
       fetchedAt: '2026-08-09T00:00:00.000Z',
       models: [{
@@ -380,7 +382,7 @@ describe('setActiveOAuthAccount', () => {
         modelFormat: 'openai',
       }],
     };
-    const result = setActiveOAuthAccount('openai-oauth', 'zachspartofaday');
+    const result = await setActiveOAuthAccount('openai-oauth', 'zachspartofaday');
     expect(result).toMatchObject({ updated: true, changed: true, account: 'zachspartofaday' });
     expect(result.provider?.activeAuthAccount).toBe('zachspartofaday');
     expect(result.provider?.modelsCache).toBeUndefined();
@@ -388,7 +390,7 @@ describe('setActiveOAuthAccount', () => {
     expect(registryState.current.providers[0]?.modelsCache).toBeUndefined();
   });
 
-  it('reports an unchanged selection as a no-op', () => {
+  it('reports an unchanged selection as a no-op', async () => {
     registryState.current.providers[0]!.activeAuthAccount = 'zachspartofaday';
     registryState.current.providers[0]!.modelsCache = {
       fetchedAt: '2026-08-09T00:00:00.000Z',
@@ -400,7 +402,7 @@ describe('setActiveOAuthAccount', () => {
       }],
     };
 
-    const result = setActiveOAuthAccount('openai-oauth', 'zachspartofaday');
+    const result = await setActiveOAuthAccount('openai-oauth', 'zachspartofaday');
 
     expect(result).toMatchObject({
       updated: true,
@@ -412,9 +414,99 @@ describe('setActiveOAuthAccount', () => {
     expect(registryState.current.providers[0]?.modelsCache?.models[0]?.id).toBe('still-current-model');
   });
 
-  it('clears the field rather than storing a sentinel when returning to the default', () => {
-    setActiveOAuthAccount('openai-oauth', 'zachspartofaday');
-    const result = setActiveOAuthAccount('openai-oauth', undefined);
+  it('parks the previous slot cache and restores only the selected slot cache', async () => {
+    const provider = registryState.current.providers[0]!;
+    provider.activeAuthAccount = 'zachspartofaday';
+    provider.authAccounts!.alt = {
+      authRef: 'keyring:oauth:provider:openai-oauth:account:alt::credential::v1:a',
+      addedAt: '2026-08-09T00:00:00.000Z',
+      modelsCache: {
+        fetchedAt: '2026-08-09T01:00:00.000Z',
+        models: [{
+          id: 'alt-only',
+          name: 'Alt only',
+          upstreamModelId: 'alt-only',
+          modelFormat: 'openai',
+        }],
+      },
+    };
+    provider.refreshedAt = '2026-08-09T00:30:00.000Z';
+    provider.modelsCache = {
+      fetchedAt: '2026-08-09T00:30:00.000Z',
+      models: [{
+        id: 'zach-only',
+        name: 'Zach only',
+        upstreamModelId: 'zach-only',
+        modelFormat: 'openai',
+      }],
+    };
+
+    expect(await setActiveOAuthAccount('openai-oauth', 'alt')).toMatchObject({ changed: true });
+    const switched = registryState.current.providers[0]!;
+    expect(switched.modelsCache?.models[0]?.id).toBe('alt-only');
+    expect(switched.refreshedAt).toBe('2026-08-09T01:00:00.000Z');
+    expect(switched.authAccounts?.zachspartofaday?.modelsCache?.models[0]?.id).toBe('zach-only');
+
+    expect(await setActiveOAuthAccount('openai-oauth', undefined)).toMatchObject({ changed: true });
+    const restoredDefault = registryState.current.providers[0]!;
+    expect(restoredDefault.modelsCache).toBeUndefined();
+    expect(restoredDefault.refreshedAt).toBeUndefined();
+    expect(restoredDefault.authAccounts?.alt?.modelsCache?.models[0]?.id).toBe('alt-only');
+  });
+
+  it('waits for slot reauthentication before deciding which cache can be parked', async () => {
+    const provider = registryState.current.providers[0]!;
+    provider.activeAuthAccount = 'zachspartofaday';
+    provider.authAccounts!.alt = {
+      authRef: 'keyring:oauth:provider:openai-oauth:account:alt::credential::v1:a',
+      addedAt: '2026-08-09T00:00:00.000Z',
+    };
+    provider.modelsCache = {
+      fetchedAt: '2026-08-09T00:30:00.000Z',
+      models: [{
+        id: 'old-zach-catalog',
+        name: 'Old Zach catalog',
+        upstreamModelId: 'old-zach-catalog',
+        modelFormat: 'openai',
+      }],
+    };
+
+    let announceReauth!: () => void;
+    const reauthStarted = new Promise<void>(resolve => { announceReauth = resolve; });
+    let finishReauth!: () => void;
+    const reauthGate = new Promise<void>(resolve => { finishReauth = resolve; });
+    const reauth = withProviderMutationLock('openai-oauth', async () => {
+      announceReauth();
+      await reauthGate;
+      await withRegistryWriteLock(() => {
+        const current = registryState.current.providers[0]!;
+        current.authAccounts!.zachspartofaday = {
+          ...current.authAccounts!.zachspartofaday!,
+          addedAt: '2026-08-09T01:00:00.000Z',
+        };
+        delete current.modelsCache;
+        delete current.refreshedAt;
+      });
+    });
+
+    await reauthStarted;
+    const switching = setActiveOAuthAccount('openai-oauth', 'alt');
+    await Promise.resolve();
+    expect(registryState.current.providers[0]?.activeAuthAccount).toBe('zachspartofaday');
+
+    finishReauth();
+    await reauth;
+    expect(await switching).toMatchObject({ changed: true, account: 'alt' });
+
+    const switched = registryState.current.providers[0]!;
+    expect(switched.activeAuthAccount).toBe('alt');
+    expect(switched.modelsCache).toBeUndefined();
+    expect(switched.authAccounts?.zachspartofaday?.modelsCache).toBeUndefined();
+  });
+
+  it('clears the field rather than storing a sentinel when returning to the default', async () => {
+    await setActiveOAuthAccount('openai-oauth', 'zachspartofaday');
+    const result = await setActiveOAuthAccount('openai-oauth', undefined);
     expect(result).toMatchObject({ updated: true });
     expect(result.provider?.activeAuthAccount).toBeUndefined();
     // Absent, not 'default': a slot may legitimately be NAMED "default", so a
@@ -422,17 +514,17 @@ describe('setActiveOAuthAccount', () => {
     expect('activeAuthAccount' in registryState.current.providers[0]!).toBe(false);
   });
 
-  it('refuses a name with no slot so the registry cannot point at a missing account', () => {
+  it('refuses a name with no slot so the registry cannot point at a missing account', async () => {
     // The state applySelectedOAuthAccount has to refuse to launch on, so it
     // must be unreachable through the picker rather than merely diagnosed.
-    const result = setActiveOAuthAccount('openai-oauth', 'ghost');
+    const result = await setActiveOAuthAccount('openai-oauth', 'ghost');
     expect(result.updated).toBe(false);
     expect(result.error).toMatch(/no account named "ghost" \(available: zachspartofaday\)/);
     expect(registryState.current.providers[0]?.activeAuthAccount).toBeUndefined();
   });
 
-  it('reports an unknown provider instead of writing', () => {
-    expect(setActiveOAuthAccount('nope', 'zachspartofaday')).toEqual({
+  it('reports an unknown provider instead of writing', async () => {
+    expect(await setActiveOAuthAccount('nope', 'zachspartofaday')).toEqual({
       updated: false,
       error: 'Provider not found: nope',
     });

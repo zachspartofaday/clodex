@@ -40,6 +40,14 @@ export const REGISTRY_SCHEMA_VERSION_WITH_ACCOUNT_SLOTS = 2;
 export const REGISTRY_SCHEMA_VERSION_WITH_ACTIVE_ACCOUNT = 3;
 
 /**
+ * Written when a named OAuth slot carries its own model-entitlement cache.
+ * A cache is not a credential, but silently dropping it would make a temporary
+ * account reuse the persisted account's catalog. Version 4 therefore fences
+ * older mutating builds that know about slots but not their cache isolation.
+ */
+export const REGISTRY_SCHEMA_VERSION_WITH_ACCOUNT_MODEL_CACHES = 4;
+
+/**
  * Shape rule for a named OAuth account-slot name — the single home. Slot
  * names land in credential-store scopes and env values, and the registry
  * parser must accept exactly what `validateOAuthAccountName` admits, or a
@@ -81,6 +89,19 @@ export interface CachedModel {
   compatibility?: ModelRuntimeCompatibility;
 }
 
+export interface RegistryModelsCache {
+  fetchedAt: string;
+  models: CachedModel[];
+}
+
+export interface RegistryOAuthAccount {
+  authRef: string;
+  addedAt: string;
+  oauthAccountId?: string;
+  /** Catalog discovered with this named slot's credential. */
+  modelsCache?: RegistryModelsCache;
+}
+
 export interface RegistryProvider {
   id: string;
   templateId: string;
@@ -94,7 +115,7 @@ export interface RegistryProvider {
    * disjoint credential-store lineage; CLODEX_OAUTH_ACCOUNT selects one at
    * launch without touching the default `authRef`.
    */
-  authAccounts?: Record<string, { authRef: string; addedAt: string; oauthAccountId?: string }>;
+  authAccounts?: Record<string, RegistryOAuthAccount>;
   /**
    * The `authAccounts` slot every launch uses, so the running identity does not
    * depend on remembering an environment variable. Absent means the provider's
@@ -117,10 +138,7 @@ export interface RegistryProvider {
     /** Static headers sent on every upstream request (e.g. a plan/auth-tracking header a custom endpoint requires). */
     headers?: Record<string, string>;
   };
-  modelsCache?: {
-    fetchedAt: string;
-    models: CachedModel[];
-  };
+  modelsCache?: RegistryModelsCache;
   addedAt: string;
   refreshedAt?: string;
 }
