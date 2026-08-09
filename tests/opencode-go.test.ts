@@ -281,7 +281,7 @@ describe('verifyOpenCodeGoCredential', () => {
   });
 });
 
-describe('qwen3.6-plus reasoning toggle', () => {
+describe('qwen3.6-plus reasoning budget', () => {
   const model = buildOpenCodeGoModels().find(entry => entry.id === 'qwen3.6-plus')!;
   const meta = {
     reasoning: model.reasoning,
@@ -289,14 +289,12 @@ describe('qwen3.6-plus reasoning toggle', () => {
     providerId: 'opencode-go',
   };
 
-  it('turns thinking on for every selectable level, max included', () => {
-    // Qwen accepts no reasoning_effort — `thinkingFormat: 'qwen'` injects the
-    // boolean `enable_thinking` and only does so when an effort is PRESENT, so
-    // the effort value is an internal signal rather than a wire control.
-    // Before the map, mapCodexEffortToOpenAI dropped `max` along with `off`
-    // and `minimal`, so choosing MAX silently disabled thinking while `low`
-    // enabled it — backwards, and invisible.
-    for (const level of ['low', 'medium', 'high', 'xhigh', 'max']) {
+  it('grades by budget at the two levels the gateway actually has', () => {
+    // Superseded the earlier seven-level map. Qwen accepts no reasoning_effort;
+    // OpenCode's own client sends `thinking: {type:'enabled', budgetTokens: N}`
+    // at exactly two grades, so seven was a fiction — it existed only to keep
+    // the capability representable by projectNativeEffort.
+    for (const [level, budget] of [['high', 16000], ['max', 31999]] as const) {
       const options = effortProviderOptions(model.npm!, level, model.id, meta as never) as
         Record<string, Record<string, unknown>> | undefined;
       const effort = options?.opencodeGo?.reasoningEffort as string | undefined;
@@ -305,31 +303,28 @@ describe('qwen3.6-plus reasoning toggle', () => {
         { model: model.id, reasoning_effort: effort },
         model.compatibility,
       ) as Record<string, unknown>;
-      expect(body.enable_thinking, level).toBe(true);
+      expect(body.thinking, level).toEqual({ type: 'enabled', budgetTokens: budget });
     }
   });
 
   it('leaves thinking off when the user asks for off', () => {
-    const options = effortProviderOptions(model.npm!, 'off', model.id, meta as never);
-    expect(options).toBeUndefined();
+    expect(effortProviderOptions(model.npm!, 'off', model.id, meta as never)).toBeUndefined();
     const body = transformOpenAiCompatibleRequestBody(
       { model: model.id },
       model.compatibility,
     ) as Record<string, unknown>;
+    expect(body.thinking).toBeUndefined();
     expect(body.enable_thinking).toBeUndefined();
   });
 
-  it('keeps a capability the patcher will actually accept', () => {
-    // The grades are cosmetic while the upstream control is a boolean, so
-    // collapsing them to one level is tempting — but getPatchReasoningCapabilities
-    // dedups identical provider options, and projectNativeEffort DISCARDS any
-    // capability missing low/medium/high. A one-level capability therefore
-    // leaves a patched client with no effort control at all, which is worse
-    // than cosmetic grades.
+  it('has no native effort picker, like every other narrow ladder here', () => {
+    // Two real grades cannot satisfy projectNativeEffort's low/medium/high
+    // floor, so this model joins deepseek and glm-5.2 in offering no native
+    // picker. That is the honest state; the alternative was advertising five
+    // grades that did not exist.
     const patch = getPatchReasoningCapabilities(model.npm!, model.id, meta as never);
-    expect(patch.levels).toContain(patch.defaultLevel);
-    for (const base of ['low', 'medium', 'high']) expect(patch.levels).toContain(base);
+    expect(patch.levels).toEqual(['high', 'max']);
     expect(projectNativeEffort({ levels: patch.levels, defaultLevel: patch.defaultLevel! }))
-      .toBeTruthy();
+      .toBeUndefined();
   });
 });

@@ -74,7 +74,9 @@ const TRANSPORTS = {
 // catalog would block a ladder that had been live-validated.
 const PATCHES = {
   'deepseek-v4-flash': {
-    reasoningEffortMap: { minimal: null, low: null, medium: null, high: 'high', max: 'max' },
+    // `low` confirmed by OpenCode's own client, which sends low/high/max for
+    // this model; the catalog had been narrower than the gateway accepts.
+    reasoningEffortMap: { minimal: null, low: 'low', medium: null, high: 'high', max: 'max' },
     supportsStore: false,
     supportsDeveloperRole: false,
     maxTokensField: 'max_tokens',
@@ -99,15 +101,10 @@ const PATCHES = {
     maxTokensField: 'max_tokens',
   },
   'glm-5.2': {
-    // UNVERIFIED, kept narrow deliberately. Z.ai's own API documents the full
-    // ladder ("max, xhigh, high, medium, low, minimal, none"); models.dev
-    // lists high/max. Neither settles it — Z.ai describes its own endpoint,
-    // not OpenCode's gateway in front of it, and models.dev is a community
-    // catalog rather than a statement of what that gateway accepts.
-    //
-    // Narrow is the safe side of an unverified guess: sending fewer levels
-    // than the gateway accepts hides capability, while sending one it rejects
-    // fails the request. Widen only after a live call confirms it.
+    // CONFIRMED high/max. Z.ai's own API documents seven levels, but that
+    // describes Z.ai's endpoint; OpenCode's client sends exactly
+    // {high, max} to this gateway. The wider vendor ladder was briefly
+    // adopted here and reverted — this is what settled it.
     reasoningEffortMap: { off: null, minimal: null, low: null, medium: null, high: 'high', xhigh: null, max: 'max' },
     supportsStore: false,
     supportsDeveloperRole: false,
@@ -150,10 +147,9 @@ const PATCHES = {
     maxTokensField: 'max_tokens',
   },
   'kimi-k3': {
-    // UNVERIFIED, kept narrow for the same reason as glm-5.2. Moonshot's own
-    // API documents low/high/max (default max); models.dev lists max. Neither
-    // describes what OpenCode's gateway accepts, so the safe side wins until a
-    // live call says otherwise.
+    // CONFIRMED max only. Moonshot's own API documents low/high/max, but
+    // OpenCode's client sends just {max} to this gateway — the same
+    // vendor-versus-gateway gap as glm-5.2, settled the same way.
     reasoningEffortMap: { off: null, minimal: null, low: null, medium: null, high: null, xhigh: null, max: 'max' },
     supportsStore: false,
     supportsDeveloperRole: false,
@@ -192,29 +188,20 @@ const PATCHES = {
     supportsReasoningEffort: false,
   },
   'qwen3.6-plus': {
-    // Qwen has no reasoning_effort: models.dev publishes a toggle plus a token
-    // budget, and DashScope's control is the boolean `enable_thinking`. But
-    // `thinkingFormat: 'qwen'` only injects that boolean when a
-    // reasoning_effort is PRESENT, so the effort value is load-bearing as an
-    // internal signal even though the upstream ignores its value.
+    // CONFIRMED shape. Qwen accepts no reasoning_effort; OpenCode's client
+    // sends `thinking: {type:'enabled', budgetTokens: N}` with one budget per
+    // grade — 16000 at high, 31999 at max. The effort value is mapped only so
+    // the transform can resolve a budget from it; it is then dropped from the
+    // body rather than sent alongside, since the upstream ignores it.
     //
-    // Without a map, mapCodexEffortToOpenAI dropped `off`, `minimal` and also
-    // `max` — so choosing MAX silently disabled thinking while `low` enabled
-    // it. Every level except `off` now maps to something, which is what fixes
-    // that: any level thinks, `off` does not.
-    //
-    // DISTINCT values, not one repeated. Collapsing them to a single value is
-    // tempting — the grades are cosmetic while the upstream control is a
-    // boolean — but getPatchReasoningCapabilities dedups identical provider
-    // options, and `projectNativeEffort` in patch-transforms.ts discards any
-    // capability missing low/medium/high. A one-level capability therefore
-    // leaves a patched client with NO effort control at all, which is worse
-    // than cosmetic grades. The upstream ignores the string either way.
-    //
-    // Grading this for real means sending enable_thinking + thinking_budget
-    // and dropping reasoning_effort. That changes the wire and needs a live
-    // key to validate, so it is tracked separately rather than guessed here.
-    reasoningEffortMap: { low: 'low', medium: 'medium', high: 'high', xhigh: 'xhigh', max: 'max', minimal: null, off: null },
+    // Two grades, not seven. The previous seven-level map existed to keep the
+    // capability representable by `projectNativeEffort`, which discards
+    // anything missing low/medium/high — so this model now joins deepseek and
+    // glm-5.2 in having no NATIVE effort picker, which is the honest state and
+    // is tracked separately rather than papered over with grades that do not
+    // exist.
+    reasoningEffortMap: { off: null, minimal: null, low: null, medium: null, high: 'high', xhigh: null, max: 'max' },
+    thinkingBudgetMap: { high: 16000, max: 31999 },
     supportsStore: false,
     supportsDeveloperRole: false,
     thinkingFormat: 'qwen',

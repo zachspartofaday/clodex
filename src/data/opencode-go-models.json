@@ -18,7 +18,7 @@
     "compatibility": {
       "reasoningEffortMap": {
         "minimal": null,
-        "low": null,
+        "low": "low",
         "medium": null,
         "high": "high",
         "max": "max"
@@ -403,19 +403,23 @@
       "image"
     ],
     "compatibility": {
+      "reasoningEffortMap": {
+        "off": null,
+        "minimal": null,
+        "low": null,
+        "medium": null,
+        "high": "high",
+        "xhigh": null,
+        "max": "max"
+      },
+      "thinkingBudgetMap": {
+        "high": 16000,
+        "max": 31999
+      },
       "supportsStore": false,
       "supportsDeveloperRole": false,
       "thinkingFormat": "qwen",
-      "maxTokensField": "max_tokens",
-      "reasoningEffortMap": {
-        "low": "low",
-        "medium": "medium",
-        "high": "high",
-        "xhigh": "xhigh",
-        "max": "max",
-        "minimal": null,
-        "off": null
-      }
+      "maxTokensField": "max_tokens"
     },
     "upstreamModelId": "qwen3.6-plus",
     "family": "qwen3.6"
