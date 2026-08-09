@@ -21,6 +21,15 @@ describe('sanitizeToolInput', () => {
     )).toEqual({ file_path: '/repo/FILE.PDF', pages: '1-3' });
   });
 
+  it.each(['/repo/file', '/repo/.env', '/repo/file.', 'C:\\repo\\.env'])
+    ('preserves pages when a Read path has no recognizable extension: %s', file_path => {
+      expect(sanitizeToolInput(
+        { file_path, pages: '1' },
+        new Set(['file_path']),
+        'Read',
+      )).toEqual({ file_path, pages: '1' });
+    });
+
   it('preserves pages when the tool or file type does not prove a non-PDF Read', () => {
     expect(sanitizeToolInput(
       { file_path: '/repo/file.swift', pages: '1' },

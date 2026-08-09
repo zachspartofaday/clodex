@@ -2364,6 +2364,26 @@ describe('createResponsesWebSocketFetch', () => {
       .toMatchObject({ toolArgumentNormalizationGap: { tool: 'Grep', equalAfterStrip: true } });
   });
 
+  it('warns when Read.pages filler differs for a known non-PDF path', async () => {
+    const { stderr, diagnostics } = await runToolArgumentMismatch({
+      accountId: 'acct-tool-gap-read-pages',
+      responseId: 'resp_tool_gap_read_pages',
+      upstreamCall: {
+        type: 'function_call', id: 'fc_read', call_id: 'call_read', name: 'Read',
+        arguments: '{"file_path":"/repo/file.swift"}', status: 'completed',
+      },
+      echoedCall: {
+        type: 'function_call', call_id: 'call_read', name: 'Read',
+        arguments: '{"file_path":"/repo/file.swift","pages":"1-3"}',
+      },
+    });
+
+    expect(stderr.join('')).toContain('filler-strip rule is applied');
+    expect(stderr.join('')).toContain('Read');
+    expect(firstHeadMismatch(diagnostics))
+      .toMatchObject({ toolArgumentNormalizationGap: { tool: 'Read', equalAfterStrip: true } });
+  });
+
   it('reports a repeated tool-argument gap once rather than on every turn', async () => {
     const first = await runToolArgumentMismatch({
       accountId: 'acct-tool-gap-repeat-1', responseId: 'resp_tool_repeat_1', ...FORKED_STRIP,
