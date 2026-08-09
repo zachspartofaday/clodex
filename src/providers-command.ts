@@ -552,14 +552,22 @@ async function runProviderDetail(id: string): Promise<'back' | 'removed'> {
     label: 'Refresh model list',
     hint: 'Fetch latest models from the provider API',
   });
+  const accountSlots = Object.keys(provider.authAccounts ?? {}).sort();
   if (supportsNativeOAuth(id) || provider.authType === 'oauth') {
     detailOptions.push({
       value: 'auth',
       label: 'Sign in again (OAuth)',
-      hint: 'Refresh OAuth tokens or add another account',
+      // Says what the action DOES. It calls the auth flow with no account
+      // name, so it re-authenticates the provider's own credential and cannot
+      // create or refresh a named slot — the previous wording advertised
+      // exactly the thing it does not do, which is worst when the account
+      // needing reauthentication is a named one that this would leave broken
+      // while overwriting the default.
+      hint: accountSlots.length > 0
+        ? `Re-authenticate ${PROVIDER_DEFAULT_ACCOUNT_LABEL} only — for a named account: clodex providers auth ${id} --account <name>`
+        : `Re-authenticate ${PROVIDER_DEFAULT_ACCOUNT_LABEL}`,
     });
   }
-  const accountSlots = Object.keys(provider.authAccounts ?? {}).sort();
   const effective = resolveActiveAccount(provider);
   if (shouldOfferAccountSwitch(provider)) {
     detailOptions.push({

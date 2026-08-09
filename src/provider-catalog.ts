@@ -116,12 +116,22 @@ export function resolveActiveAccount(
   const stored = provider.activeAuthAccount?.trim();
   const override = env[OAUTH_ACCOUNT_ENV]?.trim();
 
-  // A provider that cannot participate in the launch is never reported as
-  // broken: applySelectedOAuthAccount returns it untouched rather than
-  // throwing, precisely so a stale selector cannot take down a catalog load.
+  // A provider that cannot participate in a launch still gets its selection
+  // CHECKED. `applySelectedOAuthAccount` returns such a provider untouched
+  // rather than throwing — deliberately, so a stale selector cannot take down a
+  // catalog load — but "does not throw yet" is not "is fine": the selection is
+  // equally unhonourable, and hiding that means the listing looks healthy right
+  // up until the provider is enabled and every launch starts failing.
+  //
+  // So `broken` means "this selection names no such slot", not "this throws
+  // right now". The safety property is one-directional: anything that WOULD
+  // throw is reported broken; not everything reported broken throws today.
   const launchable = provider.authType === 'oauth' && provider.enabled;
   if (!launchable) {
-    return stored ? { kind: 'slot', name: stored, fromEnvironment: false } : { kind: 'default' };
+    if (!stored) return { kind: 'default' };
+    return has(stored)
+      ? { kind: 'slot', name: stored, fromEnvironment: false }
+      : { kind: 'broken', name: stored, fromEnvironment: false };
   }
 
   if (override) {

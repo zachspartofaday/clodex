@@ -350,10 +350,13 @@ describe('resolveActiveAccount', () => {
       .toEqual({ kind: 'broken', name: 'ghost', fromEnvironment: true });
   });
 
-  it('agrees with applySelectedOAuthAccount on every case', () => {
-    // The property that matters: the display never claims a launch that would
-    // throw, and never claims a failure that would launch. Checked against the
-    // real function rather than a restatement of it.
+  it('never calls a selection fine when a launch would throw on it', () => {
+    // One-directional on purpose. `applySelectedOAuthAccount` deliberately does
+    // NOT throw for a provider that cannot launch — a stale selector must not
+    // take down a catalog load — but such a selection is equally unhonourable,
+    // and calling it fine means the listing looks healthy right up until the
+    // provider is enabled. So: anything that would throw is reported broken;
+    // not everything reported broken throws today.
     const cases: Array<[string, RegistryProvider, NodeJS.ProcessEnv]> = [
       ['healthy stored', oauth, {}],
       ['healthy env', oauth, { CLODEX_OAUTH_ACCOUNT: 'work' }],
@@ -362,8 +365,8 @@ describe('resolveActiveAccount', () => {
       ['orphaned stored, no slots', { ...base, activeAuthAccount: 'ghost' }, {}],
       ['no selection at all', withSlots, {}],
       ['env on a provider with no slots', base, { CLODEX_OAUTH_ACCOUNT: 'work' }],
-      ['disabled provider', { ...withSlots, enabled: false, activeAuthAccount: 'ghost' }, {}],
-      ['non-oauth provider', { ...withSlots, authType: 'api', activeAuthAccount: 'ghost' }, {}],
+      ['disabled provider, orphaned', { ...withSlots, enabled: false, activeAuthAccount: 'ghost' }, {}],
+      ['non-oauth provider, orphaned', { ...withSlots, authType: 'api', activeAuthAccount: 'ghost' }, {}],
     ];
     for (const [label, provider, env] of cases) {
       const shown = resolveActiveAccount(provider, env);
@@ -373,9 +376,30 @@ describe('resolveActiveAccount', () => {
       } catch {
         launchThrew = true;
       }
-      expect(shown.kind === 'broken', `${label}: display says ${shown.kind}, launch ${launchThrew ? 'threw' : 'succeeded'}`)
-        .toBe(launchThrew);
+      if (launchThrew) {
+        expect(shown.kind, `${label}: launch throws, so the display must say broken`).toBe('broken');
+      }
     }
+  });
+
+  it('reports a latent orphan on a provider that cannot launch yet', () => {
+    // The gap this closes: the early return for a disabled or non-OAuth
+    // provider handed back `{ kind: 'slot' }` without checking membership, so
+    // an orphaned selection was invisible until someone enabled the provider
+    // and every launch began failing.
+    for (const provider of [
+      { ...withSlots, enabled: false, activeAuthAccount: 'ghost' },
+      { ...withSlots, authType: 'api' as const, activeAuthAccount: 'ghost' },
+    ]) {
+      expect(resolveActiveAccount(provider as RegistryProvider, {}))
+        .toEqual({ kind: 'broken', name: 'ghost', fromEnvironment: false });
+      // ...and it still does not throw, which is why the property above is
+      // one-directional rather than an iff.
+      expect(() => applySelectedOAuthAccount(provider as RegistryProvider, undefined)).not.toThrow();
+    }
+    // A healthy selection on a disabled provider is still just a slot.
+    expect(resolveActiveAccount({ ...withSlots, enabled: false, activeAuthAccount: 'work' } as RegistryProvider, {}))
+      .toEqual({ kind: 'slot', name: 'work', fromEnvironment: false });
   });
 
   it('reports the provider default as its own kind, never as a name', () => {
