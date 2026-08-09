@@ -8,29 +8,20 @@
 export interface ModelRuntimeCompatibility {
   /** Claude/Codex effort -> upstream reasoning_effort map. null disables that level. */
   reasoningEffortMap?: Record<string, string | null>;
+  /** Default effort for omitted client controls. null means variants are opt-in and no effort is injected. */
+  reasoningEffortDefault?: string | null;
   /** Explicitly enable or disable reasoning_effort for this model. */
   supportsReasoningEffort?: boolean;
   /** Additional request shape required when reasoning is enabled. */
   thinkingFormat?: 'deepseek' | 'qwen';
-  /**
-   * Wire effort value → reasoning-token budget, for an upstream that grades
-   * thinking by budget rather than by an effort word.
-   *
-   * Qwen is the case: it accepts no `reasoning_effort` at all, and OpenCode's
-   * reference client sends `thinking: {type:'enabled', budgetTokens: N}` with
-   * one budget per grade. Keyed by the mapped wire value so the transform can
-   * resolve a budget from the request it is already holding, without needing
-   * to know which clodex level produced it. When present with
-   * `thinkingFormat: 'qwen'`, `reasoning_effort` is REPLACED by the thinking
-   * object rather than sent alongside it — the upstream ignores the former.
-   */
-  thinkingBudgetMap?: Record<string, number>;
   /** Replay an empty reasoning_content field when prior assistant reasoning is absent. */
   requiresReasoningContentOnAssistantMessages?: boolean;
   /** Whether the upstream accepts the OpenAI `store` request field. */
   supportsStore?: boolean;
   /** Whether the upstream accepts Chat Completions `developer` messages. */
   supportsDeveloperRole?: boolean;
+  /** Whether the upstream accepts the sampling `temperature` field. */
+  supportsTemperature?: boolean;
   /** Output-token field accepted by the upstream Chat Completions endpoint. */
   maxTokensField?: 'max_tokens' | 'max_completion_tokens';
   /** Whether the upstream accepts long prompt-cache retention controls. */
@@ -113,6 +104,8 @@ export function transformOpenAiCompatibleRequestBody(
   const transformed = { ...body };
 
   if (compatibility.supportsStore === false) delete transformed.store;
+  if (compatibility.supportsTemperature === false) delete transformed.temperature;
+  if (compatibility.supportsReasoningEffort === false) delete transformed.reasoning_effort;
   if (compatibility.supportsLongCacheRetention === false) {
     delete transformed.prompt_cache_retention;
     delete transformed.promptCacheRetention;
@@ -127,20 +120,7 @@ export function transformOpenAiCompatibleRequestBody(
   if (hasReasoningEffort && compatibility.thinkingFormat === 'deepseek') {
     if (transformed.thinking === undefined) transformed.thinking = { type: 'enabled' };
   } else if (hasReasoningEffort && compatibility.thinkingFormat === 'qwen') {
-    const budget = compatibility.thinkingBudgetMap?.[String(transformed.reasoning_effort)];
-    if (budget !== undefined) {
-      // The graded form: a budget per level, which is what the upstream
-      // actually reads. `reasoning_effort` is dropped rather than sent
-      // alongside — Qwen ignores it, and leaving it in makes the request
-      // look like it carries a control it does not.
-      if (transformed.thinking === undefined) {
-        transformed.thinking = { type: 'enabled', budgetTokens: budget };
-      }
-      delete transformed.reasoning_effort;
-    } else if (transformed.enable_thinking === undefined) {
-      // No budget known for this value: fall back to the boolean toggle.
-      transformed.enable_thinking = true;
-    }
+    if (transformed.enable_thinking === undefined) transformed.enable_thinking = true;
   }
 
   return transformed;
