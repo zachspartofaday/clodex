@@ -86,31 +86,56 @@ export interface ProviderDisplayEntry {
 export const PROVIDER_DEFAULT_ACCOUNT_LABEL = '(provider default)';
 
 /**
- * The account a launch will ACTUALLY use, and whether the environment chose it.
+ * What a launch will ACTUALLY do with this provider's account selection.
  *
  * One home for the precedence, because the two surfaces that report it drifted
- * apart the moment they each computed it: the list view was corrected to
- * respect CLODEX_OAUTH_ACCOUNT while the interactive detail hint went on
- * naming the stored selection, so the same screen contradicted itself about
- * the live identity. Mirrors `applySelectedOAuthAccount`: the environment wins,
- * but only for an enabled OAuth provider whose slot actually exists — a
- * variable naming a missing slot makes the launch throw rather than select
- * anything, so reporting it as active here would be a second lie.
+ * apart the moment they each computed it. It mirrors
+ * `applySelectedOAuthAccount`, including its failure: a selector naming a slot
+ * that does not exist makes the launch THROW, so `broken` is a real outcome
+ * and not an edge case to paper over. Reporting such a selection as "active"
+ * promises a launch that will not happen — which is how the detail hint came
+ * to claim a missing account was in use.
  */
+export type ActiveAccount =
+  /** Launches on the provider's own credential. */
+  | { kind: 'default' }
+  /** Launches on this named slot. */
+  | { kind: 'slot'; name: string; fromEnvironment: boolean }
+  /** Launches on nothing: applySelectedOAuthAccount throws for this selector. */
+  | { kind: 'broken'; name: string; fromEnvironment: boolean };
+
 export function resolveActiveAccount(
   provider: Pick<
     import('./registry/types.js').RegistryProvider,
     'authAccounts' | 'activeAuthAccount' | 'authType' | 'enabled'
   >,
   env: NodeJS.ProcessEnv = process.env,
-): { name: string | undefined; fromEnvironment: boolean } {
+): ActiveAccount {
+  const slots = provider.authAccounts ?? {};
+  const has = (name: string) => Object.prototype.hasOwnProperty.call(slots, name);
+  const stored = provider.activeAuthAccount?.trim();
   const override = env[OAUTH_ACCOUNT_ENV]?.trim();
-  const applies = Boolean(override)
-    && provider.authType === 'oauth'
-    && provider.enabled
-    && Object.prototype.hasOwnProperty.call(provider.authAccounts ?? {}, override!);
-  if (applies) return { name: override!, fromEnvironment: true };
-  return { name: provider.activeAuthAccount, fromEnvironment: false };
+
+  // A provider that cannot participate in the launch is never reported as
+  // broken: applySelectedOAuthAccount returns it untouched rather than
+  // throwing, precisely so a stale selector cannot take down a catalog load.
+  const launchable = provider.authType === 'oauth' && provider.enabled;
+  if (!launchable) {
+    return stored ? { kind: 'slot', name: stored, fromEnvironment: false } : { kind: 'default' };
+  }
+
+  if (override) {
+    if (has(override)) return { kind: 'slot', name: override, fromEnvironment: true };
+    // The environment is ignored only where there is no slot table at all;
+    // otherwise it names a missing slot and the launch throws on it.
+    if (Object.keys(slots).length > 0) {
+      return { kind: 'broken', name: override, fromEnvironment: true };
+    }
+  }
+
+  if (!stored) return { kind: 'default' };
+  if (has(stored)) return { kind: 'slot', name: stored, fromEnvironment: false };
+  return { kind: 'broken', name: stored, fromEnvironment: false };
 }
 
 export async function resolveProvidersForDisplay(): Promise<ProviderDisplayEntry[]> {
@@ -132,27 +157,28 @@ export async function resolveProvidersForDisplay(): Promise<ProviderDisplayEntry
     // here too; showing the stored one while a variable overrides it would
     // misreport the live identity in exactly the persistent shell this feature
     // is meant to make visible.
-    const { name: active, fromEnvironment: overrideApplies } = resolveActiveAccount(provider);
+    const effective = resolveActiveAccount(provider);
+    const active = effective.kind === 'slot' ? effective.name : undefined;
+    const overrideApplies = effective.kind !== 'default' && effective.fromEnvironment;
+    // A broken selection is the reason every launch for this provider fails,
+    // so it is the LAST thing the listing should hide — and it is read from the
+    // shared resolver rather than re-derived here, which is how the detail hint
+    // drifted out of step in the first place.
+    const broken = effective.kind === 'broken' ? effective : undefined;
     const label = (name: string, isActive: boolean): string => {
       if (!isActive) return name;
       return overrideApplies
         ? `${name} (active, from ${OAUTH_ACCOUNT_ENV})`
         : `${name} (active)`;
     };
-    // An orphaned stored selection — one naming a slot that is gone — is the
-    // reason every launch for this provider now fails, so it is the LAST thing
-    // the listing should hide. Rendering only existing slots left it invisible,
-    // and an empty slot table suppressed the accounts section outright, so the
-    // non-interactive view showed nothing at all about a provider that could
-    // not launch.
-    const orphaned = provider.activeAuthAccount !== undefined
-      && !accountNames.includes(provider.activeAuthAccount);
     const accountList = [
-      label(PROVIDER_DEFAULT_ACCOUNT_LABEL, active === undefined && !orphaned),
+      label(PROVIDER_DEFAULT_ACCOUNT_LABEL, effective.kind === 'default'),
       ...accountNames.map(name => label(name, name === active)),
-      ...(orphaned ? [`${provider.activeAuthAccount} (selected, MISSING — every launch fails)`] : []),
+      ...(broken
+        ? [`${broken.name} (selected${broken.fromEnvironment ? ` via ${OAUTH_ACCOUNT_ENV}` : ''}, MISSING — every launch fails)`]
+        : []),
     ].join(', ');
-    const authLabel = accountNames.length || orphaned
+    const authLabel = accountNames.length || broken
       ? `${formatRegistryAuthLabel(provider)}; accounts: ${accountList}`
       : formatRegistryAuthLabel(provider);
     entries.push({

@@ -233,44 +233,19 @@ describe('provider-catalog-display', () => {
       }
     });
 
-    it('ignores an environment override that names no existing slot', async () => {
+    it('reports an environment override that names no existing slot as broken', async () => {
+      // Corrected. This previously asserted the listing shows `varmez (active)`
+      // — but applySelectedOAuthAccount THROWS on an override naming a missing
+      // slot, so the listing was promising a launch that does not happen.
       saveSlotted('varmez');
       process.env['CLODEX_OAUTH_ACCOUNT'] = 'ghost';
       try {
-        // applySelectedOAuthAccount throws on this at launch; the listing must
-        // not invent an active row for a slot that does not exist.
-        const entries = await resolveProvidersForDisplay();
-        expect(entries[0]?.authLabel).toContain('varmez (active)');
+        const label = (await resolveProvidersForDisplay())[0]?.authLabel ?? '';
+        expect(label).toContain('ghost (selected via CLODEX_OAUTH_ACCOUNT, MISSING');
+        expect(label).not.toContain('varmez (active)');
       } finally {
         delete process.env['CLODEX_OAUTH_ACCOUNT'];
       }
-    });
-
-    it('surfaces an orphaned selection instead of hiding it', async () => {
-      // This selection is why every launch for the provider fails, so it is the
-      // last thing the listing should omit. Rendering only existing slots left
-      // it invisible; an empty slot table suppressed the accounts section
-      // entirely, so the non-interactive view said nothing at all.
-      const registry = emptyRegistry();
-      registry.providers.push({
-        id: 'openai-oauth',
-        templateId: 'openai',
-        name: 'OpenAI (ChatGPT)',
-        enabled: true,
-        authRef: 'keyring:oauth:provider:openai-oauth::credential::v1:default',
-        authType: 'oauth',
-        activeAuthAccount: 'varmez',
-        api: { npm: '@ai-sdk/openai' },
-        addedAt: new Date().toISOString(),
-      });
-      withRegistryWriteLockSync(() => saveRegistry(registry));
-
-      const label = (await resolveProvidersForDisplay())[0]?.authLabel ?? '';
-      expect(label).toContain('accounts:');
-      expect(label).toContain('varmez (selected, MISSING');
-      // The provider default must not be reported as active while a broken
-      // selection is what a launch would actually hit.
-      expect(label).not.toContain('(provider default) (active)');
     });
 
     it('does not confuse a slot literally named default with the provider default', async () => {

@@ -8,6 +8,7 @@ import {
   PROVIDER_DEFAULT_ACCOUNT_LABEL,
   resolveActiveAccount,
   resolveProvidersForDisplay,
+  type ActiveAccount,
   type ProviderDisplayEntry,
 } from './provider-catalog.js';
 import {
@@ -180,6 +181,28 @@ ${pc.bold('Subcommands:')}
  * clear it, so gating on slots would hide the one repair the error recommends
  * and leave re-authenticating or hand-editing the registry as the only ways out.
  */
+/**
+ * The detail-menu hint for "Switch account", derived from the SAME resolver the
+ * listing reads. A broken selection has to read as broken here: this is the
+ * screen the launch error sends people to, so telling them the missing account
+ * is in use is the least useful thing it could say.
+ */
+export function accountSwitchHint(
+  provider: Pick<RegistryProvider, 'activeAuthAccount'>,
+  effective: ActiveAccount,
+): string {
+  if (effective.kind === 'broken') {
+    return effective.fromEnvironment
+      ? `${OAUTH_ACCOUNT_ENV}=${effective.name} names no such account — every launch fails`
+      : `Selected account "${effective.name}" no longer exists — every launch fails; clear it here`;
+  }
+  if (effective.kind === 'default') return `Every launch currently uses ${PROVIDER_DEFAULT_ACCOUNT_LABEL}`;
+  return effective.fromEnvironment
+    ? `${OAUTH_ACCOUNT_ENV}=${effective.name} overrides the stored `
+      + `${provider.activeAuthAccount ?? PROVIDER_DEFAULT_ACCOUNT_LABEL}`
+    : `Every launch currently uses ${effective.name}`;
+}
+
 export function shouldOfferAccountSwitch(
   provider: Pick<RegistryProvider, 'authAccounts' | 'activeAuthAccount'>,
 ): boolean {
@@ -507,12 +530,10 @@ async function runProviderDetail(id: string): Promise<'back' | 'removed'> {
       value: 'account',
       label: 'Switch account',
       // Same resolver the list view uses, so this screen cannot contradict it
-      // about which identity is live.
-      hint: accountSlots.length === 0
-        ? `Selected account "${provider.activeAuthAccount}" no longer exists — clear it here`
-        : effective.fromEnvironment
-          ? `${OAUTH_ACCOUNT_ENV}=${effective.name} overrides the stored ${provider.activeAuthAccount ?? PROVIDER_DEFAULT_ACCOUNT_LABEL}`
-          : `Every launch currently uses ${effective.name ?? PROVIDER_DEFAULT_ACCOUNT_LABEL}`,
+      // about which identity is live — including when the answer is "none of
+      // them, the launch fails", which this hint previously reported as a
+      // working account.
+      hint: accountSwitchHint(provider, effective),
     });
   }
   detailOptions.push(
@@ -579,7 +600,7 @@ async function runProviderDetail(id: string): Promise<'back' | 'removed'> {
         ...accountSlots.map(name => ({
           value: name,
           label: name,
-          hint: name === effective.name
+          hint: effective.kind === 'slot' && effective.name === name
             ? (effective.fromEnvironment ? `active via ${OAUTH_ACCOUNT_ENV}` : 'current')
             : name === provider.activeAuthAccount ? 'stored' : '',
         })),

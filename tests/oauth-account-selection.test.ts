@@ -3,7 +3,7 @@ import { mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { applySelectedOAuthAccount } from '../src/registry/materialize.js';
-import { shouldOfferAccountSwitch } from '../src/providers-command.js';
+import { accountSwitchHint, shouldOfferAccountSwitch } from '../src/providers-command.js';
 import { resolveActiveAccount } from '../src/provider-catalog.js';
 import { emptyRegistry, loadRegistry, loadRegistryStrict, saveRegistry } from '../src/registry/io.js';
 import { credentialIsReferenced } from '../src/registry/credential-lifecycle.js';
@@ -332,30 +332,68 @@ describe('resolveActiveAccount', () => {
   const oauth = { ...withSlots, activeAuthAccount: 'alt' } as RegistryProvider;
 
   it('reports the stored selection when nothing overrides it', () => {
-    expect(resolveActiveAccount(oauth, {})).toEqual({ name: 'alt', fromEnvironment: false });
+    expect(resolveActiveAccount(oauth, {})).toEqual({ kind: 'slot', name: 'alt', fromEnvironment: false });
   });
 
   it('reports the environment override, which is what a launch will use', () => {
-    // The drift this closes: the list view was corrected to respect the
-    // variable while the interactive hint went on naming the stored account,
-    // so one screen contradicted the other about the live identity.
     expect(resolveActiveAccount(oauth, { CLODEX_OAUTH_ACCOUNT: 'work' }))
-      .toEqual({ name: 'work', fromEnvironment: true });
+      .toEqual({ kind: 'slot', name: 'work', fromEnvironment: true });
   });
 
-  it('mirrors applySelectedOAuthAccount rather than trusting the variable', () => {
-    // A variable naming a missing slot makes the launch THROW rather than
-    // select anything, so reporting it as active would be a second lie. Same
-    // for a provider that cannot participate in the launch at all.
+  it('reports BROKEN for a selector the launch will throw on', () => {
+    // The state the previous shape could not express. Returning a plain name
+    // here promised a launch that does not happen: the detail hint read it as
+    // "every launch uses ghost" while applySelectedOAuthAccount threw.
+    expect(resolveActiveAccount({ ...withSlots, activeAuthAccount: 'ghost' }, {}))
+      .toEqual({ kind: 'broken', name: 'ghost', fromEnvironment: false });
     expect(resolveActiveAccount(oauth, { CLODEX_OAUTH_ACCOUNT: 'ghost' }))
-      .toEqual({ name: 'alt', fromEnvironment: false });
-    expect(resolveActiveAccount({ ...oauth, enabled: false }, { CLODEX_OAUTH_ACCOUNT: 'work' }))
-      .toEqual({ name: 'alt', fromEnvironment: false });
-    expect(resolveActiveAccount({ ...oauth, authType: 'api' }, { CLODEX_OAUTH_ACCOUNT: 'work' }))
-      .toEqual({ name: 'alt', fromEnvironment: false });
+      .toEqual({ kind: 'broken', name: 'ghost', fromEnvironment: true });
   });
 
-  it('reports the provider default as undefined, never as a name', () => {
-    expect(resolveActiveAccount(withSlots, {})).toEqual({ name: undefined, fromEnvironment: false });
+  it('agrees with applySelectedOAuthAccount on every case', () => {
+    // The property that matters: the display never claims a launch that would
+    // throw, and never claims a failure that would launch. Checked against the
+    // real function rather than a restatement of it.
+    const cases: Array<[string, RegistryProvider, NodeJS.ProcessEnv]> = [
+      ['healthy stored', oauth, {}],
+      ['healthy env', oauth, { CLODEX_OAUTH_ACCOUNT: 'work' }],
+      ['orphaned stored, slots remain', { ...withSlots, activeAuthAccount: 'ghost' }, {}],
+      ['env names a missing slot', oauth, { CLODEX_OAUTH_ACCOUNT: 'ghost' }],
+      ['orphaned stored, no slots', { ...base, activeAuthAccount: 'ghost' }, {}],
+      ['no selection at all', withSlots, {}],
+      ['env on a provider with no slots', base, { CLODEX_OAUTH_ACCOUNT: 'work' }],
+      ['disabled provider', { ...withSlots, enabled: false, activeAuthAccount: 'ghost' }, {}],
+      ['non-oauth provider', { ...withSlots, authType: 'api', activeAuthAccount: 'ghost' }, {}],
+    ];
+    for (const [label, provider, env] of cases) {
+      const shown = resolveActiveAccount(provider, env);
+      let launchThrew = false;
+      try {
+        applySelectedOAuthAccount(provider, env.CLODEX_OAUTH_ACCOUNT);
+      } catch {
+        launchThrew = true;
+      }
+      expect(shown.kind === 'broken', `${label}: display says ${shown.kind}, launch ${launchThrew ? 'threw' : 'succeeded'}`)
+        .toBe(launchThrew);
+    }
+  });
+
+  it('reports the provider default as its own kind, never as a name', () => {
+    expect(resolveActiveAccount(withSlots, {})).toEqual({ kind: 'default' });
+  });
+});
+
+describe('accountSwitchHint', () => {
+  it('says the launch fails when the selection is broken', () => {
+    expect(accountSwitchHint({ activeAuthAccount: 'ghost' }, { kind: 'broken', name: 'ghost', fromEnvironment: false }))
+      .toContain('every launch fails');
+    expect(accountSwitchHint({ activeAuthAccount: 'alt' }, { kind: 'broken', name: 'ghost', fromEnvironment: true }))
+      .toContain('names no such account');
+  });
+
+  it('names the live account otherwise', () => {
+    expect(accountSwitchHint({ activeAuthAccount: 'alt' }, { kind: 'slot', name: 'alt', fromEnvironment: false }))
+      .toContain('currently uses alt');
+    expect(accountSwitchHint({}, { kind: 'default' })).toContain('(provider default)');
   });
 });
