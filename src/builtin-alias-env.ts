@@ -77,6 +77,15 @@ export function routableBuiltinOverrides(
 export const WRAPPER_INJECTED_BUILTINS_ENV = 'CLODEX_INJECTED_BUILTINS';
 
 /**
+ * Claude Code ignores an injected Sonnet default for its auto-mode classifier
+ * when this marker carries the same value, while its normal `sonnet` resolver
+ * still honors ANTHROPIC_DEFAULT_SONNET_MODEL. Without the marker, remapping
+ * sonnet to a translated provider also remaps the classifier, whose private
+ * XML response contract non-Anthropic models do not reliably satisfy.
+ */
+export const SONNET_DEFAULT_PROBE_MARKER_ENV = 'CLAUDE_CODE_3P_PROBE_WROTE_SONNET_DEFAULT';
+
+/**
  * Apply remaps while distinguishing a USER's explicit env var from one a
  * previous clodex launch injected. Claude Code spawns nested processes with
  * the injected ANTHROPIC_DEFAULT_* values still in the environment; treating
@@ -135,7 +144,13 @@ export function clearInheritedBuiltinOverrides(
 ): void {
   for (const [alias, recorded] of inheritedInjections(baseEnv)) {
     const envName = BUILTIN_ALIAS_ENV[alias as BuiltinAliasName];
-    if (envName && stillOurs(baseEnv, envName, recorded)) delete env[envName];
+    if (envName && stillOurs(baseEnv, envName, recorded)) {
+      if (alias === 'sonnet'
+        && baseEnv[SONNET_DEFAULT_PROBE_MARKER_ENV] === baseEnv[envName]) {
+        delete env[SONNET_DEFAULT_PROBE_MARKER_ENV];
+      }
+      delete env[envName];
+    }
   }
   delete env[WRAPPER_INJECTED_BUILTINS_ENV];
 }
@@ -152,12 +167,17 @@ export function applyBuiltinModelOverridesWithProvenance(
   }
   clearInheritedBuiltinOverrides(env, baseEnv);
   applyBuiltinModelOverrides(env, overrides, explicit);
-  const injected = (Object.entries(BUILTIN_ALIAS_ENV) as Array<[BuiltinAliasName, string]>)
+  const injectedAliases = (Object.entries(BUILTIN_ALIAS_ENV) as Array<[BuiltinAliasName, string]>)
     .filter(([alias, envName]) => explicit[envName] === undefined && env[envName] !== undefined
-      && String(overrides?.[alias] ?? '').trim() !== '')
+      && String(overrides?.[alias] ?? '').trim() !== '');
+  const injected = injectedAliases
     .map(([alias, envName]) => `${alias}=${encodeURIComponent(String(env[envName]))}`);
   if (injected.length > 0) env[WRAPPER_INJECTED_BUILTINS_ENV] = injected.join(',');
   else delete env[WRAPPER_INJECTED_BUILTINS_ENV];
+
+  if (injectedAliases.some(([alias]) => alias === 'sonnet')) {
+    env[SONNET_DEFAULT_PROBE_MARKER_ENV] = env[BUILTIN_ALIAS_ENV.sonnet];
+  }
 }
 
 /**
