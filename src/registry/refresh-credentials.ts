@@ -1,6 +1,6 @@
 // src/registry/refresh-credentials.ts — keys for refresh-models (OpenCode placeholders, env fallbacks)
 
-import { applySelectedOAuthAccount, isAnonymousProvider } from './materialize.js';
+import { isAnonymousProvider, projectSelectedOAuthAccount } from './materialize.js';
 import {
   resolveProviderCredentialOverrideState,
   type ProviderCredentialOverrideState,
@@ -43,31 +43,15 @@ export interface RefreshCredentialOptions {
   ignoreProviderOverride?: boolean;
 }
 
-function providerForRefresh(
-  provider: RegistryProvider,
-  selected: string | undefined,
-): RegistryProvider {
-  // Disabled providers are excluded from launch materialization, but an
-  // explicit refresh is still offered for them. Project the identity they
-  // will use when enabled so their cache cannot be populated from a different
-  // account in advance. Missing stored/environment slots fail closed here.
-  const selectionCandidate = provider.authType === 'oauth' && !provider.enabled
-    ? { ...provider, enabled: true }
-    : provider;
-  // Pass an explicit empty selector when the captured environment had none;
-  // `undefined` would trigger applySelectedOAuthAccount's process.env default
-  // and could silently adopt a variable that changed after the snapshot.
-  const effective = applySelectedOAuthAccount(selectionCandidate, selected ?? '');
-  return provider.enabled ? effective : { ...effective, enabled: false };
-}
-
 export function refreshCredentialSnapshot(
   provider: RegistryProvider,
   selected: string | null | undefined = process.env[OAUTH_ACCOUNT_ENV],
   options: RefreshCredentialOptions = {},
 ): RefreshCredentialSnapshot {
   const environmentAccount = selected === null ? undefined : selected?.trim() || undefined;
-  const effective = providerForRefresh(provider, environmentAccount);
+  // Pass an explicit empty selector when the captured environment had none;
+  // `undefined` would adopt a variable that changed after this snapshot.
+  const effective = projectSelectedOAuthAccount(provider, environmentAccount ?? '');
   const activeAuthAccount = provider.activeAuthAccount?.trim() || undefined;
   const selectedName = environmentAccount || activeAuthAccount;
   const selectedAccount = provider.authType === 'oauth' && selectedName
@@ -174,7 +158,7 @@ export async function resolveRefreshCredentialWithSource(
   // Model entitlements are account-specific. Resolve exactly the provider
   // identity a launch in this process would use, never the registry's default
   // authRef merely because it is the field persisted at the top level.
-  const effectiveProvider = providerForRefresh(provider, selected ?? undefined);
+  const effectiveProvider = projectSelectedOAuthAccount(provider, selected ?? '');
   if (
     isAnonymousProvider(effectiveProvider)
     || effectiveProvider.authType === 'none'

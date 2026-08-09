@@ -244,7 +244,9 @@ describe('provider-catalog-display', () => {
       }
     });
 
-    it('counts only models cached for the temporary account', async () => {
+    it.each([true, false])(
+      'counts only models cached for the temporary account when enabled=%s',
+      async enabled => {
       const model = (id: string) => ({
         id,
         name: id,
@@ -256,7 +258,7 @@ describe('provider-catalog-display', () => {
         id: 'openai-oauth',
         templateId: 'openai',
         name: 'OpenAI (ChatGPT)',
-        enabled: true,
+        enabled,
         authRef: 'keyring:oauth:provider:openai-oauth::credential::v1:default',
         authType: 'oauth',
         activeAuthAccount: 'work',
@@ -285,6 +287,41 @@ describe('provider-catalog-display', () => {
       process.env.CLODEX_OAUTH_ACCOUNT = 'alt';
 
       expect((await resolveProvidersForDisplay())[0]?.modelCount).toBe(1);
+      },
+    );
+
+    it('does not count an OAuth account cache for a provider-key credential', async () => {
+      const registry = emptyRegistry();
+      registry.providers.push({
+        id: 'openai-oauth',
+        templateId: 'openai',
+        name: 'OpenAI (ChatGPT)',
+        enabled: true,
+        authRef: 'keyring:oauth:provider:openai-oauth::credential::v1:default',
+        authType: 'oauth',
+        activeAuthAccount: 'work',
+        authAccounts: {
+          work: {
+            authRef: 'keyring:oauth:provider:openai-oauth:account:work::credential::v1:w',
+            addedAt: '2026-08-09T00:00:00.000Z',
+          },
+        },
+        api: { npm: '@ai-sdk/openai' },
+        addedAt: '2026-08-09T00:00:00.000Z',
+        modelsCache: {
+          fetchedAt: '2026-08-09T00:00:00.000Z',
+          models: [{
+            id: 'work-only',
+            name: 'Work only',
+            upstreamModelId: 'work-only',
+            modelFormat: 'openai',
+          }],
+        },
+      });
+      withRegistryWriteLockSync(() => saveRegistry(registry));
+      process.env.CLODEX_KEY_OPENAI_OAUTH = 'provider-override-token';
+
+      expect((await resolveProvidersForDisplay())[0]?.modelCount).toBe(0);
     });
 
     it('reports the provider key as active without marking a slot active', async () => {
@@ -293,8 +330,9 @@ describe('provider-catalog-display', () => {
 
       const label = (await resolveProvidersForDisplay())[0]?.authLabel ?? '';
 
-      expect(label).toContain('CLODEX_KEY_OPENAI_OAUTH (active provider override');
-      expect(label).toContain('zachspartofaday (selected; credential overridden by CLODEX_KEY_OPENAI_OAUTH)');
+      expect(label).toContain('CLODEX_KEY_OPENAI_OAUTH (configured provider override');
+      expect(label).toContain('no isolated model catalog');
+      expect(label).toContain('zachspartofaday (selected; CLODEX_KEY_OPENAI_OAUTH configured; launch blocked');
       expect(label).not.toContain('zachspartofaday (active)');
       expect(label.match(/\(active\)/g)).toBeNull();
       expect(label).not.toContain('provider-override-token');

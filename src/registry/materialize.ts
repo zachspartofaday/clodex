@@ -183,6 +183,23 @@ export function applySelectedOAuthAccount(
   return projected;
 }
 
+/**
+ * Project the OAuth identity a provider would use if enabled, while preserving
+ * its current enabled flag. Display and explicit-refresh surfaces use this for
+ * dormant providers: their catalog must describe the selected account that
+ * will become active, not whichever account happened to populate the
+ * top-level cache before the provider was disabled.
+ */
+export function projectSelectedOAuthAccount(
+  provider: RegistryProvider,
+  selected: string | undefined = process.env[OAUTH_ACCOUNT_ENV],
+): RegistryProvider {
+  const dormantOAuth = provider.authType === 'oauth' && !provider.enabled;
+  const candidate = dormantOAuth ? { ...provider, enabled: true } : provider;
+  const projected = applySelectedOAuthAccount(candidate, selected);
+  return dormantOAuth ? { ...projected, enabled: false } : projected;
+}
+
 function materializeOne(
   provider: RegistryProvider,
   resolveCredential: CredentialResolver,

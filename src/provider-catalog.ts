@@ -7,7 +7,7 @@ import type { CompatibilityAgent } from './model-compatibility.js';
 import { oauthAuthRef } from './registry/import-build.js';
 import { loadRegistry } from './registry/io.js';
 import { loadRegistryProviders } from './registry/load.js';
-import { applySelectedOAuthAccount, isAnonymousProvider } from './registry/materialize.js';
+import { isAnonymousProvider, projectSelectedOAuthAccount } from './registry/materialize.js';
 import { OAUTH_ACCOUNT_ENV } from './oauth-account-selection.js';
 import { getTemplateById } from './provider-templates.js';
 import type { LocalProvider } from './types.js';
@@ -118,6 +118,7 @@ export type ActiveAccount =
    */
   | {
       kind: 'credential-override';
+      /** The override wins credential precedence, but runtime catalog loading fails closed. */
       credentialOverride: ProviderCredentialOverrideState;
       selection: AccountSelection;
       latentOrphan?: string;
@@ -287,8 +288,8 @@ export async function resolveProvidersForDisplay(): Promise<ProviderDisplayEntry
         }
         const selectedFrom = accountOverrideApplies ? `, from ${OAUTH_ACCOUNT_ENV}` : '';
         return selection.inactiveReason === 'disabled'
-          ? `${name} (selected${selectedFrom}; provider disabled; ${credentialOverride!.variable} will override its credential if enabled)`
-          : `${name} (selected${selectedFrom}; credential overridden by ${credentialOverride!.variable})`;
+          ? `${name} (selected${selectedFrom}; provider disabled; ${credentialOverride!.variable} has no isolated model catalog)`
+          : `${name} (selected${selectedFrom}; ${credentialOverride!.variable} configured; launch blocked — no isolated model catalog)`;
       }
       if (name === projected) {
         return accountOverrideApplies
@@ -304,10 +305,10 @@ export async function resolveProvidersForDisplay(): Promise<ProviderDisplayEntry
       ? PROVIDER_DEFAULT_ACCOUNT_LABEL
       : credentialOverrideWins
         ? selection.inactiveReason === 'disabled'
-          ? `${PROVIDER_DEFAULT_ACCOUNT_LABEL} (selected; provider disabled; ${credentialOverride!.variable} will override its credential if enabled)`
+          ? `${PROVIDER_DEFAULT_ACCOUNT_LABEL} (selected; provider disabled; ${credentialOverride!.variable} has no isolated model catalog)`
           : selection.inactiveReason === 'non-oauth'
             ? `${PROVIDER_DEFAULT_ACCOUNT_LABEL} (OAuth selection inactive; provider is not OAuth)`
-            : `${PROVIDER_DEFAULT_ACCOUNT_LABEL} (selected; credential overridden by ${credentialOverride!.variable})`
+            : `${PROVIDER_DEFAULT_ACCOUNT_LABEL} (selected; ${credentialOverride!.variable} configured; launch blocked — no isolated model catalog)`
         : selection.inactiveReason === 'disabled'
           ? `${PROVIDER_DEFAULT_ACCOUNT_LABEL} (selected; provider disabled)`
           : selection.inactiveReason === 'non-oauth'
@@ -338,8 +339,8 @@ export async function resolveProvidersForDisplay(): Promise<ProviderDisplayEntry
       ? storedAuthLabel
       : credentialOverrideWins
         ? provider.enabled
-          ? `${credentialOverride.variable} (active provider override; stored auth: ${storedAuthLabel})`
-          : `${credentialOverride.variable} (configured provider override; provider disabled; stored auth: ${storedAuthLabel})`
+          ? `${credentialOverride.variable} (configured provider override; launch blocked — no isolated model catalog; stored auth: ${storedAuthLabel})`
+          : `${credentialOverride.variable} (configured provider override; no isolated model catalog; provider disabled; stored auth: ${storedAuthLabel})`
         : `${storedAuthLabel}; ${credentialOverride.variable} is configured but blocked by the invalid OAuth account selection`;
     const authLabel = accountNames.length || broken || latent
       ? `${effectiveAuthLabel}; accounts: ${accountList}`
@@ -351,8 +352,11 @@ export async function resolveProvidersForDisplay(): Promise<ProviderDisplayEntry
       // persisted account hidden behind CLODEX_OAUTH_ACCOUNT. A broken
       // selection has no safe catalog to advertise.
       modelCount: (() => {
+        // A process-only provider credential has no account-owned discovery
+        // cache. Runtime materialization fails closed for the same reason.
+        if (credentialOverrideWins) return 0;
         try {
-          return applySelectedOAuthAccount(provider).modelsCache?.models.length ?? 0;
+          return projectSelectedOAuthAccount(provider).modelsCache?.models.length ?? 0;
         } catch {
           return 0;
         }

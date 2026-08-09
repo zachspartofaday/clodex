@@ -27,16 +27,23 @@ export async function loadRegistryProviders(
       || provider.authType === 'none'
       || provider.authRef === 'none:anonymous'
     ) return;
-    let credentialOverride = false;
-    let credentialAvailable = false;
+    let resolved;
     try {
-      const resolved = await resolveProviderCredentialWithSource(provider.id, provider.authRef, diag);
-      credentialOverride = resolved.credentialOverride !== undefined;
-      credentialAvailable = Boolean(resolved.credential);
-      if (resolved.credential) keys.set(provider.id, resolved.credential);
+      resolved = await resolveProviderCredentialWithSource(provider.id, provider.authRef, diag);
     } catch (err) {
       diag?.(`${provider.id}: credential unavailable — ${err instanceof Error ? err.message : String(err)}`);
+      return;
     }
+    const credentialOverride = resolved.credentialOverride !== undefined;
+    if (provider.enabled && resolved.credentialOverride) {
+      throw new Error(
+        `${resolved.credentialOverride.variable} is a process-scoped credential with no isolated model catalog `
+        + `for provider "${provider.id}". Save that credential as a provider or account and refresh its models, `
+        + 'or unset the variable.',
+      );
+    }
+    const credentialAvailable = Boolean(resolved.credential);
+    if (resolved.credential) keys.set(provider.id, resolved.credential);
     if (provider.authType === 'oauth' && credentialAvailable && !credentialOverride) {
       try {
         const accountId = await resolveProviderOAuthAccountId(provider.authRef, diag);

@@ -65,6 +65,16 @@ interface StandaloneServerCandidate {
   state: ServerRuntimeState;
 }
 
+function activeProviderCredentialOverride(env: NodeJS.ProcessEnv): string | null {
+  const variablePattern = isWindows
+    ? /^CLODEX_KEY_[A-Z0-9_]+$/i
+    : /^CLODEX_KEY_[A-Z0-9_]+$/;
+  return Object.keys(env)
+    .sort()
+    .find(name => variablePattern.test(name) && Boolean(env[name]?.trim()))
+    ?? null;
+}
+
 /**
  * Recover the private `clodex claude --proxy` listener inherited by a nested
  * process. The marker is accepted only when it names a valid loopback HTTPS
@@ -199,6 +209,17 @@ async function main(): Promise<void> {
       `clodex-claude: ${OAUTH_ACCOUNT_ENV} cannot override the credential snapshot of an already-running `
       + 'standalone server; restart that server with the override and then launch without the variable, '
       + 'or use clodex claude --proxy\n',
+    );
+    process.exit(1);
+  }
+  const providerCredentialOverride = state
+    ? activeProviderCredentialOverride(process.env)
+    : null;
+  if (state && providerCredentialOverride) {
+    process.stderr.write(
+      `clodex-claude: ${providerCredentialOverride} cannot override the credential snapshot of an already-running `
+      + 'standalone server; unset the process-only key to use the configured credential/catalog, or save that '
+      + 'credential as a provider or account, refresh its models, and restart the server\n',
     );
     process.exit(1);
   }

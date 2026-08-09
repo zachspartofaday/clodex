@@ -29,7 +29,7 @@ import { refreshAllProviderModels, refreshProviderModelsWithCredential } from '.
 import { authenticateProvider, providerAuthHelpText, validateOAuthAccountName, type ProviderAuthMethod } from './registry/provider-auth.js';
 import { supportsNativeOAuth } from './oauth/types.js';
 import { browseAllModels } from './prompts.js';
-import { applySelectedOAuthAccount, cachedModelToLocal } from './registry/materialize.js';
+import { cachedModelToLocal, projectSelectedOAuthAccount } from './registry/materialize.js';
 import { OAUTH_ACCOUNT_ENV } from './oauth-account-selection.js';
 import { loadPreferences } from './config.js';
 import type { LocalProvider } from './types.js';
@@ -203,22 +203,24 @@ export function accountSwitchOutcome(
     const variable = effective.credentialOverride.variable;
     if (effective.inactiveReason === 'non-oauth') {
       return {
-        ok: true,
+        ok: false,
         message: `Saved ${savedLabel} for ${providerName}, but this provider is not configured for OAuth account selection; `
-          + `${variable} remains the active provider credential override.`,
+          + `${variable} is configured and blocks launch because it has no isolated model catalog. Save that credential `
+          + 'as a provider or unset the variable.',
       };
     }
     if (effective.inactiveReason === 'disabled') {
       return {
-        ok: true,
-        message: `Saved ${savedLabel} for ${providerName} (provider disabled); ${variable} is configured to override `
-          + 'the selected account credential if the provider is enabled in this shell.',
+        ok: false,
+        message: `Saved ${savedLabel} for ${providerName} (provider disabled); ${variable} has no isolated model `
+          + 'catalog, so enabling the provider in this shell will fail until that credential is saved and refreshed '
+          + 'or the variable is unset.',
       };
     }
     return {
-      ok: true,
-      message: `Saved ${savedLabel} for ${providerName}, but ${variable} is the active provider credential override; `
-        + 'no OAuth account credential is active in this shell.',
+      ok: false,
+      message: `Saved ${savedLabel} for ${providerName}, but ${variable} has no isolated model catalog, so launches `
+        + 'are blocked. Save that credential as a provider or account and refresh its models, or unset the variable.',
     };
   }
 
@@ -310,13 +312,15 @@ export function accountSwitchHint(
       ? `; stored "${selected.latentOrphan}" is missing and will fail without ${OAUTH_ACCOUNT_ENV}`
       : '';
     if (effective.inactiveReason === 'non-oauth') {
-      return `${variable} is the active provider credential override; OAuth selection (${account}) is stored but inactive `
-        + `because this provider is not configured for OAuth${masked}`;
+      return `${variable} is configured but launches are blocked because it has no isolated model catalog; OAuth `
+        + `selection (${account}) is stored but inactive because this provider is not configured for OAuth${masked}`;
     }
     if (effective.inactiveReason === 'disabled') {
-      return `${variable} is configured to override ${account}'s credential if this provider is enabled${masked}`;
+      return `${variable} is configured for ${account} but has no isolated model catalog; enabling this provider `
+        + `will fail until that credential is saved and refreshed or the variable is unset${masked}`;
     }
-    return `${variable} overrides ${account}'s credential; no OAuth account credential is currently active${masked}`;
+    return `${variable} is configured for ${account}, but launches are blocked because it has no isolated model `
+      + `catalog; save and refresh that credential or unset the variable${masked}`;
   }
 
   if (effective.inactiveReason === 'non-oauth') {
@@ -697,19 +701,27 @@ async function runProviderDetail(id: string): Promise<'back' | 'removed'> {
   const registry = loadRegistry();
   const provider = registry.providers.find(pr => pr.id === id);
   if (!provider) return 'back';
+  const effective = resolveActiveAccount(provider);
 
   // The detail/browse surface must describe the same account a launch from
   // this process will use. If the selection is broken, fail closed to an
   // empty catalog while leaving the account controls available for repair.
   let modelProvider: RegistryProvider;
   try {
-    modelProvider = applySelectedOAuthAccount(provider);
+    modelProvider = projectSelectedOAuthAccount(provider);
+    if (effective.kind === 'credential-override') {
+      modelProvider = { ...modelProvider };
+      delete modelProvider.modelsCache;
+      delete modelProvider.refreshedAt;
+    }
   } catch {
     modelProvider = { ...provider };
     delete modelProvider.modelsCache;
+    delete modelProvider.refreshedAt;
   }
   const modelCount = modelProvider.modelsCache?.models.length ?? 0;
-  const authLabel = formatRegistryAuthLabel(provider);
+  const authLabel = (await resolveProvidersForDisplay()).find(entry => entry.id === id)?.authLabel
+    ?? formatRegistryAuthLabel(provider);
   printProviderDetailPanel(provider.name, modelCount, authLabel);
 
   const detailOptions: Array<{ value: string; label: string; hint?: string }> = [];
@@ -741,7 +753,6 @@ async function runProviderDetail(id: string): Promise<'back' | 'removed'> {
         : `Re-authenticate ${PROVIDER_DEFAULT_ACCOUNT_LABEL}`,
     });
   }
-  const effective = resolveActiveAccount(provider);
   if (shouldOfferAccountSwitch(provider)) {
     detailOptions.push({
       value: 'account',

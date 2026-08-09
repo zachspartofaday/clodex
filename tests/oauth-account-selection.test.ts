@@ -2,7 +2,11 @@ import { afterEach, beforeEach, describe, expect, it } from 'vitest';
 import { mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { applySelectedOAuthAccount, materializeRegistry } from '../src/registry/materialize.js';
+import {
+  applySelectedOAuthAccount,
+  materializeRegistry,
+  projectSelectedOAuthAccount,
+} from '../src/registry/materialize.js';
 import {
   accountSwitchHint,
   accountSwitchOutcome,
@@ -203,6 +207,41 @@ describe('selection on disabled providers', () => {
     expect(applySelectedOAuthAccount(disabled, 'personal')).toBe(disabled);
     // Enabled slotted providers keep the fail-loud contract.
     expect(() => applySelectedOAuthAccount(withSlots, 'personal')).toThrow(/has no account named/);
+  });
+
+  it('projects the catalog and credential a disabled OAuth provider will use when enabled', () => {
+    const disabled: RegistryProvider = {
+      ...withSlots,
+      enabled: false,
+      activeAuthAccount: 'work',
+      modelsCache: modelsCache('work-only'),
+      authAccounts: {
+        ...withSlots.authAccounts,
+        alt: { ...withSlots.authAccounts!.alt!, modelsCache: modelsCache('alt-only') },
+      },
+    };
+
+    const projected = projectSelectedOAuthAccount(disabled, 'alt');
+
+    expect(projected.enabled).toBe(false);
+    expect(projected.authRef).toBe(withSlots.authAccounts!.alt!.authRef);
+    expect(projected.modelsCache?.models.map(model => model.id)).toEqual(['alt-only']);
+    expect(disabled.modelsCache?.models.map(model => model.id)).toEqual(['work-only']);
+  });
+
+  it('fails closed when a disabled OAuth provider projects a missing slot', () => {
+    const disabled: RegistryProvider = { ...withSlots, enabled: false };
+    expect(() => projectSelectedOAuthAccount(disabled, 'personal')).toThrow(/has no account named/);
+  });
+
+  it('does not reinterpret a disabled non-OAuth provider catalog', () => {
+    const disabledApi: RegistryProvider = {
+      ...withSlots,
+      enabled: false,
+      authType: 'api',
+      modelsCache: modelsCache('api-only'),
+    };
+    expect(projectSelectedOAuthAccount(disabledApi, 'alt')).toBe(disabledApi);
   });
 });
 
@@ -716,8 +755,8 @@ describe('accountSwitchHint', () => {
       credentialOverride: { variable: 'CLODEX_KEY_OPENAI_OAUTH', fingerprint: 'a'.repeat(64) },
       selection: { kind: 'slot', name: 'work', fromEnvironment: false },
     });
-    expect(hint).toContain('CLODEX_KEY_OPENAI_OAUTH overrides account work');
-    expect(hint).toContain('no OAuth account credential is currently active');
+    expect(hint).toContain('CLODEX_KEY_OPENAI_OAUTH is configured for account work');
+    expect(hint).toContain('launches are blocked because it has no isolated model catalog');
   });
 });
 
@@ -749,9 +788,10 @@ describe('accountSwitchOutcome', () => {
       credentialOverride: { variable: 'CLODEX_KEY_OPENAI_OAUTH', fingerprint: 'b'.repeat(64) },
       selection: { kind: 'slot', name: 'work', fromEnvironment: false },
     });
-    expect(outcome.ok).toBe(true);
-    expect(outcome.message).toContain('CLODEX_KEY_OPENAI_OAUTH is the active provider credential override');
-    expect(outcome.message).toContain('no OAuth account credential is active');
+    expect(outcome.ok).toBe(false);
+    expect(outcome.message).toContain('CLODEX_KEY_OPENAI_OAUTH has no isolated model catalog');
+    expect(outcome.message).toContain('launches are blocked');
+    expect(outcome.message).toContain('unset the variable');
     expect(outcome.message).not.toContain('will launch as work');
   });
 

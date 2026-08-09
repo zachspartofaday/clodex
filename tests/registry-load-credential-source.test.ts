@@ -56,7 +56,7 @@ describe('runtime registry credential attribution', () => {
     credential.providerData.mockReset().mockResolvedValue({ plan: 'pro' });
   });
 
-  it('does not attach selected-account metadata to a provider-override token', async () => {
+  it('rejects a provider-override token before pairing it with selected-account metadata or models', async () => {
     state.registry = {
       schemaVersion: 3,
       providers: [oauthProvider({
@@ -77,12 +77,9 @@ describe('runtime registry credential attribution', () => {
       },
     });
 
-    const providers = await loadRegistryProviders();
-
-    expect(providers).toHaveLength(1);
-    expect(providers[0]?.apiKey).toBe('provider-override-token');
-    expect(providers[0]?.oauthAccountId).toBeUndefined();
-    expect(providers[0]?.providerData).toBeUndefined();
+    await expect(loadRegistryProviders()).rejects.toThrow(
+      /CLODEX_KEY_OPENAI_OAUTH is a process-scoped credential with no isolated model catalog.*Save that credential/s,
+    );
     expect(credential.resolve).toHaveBeenCalledWith(
       'openai-oauth',
       'keyring:oauth:provider:openai-oauth:account:work::credential::v1:w',
@@ -90,6 +87,121 @@ describe('runtime registry credential attribution', () => {
     );
     expect(credential.accountId).not.toHaveBeenCalled();
     expect(credential.providerData).not.toHaveBeenCalled();
+    expect(state.registry.providers[0]?.modelsCache?.models[0]?.id).toBe('gpt-test');
+  });
+
+  it('does not pair an API-key provider override with its persisted catalog', async () => {
+    state.registry = {
+      schemaVersion: 1,
+      providers: [oauthProvider({
+        id: 'groq',
+        templateId: 'groq',
+        name: 'Groq',
+        authRef: 'keyring:provider:groq',
+        authType: 'api',
+        api: { npm: '@ai-sdk/groq', url: 'https://api.groq.com/openai/v1' },
+      })],
+    };
+    credential.resolve.mockResolvedValue({
+      credential: 'provider-override-token',
+      credentialOverride: {
+        variable: 'CLODEX_KEY_GROQ',
+        fingerprint: 'c'.repeat(64),
+      },
+    });
+
+    await expect(loadRegistryProviders()).rejects.toThrow(
+      /CLODEX_KEY_GROQ is a process-scoped credential with no isolated model catalog/,
+    );
+    expect(state.registry.providers[0]?.modelsCache?.models[0]?.id).toBe('gpt-test');
+    expect(credential.accountId).not.toHaveBeenCalled();
+    expect(credential.providerData).not.toHaveBeenCalled();
+  });
+
+  it('does not pair a provider override with a temporary account slot cache', async () => {
+    const previous = process.env.CLODEX_OAUTH_ACCOUNT;
+    state.registry = {
+      schemaVersion: 4,
+      providers: [oauthProvider({
+        activeAuthAccount: 'work',
+        authAccounts: {
+          work: {
+            authRef: 'keyring:oauth:provider:openai-oauth:account:work::credential::v1:w',
+            addedAt: '2026-08-09T00:00:00.000Z',
+          },
+          alt: {
+            authRef: 'keyring:oauth:provider:openai-oauth:account:alt::credential::v1:a',
+            addedAt: '2026-08-09T00:00:00.000Z',
+            modelsCache: {
+              fetchedAt: '2026-08-09T01:00:00.000Z',
+              models: [{
+                id: 'alt-only',
+                name: 'Alt only',
+                upstreamModelId: 'alt-only',
+                modelFormat: 'openai',
+              }],
+            },
+          },
+        },
+      })],
+    };
+    process.env.CLODEX_OAUTH_ACCOUNT = 'alt';
+    credential.resolve.mockResolvedValue({
+      credential: 'provider-override-token',
+      credentialOverride: {
+        variable: 'CLODEX_KEY_OPENAI_OAUTH',
+        fingerprint: 'd'.repeat(64),
+      },
+    });
+
+    try {
+      await expect(loadRegistryProviders()).rejects.toThrow(
+        /CLODEX_KEY_OPENAI_OAUTH is a process-scoped credential with no isolated model catalog/,
+      );
+      expect(credential.resolve).toHaveBeenCalledWith(
+        'openai-oauth',
+        'keyring:oauth:provider:openai-oauth:account:alt::credential::v1:a',
+        undefined,
+      );
+      expect(state.registry.providers[0]?.authAccounts?.alt?.modelsCache?.models[0]?.id)
+        .toBe('alt-only');
+      expect(state.registry.providers[0]?.modelsCache?.models[0]?.id).toBe('gpt-test');
+    } finally {
+      if (previous === undefined) delete process.env.CLODEX_OAUTH_ACCOUNT;
+      else process.env.CLODEX_OAUTH_ACCOUNT = previous;
+    }
+  });
+
+  it('does not let an override on a disabled provider block other runtime providers', async () => {
+    state.registry = {
+      schemaVersion: 1,
+      providers: [
+        oauthProvider({ enabled: false }),
+        oauthProvider({
+          id: 'groq',
+          templateId: 'groq',
+          name: 'Groq',
+          authRef: 'keyring:provider:groq',
+          authType: 'api',
+          api: { npm: '@ai-sdk/groq', url: 'https://api.groq.com/openai/v1' },
+        }),
+      ],
+    };
+    credential.resolve.mockImplementation(async (providerId: string) => providerId === 'openai-oauth'
+      ? {
+          credential: 'disabled-provider-override',
+          credentialOverride: {
+            variable: 'CLODEX_KEY_OPENAI_OAUTH',
+            fingerprint: 'e'.repeat(64),
+          },
+        }
+      : { credential: 'stored-groq-key' });
+
+    const providers = await loadRegistryProviders();
+
+    expect(providers).toHaveLength(1);
+    expect(providers[0]).toMatchObject({ id: 'groq', apiKey: 'stored-groq-key' });
+    expect(providers[0]?.models.map(model => model.id)).toEqual(['gpt-test']);
   });
 
   it('retains selected-account metadata when the stored credential wins', async () => {

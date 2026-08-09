@@ -36,6 +36,7 @@ const logSuccessMock = vi.hoisted(() => vi.fn());
 const warnMock = vi.hoisted(() => vi.fn());
 const refreshProviderModelsWithCredentialMock = vi.hoisted(() => vi.fn());
 const refreshAllProviderModelsMock = vi.hoisted(() => vi.fn());
+const browseAllModelsMock = vi.hoisted(() => vi.fn());
 const TEST_HELPER_ID = 'a'.repeat(64);
 const helperRef = (account: string): string => `helper:v1:${TEST_HELPER_ID}:${account}`;
 
@@ -78,6 +79,11 @@ vi.mock('../src/registry/refresh-models.js', async importOriginal => ({
   ...await importOriginal<typeof import('../src/registry/refresh-models.js')>(),
   refreshProviderModelsWithCredential: refreshProviderModelsWithCredentialMock,
   refreshAllProviderModels: refreshAllProviderModelsMock,
+}));
+
+vi.mock('../src/prompts.js', async importOriginal => ({
+  ...await importOriginal<typeof import('../src/prompts.js')>(),
+  browseAllModels: browseAllModelsMock,
 }));
 
 vi.mock('../src/registry/provider-auth.js', async importOriginal => {
@@ -294,12 +300,12 @@ describe('interactive OAuth account switching', () => {
   const prevProviderOverride = process.env.CLODEX_KEY_OPENAI_OAUTH;
   const prevAccountOverride = process.env.CLODEX_OAUTH_ACCOUNT;
 
-  function slottedProvider(activeAuthAccount?: string): RegistryProvider {
+  function slottedProvider(activeAuthAccount?: string, enabled = true): RegistryProvider {
     return {
       id: 'openai-oauth',
       templateId: 'openai',
       name: 'OpenAI (ChatGPT)',
-      enabled: true,
+      enabled,
       authRef: 'keyring:oauth:provider:openai-oauth::credential::v1:default',
       authType: 'oauth',
       authAccounts: {
@@ -338,6 +344,7 @@ describe('interactive OAuth account switching', () => {
     warnMock.mockReset();
     refreshProviderModelsWithCredentialMock.mockReset();
     refreshAllProviderModelsMock.mockReset();
+    browseAllModelsMock.mockReset().mockResolvedValue(undefined);
   });
 
   afterEach(() => {
@@ -426,6 +433,67 @@ describe('interactive OAuth account switching', () => {
 
     expect(refreshProviderModelsWithCredentialMock).not.toHaveBeenCalled();
     expect(loadRegistry().providers[0]?.modelsCache?.models[0]?.id).toBe('default-only-model');
+  });
+
+  it('browses the projected account catalog for a disabled OAuth provider', async () => {
+    const registry = emptyRegistry();
+    const provider = slottedProvider('work', false);
+    provider.authAccounts!.alt!.modelsCache = {
+      fetchedAt: '2026-08-09T01:00:00.000Z',
+      models: [{
+        id: 'alt-only-model',
+        name: 'Alt only model',
+        upstreamModelId: 'alt-only-model',
+        modelFormat: 'openai',
+      }],
+    };
+    registry.providers.push(provider);
+    withRegistryWriteLockSync(() => saveRegistry(registry));
+    process.env.CLODEX_OAUTH_ACCOUNT = 'alt';
+    selectMock
+      .mockResolvedValueOnce('provider:openai-oauth')
+      .mockResolvedValueOnce('browse')
+      .mockResolvedValueOnce('done');
+
+    await expect(runProvidersCommand([])).resolves.toBe(0);
+
+    expect(browseAllModelsMock).toHaveBeenCalledOnce();
+    expect(browseAllModelsMock.mock.calls[0]?.[0].models.map((model: { id: string }) => model.id))
+      .toEqual(['alt-only-model']);
+  });
+
+  it('does not offer another account catalog when the disabled projection has no cache', async () => {
+    const registry = emptyRegistry();
+    registry.providers.push(slottedProvider('work', false));
+    withRegistryWriteLockSync(() => saveRegistry(registry));
+    process.env.CLODEX_OAUTH_ACCOUNT = 'alt';
+    selectMock
+      .mockResolvedValueOnce('provider:openai-oauth')
+      .mockResolvedValueOnce('back')
+      .mockResolvedValueOnce('done');
+
+    await expect(runProvidersCommand([])).resolves.toBe(0);
+
+    const detailOptions = selectMock.mock.calls[1]?.[0].options as Array<{ value: string }>;
+    expect(detailOptions.map(option => option.value)).not.toContain('browse');
+    expect(browseAllModelsMock).not.toHaveBeenCalled();
+  });
+
+  it('does not offer a stored account catalog under a provider-key override', async () => {
+    const registry = emptyRegistry();
+    registry.providers.push(slottedProvider('work'));
+    withRegistryWriteLockSync(() => saveRegistry(registry));
+    process.env.CLODEX_KEY_OPENAI_OAUTH = 'temporary-provider-token';
+    selectMock
+      .mockResolvedValueOnce('provider:openai-oauth')
+      .mockResolvedValueOnce('back')
+      .mockResolvedValueOnce('done');
+
+    await expect(runProvidersCommand([])).resolves.toBe(0);
+
+    const detailOptions = selectMock.mock.calls[1]?.[0].options as Array<{ value: string }>;
+    expect(detailOptions.map(option => option.value)).not.toContain('browse');
+    expect(browseAllModelsMock).not.toHaveBeenCalled();
   });
 });
 
