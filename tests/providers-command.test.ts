@@ -358,7 +358,7 @@ describe('interactive OAuth account switching', () => {
     vi.restoreAllMocks();
   });
 
-  it('invalidates then immediately refreshes after a real account transition', async () => {
+  it('retries a failed switch refresh when the same selected account still has no catalog', async () => {
     const registry = emptyRegistry();
     registry.providers.push(slottedProvider());
     withRegistryWriteLockSync(() => saveRegistry(registry));
@@ -391,8 +391,71 @@ describe('interactive OAuth account switching', () => {
     expect(logErrorMock).toHaveBeenCalledWith('OpenAI (ChatGPT): simulated discovery failure');
     expect(logSuccessMock).not.toHaveBeenCalledWith(expect.stringContaining('will launch'));
     expect(warnMock).toHaveBeenCalledWith(
-      expect.stringContaining('Saved work for OpenAI (ChatGPT), but automatic model refresh failed.'),
+      expect.stringContaining('did not produce a usable catalog'),
     );
+
+    selectMock
+      .mockResolvedValueOnce('provider:openai-oauth')
+      .mockResolvedValueOnce('account')
+      .mockResolvedValueOnce('work')
+      .mockResolvedValueOnce('done');
+
+    await expect(runProvidersCommand([])).resolves.toBe(0);
+
+    expect(refreshProviderModelsWithCredentialMock).toHaveBeenCalledTimes(2);
+    expect(loadRegistry().providers[0]).toMatchObject({ activeAuthAccount: 'work' });
+    expect(loadRegistry().providers[0]?.modelsCache).toBeUndefined();
+    expect(logSuccessMock).not.toHaveBeenCalledWith(expect.stringContaining('will launch'));
+  });
+
+  it('preserves an environment-account caveat when the persisted-selection refresh fails', async () => {
+    const registry = emptyRegistry();
+    registry.providers.push(slottedProvider());
+    withRegistryWriteLockSync(() => saveRegistry(registry));
+    process.env.CLODEX_OAUTH_ACCOUNT = 'alt';
+    selectMock
+      .mockResolvedValueOnce('provider:openai-oauth')
+      .mockResolvedValueOnce('account')
+      .mockResolvedValueOnce('work')
+      .mockResolvedValueOnce('done');
+    refreshProviderModelsWithCredentialMock.mockResolvedValue({
+      id: 'openai-oauth',
+      name: 'OpenAI (ChatGPT)',
+      ok: false,
+      reason: 'simulated discovery failure',
+    });
+
+    await expect(runProvidersCommand([])).resolves.toBe(0);
+
+    expect(warnMock).toHaveBeenCalledWith(expect.stringMatching(
+      /CLODEX_OAUTH_ACCOUNT=alt overrides it in this shell.*choose Switch account again/,
+    ));
+    expect(warnMock).not.toHaveBeenCalledWith(expect.stringContaining('clodex providers refresh-models'));
+    expect(logSuccessMock).not.toHaveBeenCalledWith(expect.stringContaining('will launch'));
+  });
+
+  it('never mistakes a provider name beginning with Saved for a safe failure caveat', async () => {
+    const registry = emptyRegistry();
+    const provider = slottedProvider();
+    provider.name = 'Saved Provider';
+    registry.providers.push(provider);
+    withRegistryWriteLockSync(() => saveRegistry(registry));
+    selectMock
+      .mockResolvedValueOnce('provider:openai-oauth')
+      .mockResolvedValueOnce('account')
+      .mockResolvedValueOnce('work')
+      .mockResolvedValueOnce('done');
+    refreshProviderModelsWithCredentialMock.mockResolvedValue({
+      id: 'openai-oauth',
+      name: 'Saved Provider',
+      ok: false,
+      reason: 'simulated discovery failure',
+    });
+
+    await expect(runProvidersCommand([])).resolves.toBe(0);
+
+    expect(warnMock).toHaveBeenCalledWith(expect.stringContaining('Saved work for Saved Provider.'));
+    expect(warnMock.mock.calls.flat()).not.toContainEqual(expect.stringContaining('will launch'));
   });
 
   it('refreshes the persisted account instead of a temporary process selection', async () => {
@@ -423,7 +486,7 @@ describe('interactive OAuth account switching', () => {
     );
   });
 
-  it('preserves the cache and skips refresh for a no-op selection', async () => {
+  it('refreshes a no-op selection to verify its credential without clearing its cache', async () => {
     const registry = emptyRegistry();
     registry.providers.push(slottedProvider('work'));
     withRegistryWriteLockSync(() => saveRegistry(registry));
@@ -432,11 +495,129 @@ describe('interactive OAuth account switching', () => {
       .mockResolvedValueOnce('account')
       .mockResolvedValueOnce('work')
       .mockResolvedValueOnce('done');
+    refreshProviderModelsWithCredentialMock.mockResolvedValue({
+      id: 'openai-oauth',
+      name: 'OpenAI (ChatGPT)',
+      ok: true,
+      modelCount: 1,
+    });
 
     await expect(runProvidersCommand([])).resolves.toBe(0);
 
-    expect(refreshProviderModelsWithCredentialMock).not.toHaveBeenCalled();
+    expect(refreshProviderModelsWithCredentialMock).toHaveBeenCalledOnce();
     expect(loadRegistry().providers[0]?.modelsCache?.models[0]?.id).toBe('default-only-model');
+  });
+
+  it('does not confirm a cacheless selection when refresh is skipped', async () => {
+    const registry = emptyRegistry();
+    registry.providers.push(slottedProvider());
+    withRegistryWriteLockSync(() => saveRegistry(registry));
+    selectMock
+      .mockResolvedValueOnce('provider:openai-oauth')
+      .mockResolvedValueOnce('account')
+      .mockResolvedValueOnce('work')
+      .mockResolvedValueOnce('done');
+    refreshProviderModelsWithCredentialMock.mockResolvedValue({
+      id: 'openai-oauth',
+      name: 'OpenAI (ChatGPT)',
+      ok: true,
+      skipped: true,
+      reason: 'simulated unsupported refresh',
+    });
+
+    await expect(runProvidersCommand([])).resolves.toBe(0);
+
+    expect(loadRegistry().providers[0]?.modelsCache).toBeUndefined();
+    expect(logSuccessMock).not.toHaveBeenCalledWith(expect.stringContaining('will launch'));
+    expect(warnMock).toHaveBeenCalledWith(expect.stringContaining('did not produce a usable catalog'));
+  });
+
+  it('revalidates a selected account with a cached catalog after its credential refresh fails', async () => {
+    const registry = emptyRegistry();
+    const provider = slottedProvider();
+    provider.authAccounts!.work!.modelsCache = {
+      fetchedAt: '2026-08-09T01:00:00.000Z',
+      models: [{
+        id: 'work-only-model',
+        name: 'Work only model',
+        upstreamModelId: 'work-only-model',
+        modelFormat: 'openai',
+      }],
+    };
+    registry.providers.push(provider);
+    withRegistryWriteLockSync(() => saveRegistry(registry));
+    refreshProviderModelsWithCredentialMock.mockResolvedValue({
+      id: 'openai-oauth',
+      name: 'OpenAI (ChatGPT)',
+      ok: false,
+      reason: 'OAuth token not available',
+    });
+
+    for (let attempt = 0; attempt < 2; attempt += 1) {
+      selectMock
+        .mockResolvedValueOnce('provider:openai-oauth')
+        .mockResolvedValueOnce('account')
+        .mockResolvedValueOnce('work')
+        .mockResolvedValueOnce('done');
+      await expect(runProvidersCommand([])).resolves.toBe(0);
+    }
+
+    expect(refreshProviderModelsWithCredentialMock).toHaveBeenCalledTimes(2);
+    expect(loadRegistry().providers[0]?.modelsCache?.models[0]?.id).toBe('work-only-model');
+    expect(logSuccessMock).not.toHaveBeenCalledWith(expect.stringContaining('will launch'));
+    expect(warnMock).toHaveBeenCalledWith(expect.stringContaining('did not produce a usable catalog'));
+  });
+
+  it('serializes a saved selection through its refresh before another switch can win', async () => {
+    const registry = emptyRegistry();
+    registry.providers.push(slottedProvider());
+    withRegistryWriteLockSync(() => saveRegistry(registry));
+    selectMock
+      .mockResolvedValueOnce('provider:openai-oauth')
+      .mockResolvedValueOnce('account')
+      .mockResolvedValueOnce('work')
+      .mockResolvedValueOnce('provider:openai-oauth')
+      .mockResolvedValueOnce('account')
+      .mockResolvedValueOnce('alt')
+      .mockResolvedValueOnce('done')
+      .mockResolvedValueOnce('done');
+
+    let releaseFirstRefresh!: () => void;
+    const firstRefreshGate = new Promise<void>(resolve => {
+      releaseFirstRefresh = resolve;
+    });
+    let markFirstRefreshStarted!: () => void;
+    const firstRefreshStarted = new Promise<void>(resolve => {
+      markFirstRefreshStarted = resolve;
+    });
+    const refreshedSelections: Array<string | undefined> = [];
+    refreshProviderModelsWithCredentialMock.mockImplementation(async () => {
+      refreshedSelections.push(loadRegistry().providers[0]?.activeAuthAccount);
+      if (refreshedSelections.length === 1) {
+        markFirstRefreshStarted();
+        await firstRefreshGate;
+      }
+      return {
+        id: 'openai-oauth',
+        name: 'OpenAI (ChatGPT)',
+        ok: false,
+        reason: 'simulated discovery failure',
+      };
+    });
+
+    const firstSwitch = runProvidersCommand([]);
+    await firstRefreshStarted;
+    const secondSwitch = runProvidersCommand([]);
+    await new Promise(resolve => setTimeout(resolve, 50));
+
+    // The second command has made its picker choice, but cannot persist it
+    // until the first command's targeted refresh and outcome are complete.
+    expect(loadRegistry().providers[0]?.activeAuthAccount).toBe('work');
+    releaseFirstRefresh();
+    await expect(Promise.all([firstSwitch, secondSwitch])).resolves.toEqual([0, 0]);
+
+    expect(refreshedSelections).toEqual(['work', 'alt']);
+    expect(loadRegistry().providers[0]?.activeAuthAccount).toBe('alt');
   });
 
   it('browses the projected account catalog for a disabled OAuth provider', async () => {

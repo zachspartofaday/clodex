@@ -36,6 +36,7 @@ import { deriveBrand } from '../models.js';
 import { resolveContextWindow } from '../context-window.js';
 import { getInstalledClaudeVersion } from '../launch.js';
 import { classifyFreeStatus, isFreeStatus } from '../free-models.js';
+import { isLegacyAnonymousCustomEndpoint } from './materialize.js';
 
 export interface RefreshProviderResult {
   id: string;
@@ -60,7 +61,13 @@ export interface RefreshModelsResult {
 async function refreshOAuthProvider(
   provider: RegistryProvider,
   accessToken: string,
-): Promise<{ models: CachedModel[]; baseUrl?: string; source: 'live' | 'seed'; failureReason?: string }> {
+): Promise<{
+  models: CachedModel[];
+  baseUrl?: string;
+  source: 'live' | 'seed';
+  failureReason?: string;
+  credentialRejected?: boolean;
+}> {
   const tpl = provider.templateId ?? provider.id;
   if (tpl === 'openai' || tpl === 'openai-oauth') return refreshOpenAiOAuthModels(accessToken);
   throw new Error(`refreshOAuthProvider: unsupported template "${tpl}"`);
@@ -188,7 +195,12 @@ async function fetchJsonWithAuth(
  */
 async function refreshOpenAiOAuthModels(
   accessToken: string,
-): Promise<{ models: CachedModel[]; source: 'live' | 'seed'; failureReason?: string }> {
+): Promise<{
+  models: CachedModel[];
+  source: 'live' | 'seed';
+  failureReason?: string;
+  credentialRejected?: boolean;
+}> {
   const TIMEOUT_MS = 10_000;
   const seedById = new Map(buildOpenAiOAuthModels().map(m => [m.id, m]));
   const toModels = (entries: OpenAiModelEntry[]) =>
@@ -220,10 +232,14 @@ async function refreshOpenAiOAuthModels(
   }
 
   // Tier 3: Static seed — reuse already-built map instead of calling the builder again.
+  const failures = [codexResult.error, chatGptResult.error]
+    .filter((error): error is string => error !== undefined);
+  const credentialFailure = failures.find(error => /(?:\brejected\b|\b401\b|\b403\b)/i.test(error));
   return {
     models: [...seedById.values()],
     source: 'seed',
-    failureReason: chatGptResult.error ?? codexResult.error,
+    failureReason: credentialFailure ?? chatGptResult.error ?? codexResult.error,
+    credentialRejected: credentialFailure !== undefined,
   };
 }
 
@@ -427,6 +443,16 @@ export async function refreshProviderModels(
   }
   const source = resolveModelSource(provider);
   if (source === 'manual-only') {
+    if (provider.authType !== 'none' && !apiKey) {
+      return {
+        id: provider.id,
+        name: provider.name,
+        ok: false,
+        reason: provider.authType === 'oauth'
+          ? 'OAuth token not available — try signing in again with clodex providers auth.'
+          : 'API key not available — cannot verify the saved model catalog.',
+      };
+    }
     return {
       id: provider.id,
       name: provider.name,
@@ -458,6 +484,19 @@ export async function refreshProviderModels(
       }
       const oauthResult = await refreshOAuthProvider(cacheProvider, apiKey);
       const failureDetail = oauthResult.failureReason ? ` (${oauthResult.failureReason})` : '';
+      if (oauthResult.source === 'seed' && oauthResult.credentialRejected) {
+        const count = cachedModelCount(cacheProvider);
+        return {
+          id: provider.id,
+          name: provider.name,
+          ok: false,
+          ...(count > 0 ? { modelCount: count } : {}),
+          reason: `OAuth credential was rejected${failureDetail}. `
+            + (count > 0
+              ? `Kept ${count} cached model${count === 1 ? '' : 's'}, but sign in again before launching.`
+              : 'Sign in again before refreshing or launching.'),
+        };
+      }
       if (oauthResult.source === 'seed' && cachedModelCount(cacheProvider) > 0) {
         // Live discovery failed — keep the existing cache (which may already include
         // models newer than the built-in fallback list) instead of overwriting it.
@@ -486,11 +525,21 @@ export async function refreshProviderModels(
       const effectiveKey = keyOptional && isLikelyPlaceholderKey(apiKey) ? '' : apiKey;
       if (!keyOptional && isLikelyPlaceholderKey(effectiveKey)) {
         if (cachedModelCount(cacheProvider) > 0) {
-          return skipWithCachedModels(
-            cacheProvider,
-            'A placeholder API key is configured — kept cached model list. '
-            + 'Add this provider again via clodex providers add with a real key to refresh live.',
-          );
+          if (isLegacyAnonymousCustomEndpoint(provider, effectiveKey)) {
+            return skipWithCachedModels(
+              cacheProvider,
+              'Legacy anonymous custom endpoint — kept cached model list.',
+            );
+          }
+          const count = cachedModelCount(cacheProvider);
+          return {
+            id: provider.id,
+            name: provider.name,
+            ok: false,
+            modelCount: count,
+            reason: `A placeholder API key is configured — kept ${count} cached model${count === 1 ? '' : 's'}, `
+              + 'but add this provider again with a real key before launching.',
+          };
         }
         return {
           id: provider.id,
@@ -513,11 +562,15 @@ export async function refreshProviderModels(
           (fetched.error.includes('rejected') || fetched.error.includes('401') || fetched.error.includes('403'))
           && cachedModelCount(cacheProvider) > 0
         ) {
-          return skipWithCachedModels(
-            cacheProvider,
-            `${fetched.error} Kept ${cachedModelCount(cacheProvider)} cached model${cachedModelCount(cacheProvider) === 1 ? '' : 's'} from import. `
-            + 'Update your API key via clodex providers add if you need a live refresh.',
-          );
+          const count = cachedModelCount(cacheProvider);
+          return {
+            id: provider.id,
+            name: provider.name,
+            ok: false,
+            modelCount: count,
+            reason: `${fetched.error} Kept ${count} cached model${count === 1 ? '' : 's'} from import, `
+              + 'but update the API key before launching.',
+          };
         }
         return { id: provider.id, name: provider.name, ok: false, reason: fetched.error };
       }

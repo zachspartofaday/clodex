@@ -93,7 +93,7 @@ export function isAnonymousProvider(
   return provider.authType === 'none' && provider.authRef === 'none:anonymous';
 }
 
-function isLegacyAnonymousCustomEndpoint(
+export function isLegacyAnonymousCustomEndpoint(
   provider: RegistryProvider,
   credential: string | null,
 ): boolean {

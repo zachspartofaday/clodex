@@ -797,7 +797,7 @@ describe('accountSwitchOutcome', () => {
 
   it('confirms plainly when the saved choice is what will launch', () => {
     expect(accountSwitchOutcome('OpenAI', 'work', { kind: 'slot', name: 'work', fromEnvironment: false }))
-      .toEqual({ ok: true, message: 'OpenAI will launch as work.' });
+      .toEqual({ ok: true, message: 'OpenAI will launch as work.', confirmsLaunch: true });
     // An override naming the SAME account is not worth a caveat.
     expect(accountSwitchOutcome('OpenAI', 'work', { kind: 'slot', name: 'work', fromEnvironment: true }).ok)
       .toBe(true);

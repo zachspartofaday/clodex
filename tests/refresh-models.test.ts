@@ -84,6 +84,105 @@ describe('refreshProviderModels', () => {
     expect(persistedRegistry.providers[0]?.modelsCache?.models[0]?.id).toBe('live-a');
   });
 
+  it('does not treat a cached manual-only OAuth provider as usable without its credential', async () => {
+    const registry: ProviderRegistry = {
+      schemaVersion: 1,
+      providers: [{
+        id: 'vertex',
+        templateId: 'vertex',
+        name: 'Vertex',
+        enabled: true,
+        authRef: 'keyring:provider:vertex',
+        authType: 'oauth',
+        api: { npm: '@ai-sdk/google-vertex', url: 'https://vertex.example/v1' },
+        modelsCache: {
+          fetchedAt: '2026-08-09T00:00:00.000Z',
+          models: [{
+            id: 'cached-model',
+            name: 'Cached model',
+            upstreamModelId: 'cached-model',
+            modelFormat: 'openai',
+          }],
+        },
+        addedAt: '2026-01-01T00:00:00.000Z',
+      }],
+    };
+
+    const result = await refreshProviderModels('vertex', null, registry);
+
+    expect(result).toMatchObject({
+      ok: false,
+      reason: expect.stringContaining('OAuth token not available'),
+    });
+    expect(fetchTemplateModels).not.toHaveBeenCalled();
+    expect(saveRegistry).not.toHaveBeenCalled();
+  });
+
+  it('retains imported models but rejects a placeholder API credential', async () => {
+    const registry: ProviderRegistry = {
+      schemaVersion: 1,
+      providers: [{
+        id: 'groq',
+        templateId: 'groq',
+        name: 'Groq',
+        enabled: true,
+        authRef: 'keyring:provider:groq',
+        authType: 'api',
+        api: { npm: '@ai-sdk/groq', url: 'https://api.groq.com/openai/v1' },
+        modelsCache: {
+          fetchedAt: '2026-08-09T00:00:00.000Z',
+          models: [{
+            id: 'imported-model',
+            name: 'Imported model',
+            upstreamModelId: 'imported-model',
+            modelFormat: 'openai',
+          }],
+        },
+        addedAt: '2026-01-01T00:00:00.000Z',
+      }],
+    };
+
+    const result = await refreshProviderModels('groq', 'placeholder', registry);
+
+    expect(result).toMatchObject({
+      ok: false,
+      modelCount: 1,
+      reason: expect.stringContaining('placeholder API key'),
+    });
+    expect(fetchTemplateModels).not.toHaveBeenCalled();
+    expect(saveRegistry).not.toHaveBeenCalled();
+  });
+
+  it('preserves the legacy local credential as anonymous for cached custom endpoints', async () => {
+    const registry: ProviderRegistry = {
+      schemaVersion: 1,
+      providers: [{
+        id: 'legacy-local',
+        templateId: 'custom-openai',
+        name: 'Legacy local',
+        enabled: true,
+        authRef: 'keyring:provider:legacy-local',
+        api: { npm: '@ai-sdk/openai-compatible', url: 'http://127.0.0.1:11434/v1' },
+        modelsCache: {
+          fetchedAt: '2026-08-09T00:00:00.000Z',
+          models: [{
+            id: 'local-model',
+            name: 'Local model',
+            upstreamModelId: 'local-model',
+            modelFormat: 'openai',
+          }],
+        },
+        addedAt: '2026-01-01T00:00:00.000Z',
+      }],
+    };
+
+    const result = await refreshProviderModels('legacy-local', 'local', registry);
+
+    expect(result).toMatchObject({ ok: true, skipped: true, modelCount: 1 });
+    expect(fetchTemplateModels).not.toHaveBeenCalled();
+    expect(saveRegistry).not.toHaveBeenCalled();
+  });
+
   it('does not apply discovery results after credentials change', async () => {
     const initialRegistry: ProviderRegistry = {
       schemaVersion: 1,
@@ -497,7 +596,11 @@ describe('refreshProviderModels', () => {
       .toEqual(['alt-only']);
 
     const retry = await refreshProviderModelsWithCredential('groq', resolveKey, 'alt');
-    expect(retry).toMatchObject({ ok: true, skipped: true, modelCount: 1 });
+    expect(retry).toMatchObject({
+      ok: false,
+      modelCount: 1,
+      reason: expect.stringContaining('update the API key before launching'),
+    });
     expect(registry.providers[0]?.modelsCache?.models.map(model => model.id)).toEqual(['work-only']);
     expect(registry.providers[0]?.authAccounts?.alt?.modelsCache?.models.map(model => model.id))
       .toEqual(['alt-only']);

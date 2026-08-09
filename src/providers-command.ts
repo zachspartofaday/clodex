@@ -24,6 +24,7 @@ import {
 } from './registry/crud.js';
 import { reconcilePendingCredentialDeletes } from './registry/credential-lifecycle.js';
 import { loadRegistry } from './registry/io.js';
+import { withProviderMutationLock } from './registry/lock.js';
 import type { RegistryProvider } from './registry/types.js';
 import { refreshAllProviderModels, refreshProviderModelsWithCredential } from './registry/refresh-models.js';
 import { authenticateProvider, providerAuthHelpText, validateOAuthAccountName, type ProviderAuthMethod } from './registry/provider-auth.js';
@@ -196,7 +197,7 @@ export function accountSwitchOutcome(
   providerName: string,
   saved: string | undefined,
   effective: ActiveAccount,
-): { ok: boolean; message: string } {
+): { ok: boolean; message: string; confirmsLaunch?: true } {
   const savedLabel = saved ?? PROVIDER_DEFAULT_ACCOUNT_LABEL;
 
   if (effective.kind === 'credential-override') {
@@ -278,7 +279,11 @@ export function accountSwitchOutcome(
         + 'overrides it in this shell.',
     };
   }
-  return { ok: true, message: `${providerName} will launch as ${savedLabel}.` };
+  return {
+    ok: true,
+    message: `${providerName} will launch as ${savedLabel}.`,
+    confirmsLaunch: true,
+  };
 }
 
 export function accountSwitchServerRestartWarning(
@@ -836,55 +841,68 @@ async function runProviderDetail(id: string): Promise<'back' | 'removed'> {
     });
     // Only isCancel: a falsy check would read the sentinel as a cancellation.
     if (p.isCancel(chosen)) return 'back';
-    const result = await setActiveOAuthAccount(id, chosen === providerDefault ? undefined : chosen);
-    if (!result.updated) {
-      p.log.error(result.error ?? 'Could not switch account.');
-      return 'back';
-    }
-    if (!result.provider) {
-      p.log.error('Account selection was saved, but the resulting provider state could not be read.');
-      return 'back';
-    }
-    // Re-resolved against the SAVED state rather than reported from the picker
-    // choice. Checking only whether the variable is present said "will launch
-    // as X" while an override naming a missing slot made every launch throw —
-    // an apparent repair that fixed nothing and said nothing.
-    const outcome = accountSwitchOutcome(
-      provider.name,
-      result.account,
-      resolveActiveAccount(result.provider),
-    );
-    // The catalog belongs to the credential identity. The write above parks
-    // the old account's cache and projects only a cache already owned by the
-    // selected identity; refresh immediately to rebuild or update it. A no-op
-    // preserves and does not re-fetch the valid cache.
-    // This refresh belongs to the persisted transition, not to a temporary
-    // per-process account override. Explicit refresh commands still honor the
-    // environment; the switch refresh deliberately rebuilds the cache for the
-    // identity every future launch will use after that override is unset.
-    const refreshExitCode = result.changed
-      ? await runProvidersRefreshModels(id, {
+    return withProviderMutationLock<'back'>(id, async (): Promise<'back'> => {
+      const result = await setActiveOAuthAccount(id, chosen === providerDefault ? undefined : chosen);
+      if (!result.updated) {
+        p.log.error(result.error ?? 'Could not switch account.');
+        return 'back';
+      }
+      if (!result.provider) {
+        p.log.error('Account selection was saved, but the resulting provider state could not be read.');
+        return 'back';
+      }
+      // The catalog belongs to the credential identity. Keep the saved
+      // selection and its targeted refresh in one provider mutation. Otherwise
+      // a concurrent switch can win between the two and make this command
+      // refresh and report a different account.
+      //
+      // Refresh every explicit selection, including a selection no-op. Cache
+      // presence does not prove that its credential still resolves, and this
+      // makes the recovery instruction below a real retry rather than another
+      // false success.
+      const refreshExitCode = await runProvidersRefreshModels(id, {
         accountOverride: null,
         ignoreProviderCredentialOverride: true,
-      })
-      : undefined;
-    if (outcome.ok && refreshExitCode !== undefined && refreshExitCode !== 0) {
-      const savedLabel = result.account ?? PROVIDER_DEFAULT_ACCOUNT_LABEL;
-      p.log.warn(
-        `Saved ${savedLabel} for ${provider.name}, but automatic model refresh failed. `
-        + `Run clodex providers refresh-models ${id} before relying on this selection for launches.`,
+      });
+      const currentProvider = loadRegistry().providers.find(candidate => candidate.id === id);
+      if (!currentProvider) {
+        p.log.error('Account selection was saved, but the resulting provider state could not be read.');
+        return 'back';
+      }
+      // Re-resolved against the state that won the same provider lock rather
+      // than reported from the picker choice.
+      const outcome = accountSwitchOutcome(
+        currentProvider.name,
+        result.account,
+        resolveActiveAccount(currentProvider),
       );
-    } else if (outcome.ok) {
-      p.log.success(outcome.message);
-    } else {
-      p.log.warn(outcome.message);
-    }
-    const restartWarning = accountSwitchServerRestartWarning(
-      readLiveServerRuntimeStates().length,
-      result.changed,
-    );
-    if (restartWarning) p.log.warn(restartWarning);
-    return 'back';
+      const selectedCatalogReady = Boolean(currentProvider.modelsCache?.models.length);
+      if (
+        outcome.ok
+        && currentProvider.enabled
+        && currentProvider.authType === 'oauth'
+        && (refreshExitCode !== 0 || !selectedCatalogReady)
+      ) {
+        const savedLabel = result.account ?? PROVIDER_DEFAULT_ACCOUNT_LABEL;
+        const savedContext = outcome.confirmsLaunch
+          ? `Saved ${savedLabel} for ${currentProvider.name}.`
+          : outcome.message;
+        p.log.warn(
+          `${savedContext} Automatic model refresh for the saved selection did not produce a usable catalog; `
+          + 'choose Switch account again to retry it before relying on that selection for launches.',
+        );
+      } else if (outcome.ok) {
+        p.log.success(outcome.message);
+      } else {
+        p.log.warn(outcome.message);
+      }
+      const restartWarning = accountSwitchServerRestartWarning(
+        readLiveServerRuntimeStates().length,
+        result.changed,
+      );
+      if (restartWarning) p.log.warn(restartWarning);
+      return 'back';
+    });
   }
 
   if (action === 'toggle') {
