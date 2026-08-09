@@ -115,11 +115,21 @@ async function callModel(model, effort) {
   }
 }
 
-/** Sample one setting `trials` times, retrying transient failures. */
+/**
+ * Sample one setting `trials` times, retrying transient failures.
+ *
+ * Repeated trials exist to separate signal from noise in a REPLY. A level that
+ * is not replying has nothing to average, so the loop stops the moment the
+ * answer is settled: one durable rejection is proof enough that the value is
+ * unsupported, and a level still unreachable after its retries will not become
+ * reachable by asking `trials` more times. These are paid calls on someone's
+ * plan, and a full-catalog run should not spend them re-confirming a refusal.
+ */
 async function sample(model, effort, label) {
   const readings = [];
   let rejection;
   let transient;
+  let stoppedEarly = false;
   for (let trial = 0; trial < trials; trial++) {
     let result;
     for (let attempt = 0; attempt <= RETRIES; attempt++) {
@@ -127,15 +137,24 @@ async function sample(model, effort, label) {
       if (result.outcome !== 'transient') break;
       await sleep(PAUSE_MS * (attempt + 2));
     }
-    if (result.outcome === 'ok') readings.push(result.reasoning);
-    else if (result.outcome === 'rejected') rejection = result;
-    else transient = result;
+    if (result.outcome === 'ok') {
+      readings.push(result.reasoning);
+    } else if (result.outcome === 'rejected') {
+      rejection = result;
+      stoppedEarly = trial < trials - 1;
+      break;
+    } else {
+      transient = result;
+      stoppedEarly = trial < trials - 1;
+      break;
+    }
     await sleep(PAUSE_MS);
   }
   process.stderr.write(
     `  ${label.padEnd(9)} ${rejection ? `REJECTED ${rejection.status} ${rejection.error}` : ''}`
     + `${!rejection && readings.length ? `reasoning=[${readings.join(', ')}]` : ''}`
-    + `${!rejection && !readings.length ? `unreachable (${transient?.error ?? 'unknown'})` : ''}\n`,
+    + `${!rejection && !readings.length ? `unreachable (${transient?.error ?? 'unknown'})` : ''}`
+    + `${stoppedEarly ? ' — stopped early, no point re-asking' : ''}\n`,
   );
   return { readings, rejection, transient };
 }
