@@ -392,14 +392,14 @@ describe('resolveActiveAccount', () => {
       { ...withSlots, authType: 'api' as const, activeAuthAccount: 'ghost' },
     ]) {
       expect(resolveActiveAccount(provider as RegistryProvider, {}))
-        .toEqual({ kind: 'broken', name: 'ghost', fromEnvironment: false });
+        .toEqual({ kind: 'broken', name: 'ghost', fromEnvironment: false, dormant: true });
       // ...and it still does not throw, which is why the property above is
       // one-directional rather than an iff.
       expect(() => applySelectedOAuthAccount(provider as RegistryProvider, undefined)).not.toThrow();
     }
     // A healthy selection on a disabled provider is still just a slot.
     expect(resolveActiveAccount({ ...withSlots, enabled: false, activeAuthAccount: 'work' } as RegistryProvider, {}))
-      .toEqual({ kind: 'slot', name: 'work', fromEnvironment: false });
+      .toEqual({ kind: 'slot', name: 'work', fromEnvironment: false, dormant: true });
   });
 
   it('keeps a stored orphan visible when an override is masking it', () => {
@@ -439,6 +439,32 @@ describe('resolveActiveAccount', () => {
   it('does not invent a latent orphan for a healthy stored selection', () => {
     expect(resolveActiveAccount(oauth, { CLODEX_OAUTH_ACCOUNT: 'work' }))
       .toEqual({ kind: 'slot', name: 'work', fromEnvironment: true });
+  });
+
+  it('phrases a dormant provider as saved state, not a live outcome', () => {
+    // "every launch fails" is untrue of a provider that is not launching:
+    // applySelectedOAuthAccount returns it untouched and materialization
+    // excludes it. The selection still matters — it will start failing the
+    // moment the provider is enabled — so it is reported, differently.
+    const dormant = resolveActiveAccount(
+      { ...withSlots, enabled: false, activeAuthAccount: 'ghost' } as RegistryProvider, {},
+    );
+    expect(dormant).toMatchObject({ kind: 'broken', dormant: true });
+    const hint = accountSwitchHint({ activeAuthAccount: 'ghost' }, dormant);
+    expect(hint).toContain('will fail if this provider is enabled');
+    expect(hint).not.toContain('every launch fails');
+  });
+
+  it('does not report one broken selection as two', () => {
+    // Stored and override naming the SAME missing slot is a single failure.
+    // Carrying it as a latent orphan as well rendered `ghost` twice and made
+    // the hint say the stored account was missing "too".
+    const both = { ...withSlots, activeAuthAccount: 'ghost' } as RegistryProvider;
+    expect(resolveActiveAccount(both, { CLODEX_OAUTH_ACCOUNT: 'ghost' }))
+      .toEqual({ kind: 'broken', name: 'ghost', fromEnvironment: true });
+    // Two DIFFERENT missing names remain two failures.
+    expect(resolveActiveAccount(both, { CLODEX_OAUTH_ACCOUNT: 'phantom' }))
+      .toEqual({ kind: 'broken', name: 'phantom', fromEnvironment: true, latentOrphan: 'ghost' });
   });
 
   it('reports the provider default as its own kind, never as a name', () => {

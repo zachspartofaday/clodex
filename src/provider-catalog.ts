@@ -98,11 +98,22 @@ export const PROVIDER_DEFAULT_ACCOUNT_LABEL = '(provider default)';
  */
 export type ActiveAccount =
   /** Launches on the provider's own credential. */
-  | { kind: 'default'; latentOrphan?: string }
+  | { kind: 'default'; latentOrphan?: string; dormant?: true }
   /** Launches on this named slot. */
-  | { kind: 'slot'; name: string; fromEnvironment: boolean; latentOrphan?: string }
-  /** Launches on nothing: this selector names no such slot. */
-  | { kind: 'broken'; name: string; fromEnvironment: boolean; latentOrphan?: string };
+  | { kind: 'slot'; name: string; fromEnvironment: boolean; latentOrphan?: string; dormant?: true }
+  /** Cannot be honoured: this selector names no such slot. */
+  | { kind: 'broken'; name: string; fromEnvironment: boolean; latentOrphan?: string; dormant?: true };
+
+/**
+ * `dormant` — the provider cannot launch at all (disabled, or not OAuth), so
+ * none of this describes a CURRENT outcome.
+ *
+ * The selection still matters, which is why it is resolved rather than
+ * skipped: a broken one will start failing the moment the provider is enabled.
+ * But saying "every launch fails" about a provider that is not launching is
+ * simply untrue, and materialization excludes it entirely. Callers use this to
+ * phrase a saved state rather than a live one.
+ */
 
 /**
  * `latentOrphan` — a STORED selection that names no slot while something else
@@ -138,15 +149,19 @@ export function resolveActiveAccount(
   // throw is reported broken; not everything reported broken throws today.
   const launchable = provider.authType === 'oauth' && provider.enabled;
   if (!launchable) {
-    if (!stored) return { kind: 'default' };
+    if (!stored) return { kind: 'default', dormant: true };
     return has(stored)
-      ? { kind: 'slot', name: stored, fromEnvironment: false }
-      : { kind: 'broken', name: stored, fromEnvironment: false };
+      ? { kind: 'slot', name: stored, fromEnvironment: false, dormant: true }
+      : { kind: 'broken', name: stored, fromEnvironment: false, dormant: true };
   }
 
   // Carried on whatever answer wins below: a stored selection that names no
   // slot is still broken while an override happens to be masking it.
-  const latentOrphan = stored && !has(stored) ? { latentOrphan: stored } : {};
+  // Only when it names something OTHER than whatever is currently winning:
+  // one broken selection reported twice reads as two separate failures.
+  const latentOrphan = stored && !has(stored) && stored !== override
+    ? { latentOrphan: stored }
+    : {};
 
   if (override) {
     if (has(override)) return { kind: 'slot', name: override, fromEnvironment: true, ...latentOrphan };
@@ -185,7 +200,10 @@ export async function resolveProvidersForDisplay(): Promise<ProviderDisplayEntry
     // misreport the live identity in exactly the persistent shell this feature
     // is meant to make visible.
     const effective = resolveActiveAccount(provider);
-    const active = effective.kind === 'slot' ? effective.name : undefined;
+    // `(active)` is a claim about what a launch will do, so a dormant provider
+    // gets `(selected)` instead — the account is saved, nothing is running.
+    const active = effective.kind === 'slot' && !effective.dormant ? effective.name : undefined;
+    const selected = effective.kind === 'slot' && effective.dormant ? effective.name : undefined;
     const overrideApplies = effective.kind !== 'default' && effective.fromEnvironment;
     // A broken selection is the reason every launch for this provider fails,
     // so it is the LAST thing the listing should hide — and it is read from the
@@ -205,10 +223,14 @@ export async function resolveProvidersForDisplay(): Promise<ProviderDisplayEntry
         : `${name} (active)`;
     };
     const accountList = [
-      label(PROVIDER_DEFAULT_ACCOUNT_LABEL, effective.kind === 'default'),
-      ...accountNames.map(name => label(name, name === active)),
+      label(PROVIDER_DEFAULT_ACCOUNT_LABEL, effective.kind === 'default' && !effective.dormant),
+      ...accountNames.map(name => (name === selected ? `${name} (selected)` : label(name, name === active))),
+      // A provider that cannot launch gets saved-state wording, not live-outcome
+      // wording: "every launch fails" is untrue of something that is not
+      // launching, and materialization excludes it entirely.
       ...(broken
-        ? [`${broken.name} (selected${broken.fromEnvironment ? ` via ${OAUTH_ACCOUNT_ENV}` : ''}, MISSING — every launch fails)`]
+        ? [`${broken.name} (selected${broken.fromEnvironment ? ` via ${OAUTH_ACCOUNT_ENV}` : ''}, MISSING — `
+          + `${effective.dormant ? 'will fail if this provider is enabled' : 'every launch fails'})`]
         : []),
       ...(latent
         ? [`${latent} (stored, MISSING — masked by ${OAUTH_ACCOUNT_ENV}; launches fail without it)`]

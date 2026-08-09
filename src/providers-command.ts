@@ -227,6 +227,22 @@ export function accountSwitchHint(
   provider: Pick<RegistryProvider, 'activeAuthAccount'>,
   effective: ActiveAccount,
 ): string {
+  // Saved state, not a live outcome: this provider is not launching at all.
+  if (effective.dormant) {
+    // Saved state, not a live outcome: this provider is not launching at all.
+  if (effective.dormant) {
+    if (effective.kind === 'broken') {
+      return `Selected account "${effective.name}" no longer exists — will fail if this provider is enabled`;
+    }
+    if (effective.kind === 'slot') return `Saved account: ${effective.name} (provider not enabled)`;
+    return `Saved account: ${PROVIDER_DEFAULT_ACCOUNT_LABEL} (provider not enabled)`;
+  }
+  if (effective.kind === 'broken') {
+      return `Selected account "${effective.name}" no longer exists — will fail if this provider is enabled`;
+    }
+    if (effective.kind === 'slot') return `Saved account: ${effective.name} (provider not enabled)`;
+    return `Saved account: ${PROVIDER_DEFAULT_ACCOUNT_LABEL} (provider not enabled)`;
+  }
   if (effective.kind === 'broken') {
     // A broken override can hide a second, independent breakage: the stored
     // selection behind it. Unsetting the variable would otherwise just swap
