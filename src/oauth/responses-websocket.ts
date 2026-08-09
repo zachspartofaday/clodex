@@ -83,6 +83,7 @@ interface RequestContext {
   responseId?: string;
   pendingEvents: unknown[];
   emittedModelData: boolean;
+  emittedDownstreamData: boolean;
   transportRetryPending: boolean;
   outputByIndex: Map<number, OutputAccumulator>;
   outputIndexByItemId: Map<string, number>;
@@ -716,8 +717,9 @@ function continuationMismatchSummary(
   payload: JsonObject,
   log?: (message: string) => void,
   mismatchDump = false,
+  precomputedDetails?: Record<string, unknown>,
 ): string {
-  const details = continuationMismatchDetails(entry, payload, log, true);
+  const details = precomputedDetails ?? continuationMismatchDetails(entry, payload, log, true);
   let summary = `full_items=${details.fullItems} expected_prefix_items=${details.expectedPrefixItems} `
     + `first_mismatch=${details.firstMismatch} expected=${details.expectedKind} actual=${details.actualKind}`;
   // The hashes make same-kind mismatches diagnosable from the log alone. With
@@ -933,6 +935,7 @@ function emitContextDiagnostic(
     retried: ctx.retried,
     frameCount: ctx.frameCount,
     emittedModelData: ctx.emittedModelData,
+    emittedDownstreamData: ctx.emittedDownstreamData,
     responseIdReceived: Boolean(ctx.responseId),
     inFlightMs: entry.inFlightStartedAt === undefined
       ? undefined
@@ -1277,6 +1280,7 @@ function expectedAssistantItems(ctx: RequestContext): unknown[] {
 
 function encodeSse(ctx: RequestContext, event: unknown): void {
   if (ctx.closed) return;
+  ctx.emittedDownstreamData = true;
   ctx.controller.enqueue(ctx.encoder.encode(`data: ${JSON.stringify(event)}\n\n`));
 }
 
@@ -1340,15 +1344,14 @@ function retryTransportFailure(
     ctx.closed
     || entry.current !== ctx
     || ctx.retried
-    || ctx.frameCount !== 0
-    || ctx.emittedModelData
+    || !transportReplaySafe(ctx)
   ) {
     return false;
   }
 
   ctx.retried = true;
   ctx.transportRetryPending = true;
-  entry.debug('transport failed before any response frame; retrying once with full context');
+  entry.debug('transport failed before downstream output; retrying once with full context');
   emitContextDiagnostic(entry, ctx, {
     event: 'ws_transport_retry',
     outcome: 'started',
@@ -1388,9 +1391,9 @@ function handleTransportFailure(
 ): void {
   if (retryTransportFailure(entry, ctx, diagnosticDetails)) return;
   if (ctx.closed || entry.current !== ctx) return;
-  if (ctx.retried && ctx.frameCount === 0 && !ctx.emittedModelData) {
+  if (ctx.retried && ctx.transportRetryPending && transportReplaySafe(ctx)) {
     ctx.transportRetryPending = false;
-    entry.debug('transport retry exhausted before any response frame');
+    entry.debug('transport retry exhausted before downstream output');
     emitContextDiagnostic(entry, ctx, {
       event: 'ws_transport_retry',
       outcome: 'exhausted',
@@ -1521,6 +1524,12 @@ function resetContextForRetry(ctx: RequestContext): void {
   ctx.reasoningPartsByItemId.clear();
   ctx.recentUpstreamEventTypes = [];
   ctx.emittedProtocolAnomalies.clear();
+}
+
+function transportReplaySafe(ctx: RequestContext): boolean {
+  return !ctx.emittedDownstreamData
+    && !ctx.emittedModelData
+    && ctx.outputByIndex.size === 0;
 }
 
 function handleSocketMessage(entry: ConnectionEntry, data: RawData): void {
@@ -1914,6 +1923,7 @@ export function createResponsesWebSocketFetch(
     let persistent = Boolean(partitionKey);
     let promotedConnectionId: number | undefined;
     let decision: 'continuation' | 'parallel_isolated' | 'history_mismatch_new_head' | 'new_partition_head' | 'unpartitioned_socket';
+    let candidateMismatchDetails: Map<ConnectionEntry, Record<string, unknown>> | undefined;
 
     if (selected && selectedDelta) {
       sendPayload = { ...payload, input: selectedDelta, previous_response_id: selected.responseId };
@@ -1942,9 +1952,26 @@ export function createResponsesWebSocketFetch(
     } else if (diagnosticEntry) {
       // A rewind, branch, or hidden auxiliary inference gets its own full-context
       // head. Existing heads remain eligible for later exact-prefix matches.
+      const diagnosticMismatch = continuationMismatchDetails(diagnosticEntry, payload, debug, true);
+      candidateMismatchDetails = new Map([[diagnosticEntry, diagnosticMismatch]]);
+      // Every abandoned non-diagnostic head warns independently of diagnostics.
+      // Cache each mismatch so the diagnostic payload does not evaluate it again.
+      for (const candidate of candidates) {
+        if (candidate === diagnosticEntry) continue;
+        candidateMismatchDetails.set(
+          candidate,
+          continuationMismatchDetails(candidate, payload, debug, true),
+        );
+      }
       debug(
         `history mismatch starting an additional chain; retained ${candidates.length} existing head(s) `
-        + `(${continuationMismatchSummary(diagnosticEntry, payload, debug, mismatchDump)})`,
+        + `(${continuationMismatchSummary(
+          diagnosticEntry,
+          payload,
+          debug,
+          mismatchDump,
+          diagnosticMismatch,
+        )})`,
       );
       // No head matched, so clodex abandoned EVERY candidate this turn — a
       // normalization gap on any of them is a give-up-shaped gap. Warning only
@@ -2019,7 +2046,8 @@ export function createResponsesWebSocketFetch(
         ttlPausedMs: entry.ttlPausedMs,
         idleMs: Math.max(0, now - entry.lastUsedAt),
         promptChanges: changedPromptFields(entry.promptFieldHashes, promptFieldHashes),
-        mismatch: continuationMismatchDetails(entry, payload, debug),
+        mismatch: candidateMismatchDetails?.get(entry)
+          ?? continuationMismatchDetails(entry, payload, debug),
       })),
       evictions,
     }, diagnosticCorrelation);
@@ -2040,6 +2068,7 @@ export function createResponsesWebSocketFetch(
           frameCount: 0,
           pendingEvents: [],
           emittedModelData: false,
+          emittedDownstreamData: false,
           transportRetryPending: false,
           outputByIndex: new Map(),
           outputIndexByItemId: new Map(),

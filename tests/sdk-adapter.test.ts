@@ -12,8 +12,6 @@ import {
   extractClaudeSessionId,
   claudeSessionPromptCacheKey,
   sdkTranslationErrorSignature,
-  upstreamMaxRetries,
-  resetUpstreamMaxRetriesWarningForTests,
   resetServiceTierWarningForTests,
 } from '../src/sdk-adapter.js';
 
@@ -560,6 +558,70 @@ describe('translateRequest', () => {
 });
 
 describe('generateAnthropicResponse', () => {
+  it('passes the configured upstream retry budget to generation requests', async () => {
+    vi.resetModules();
+    const previous = process.env['CLODEX_UPSTREAM_MAX_RETRIES'];
+    process.env['CLODEX_UPSTREAM_MAX_RETRIES'] = '4';
+    const generateText = vi.fn(async () => ({
+      text: 'done',
+      toolCalls: [],
+      finishReason: 'stop',
+      usage: { inputTokens: 1, outputTokens: 1 },
+    }));
+    vi.doMock('ai', () => ({
+      generateText,
+      streamText: vi.fn(),
+      tool: vi.fn((spec: unknown) => spec),
+      jsonSchema: vi.fn((schema: unknown) => schema),
+    }));
+
+    try {
+      const { generateAnthropicResponse } = await import('../src/sdk-adapter.js');
+      await generateAnthropicResponse({} as never, { messages: [] }, 'test-model');
+
+      expect(generateText.mock.calls[0]![0].maxRetries).toBe(4);
+    } finally {
+      if (previous === undefined) delete process.env['CLODEX_UPSTREAM_MAX_RETRIES'];
+      else process.env['CLODEX_UPSTREAM_MAX_RETRIES'] = previous;
+      vi.doUnmock('ai');
+      vi.resetModules();
+    }
+  });
+
+  it('passes the configured upstream retry budget to collected stream requests', async () => {
+    vi.resetModules();
+    const previous = process.env['CLODEX_UPSTREAM_MAX_RETRIES'];
+    process.env['CLODEX_UPSTREAM_MAX_RETRIES'] = '5';
+    async function* stream() {
+      yield { type: 'start' };
+      yield { type: 'finish', finishReason: 'stop' };
+    }
+    const streamText = vi.fn(() => ({ stream: stream() }));
+    vi.doMock('ai', () => ({
+      generateText: vi.fn(),
+      streamText,
+      tool: vi.fn((spec: unknown) => spec),
+      jsonSchema: vi.fn((schema: unknown) => schema),
+    }));
+
+    try {
+      const { generateAnthropicResponse } = await import('../src/sdk-adapter.js');
+      await generateAnthropicResponse(
+        {} as never,
+        { messages: [] },
+        'test-model',
+        { forceStream: true },
+      );
+
+      expect(streamText.mock.calls[0]![0].maxRetries).toBe(5);
+    } finally {
+      if (previous === undefined) delete process.env['CLODEX_UPSTREAM_MAX_RETRIES'];
+      else process.env['CLODEX_UPSTREAM_MAX_RETRIES'] = previous;
+      vi.doUnmock('ai');
+      vi.resetModules();
+    }
+  });
+
   it('encodes non-streaming tool-call provider signatures for Gemini round-trip', async () => {
     vi.resetModules();
     const generateText = vi.fn(async () => ({
@@ -711,6 +773,35 @@ describe('generateAnthropicResponse', () => {
 });
 
 describe('streamAnthropicResponse idle timeout', () => {
+  it('passes the configured upstream retry budget to streaming requests', async () => {
+    vi.resetModules();
+    const previous = process.env['CLODEX_UPSTREAM_MAX_RETRIES'];
+    process.env['CLODEX_UPSTREAM_MAX_RETRIES'] = '5';
+    async function* stream() {
+      yield { type: 'start' };
+      yield { type: 'finish', finishReason: 'stop' };
+    }
+    const streamText = vi.fn(() => ({ stream: stream() }));
+    vi.doMock('ai', () => ({
+      generateText: vi.fn(),
+      streamText,
+      tool: vi.fn((spec: unknown) => spec),
+      jsonSchema: vi.fn((schema: unknown) => schema),
+    }));
+
+    try {
+      const { streamAnthropicResponse } = await import('../src/sdk-adapter.js');
+      await streamAnthropicResponse({} as never, { messages: [] }, 'test-model', () => {});
+
+      expect(streamText.mock.calls[0]![0].maxRetries).toBe(5);
+    } finally {
+      if (previous === undefined) delete process.env['CLODEX_UPSTREAM_MAX_RETRIES'];
+      else process.env['CLODEX_UPSTREAM_MAX_RETRIES'] = previous;
+      vi.doUnmock('ai');
+      vi.resetModules();
+    }
+  });
+
   it('consumes only the stream without touching lazy aggregate getters', async () => {
     vi.resetModules();
     async function* stream() {
@@ -1228,82 +1319,5 @@ describe('translateRequest openai promptCacheKey', () => {
 
   it('omits the key for non-OpenAI providers', () => {
     expect(keyOf(req(), '@ai-sdk/xai')).toBeUndefined();
-  });
-});
-
-describe('upstreamMaxRetries knob', () => {
-  afterEach(() => {
-    delete process.env.CLODEX_UPSTREAM_MAX_RETRIES;
-    resetUpstreamMaxRetriesWarningForTests();
-  });
-
-  it('returns undefined when unset so the SDK default is preserved', () => {
-    delete process.env.CLODEX_UPSTREAM_MAX_RETRIES;
-    expect(upstreamMaxRetries()).toBeUndefined();
-  });
-
-  it('parses a valid integer up to the ceiling', () => {
-    process.env.CLODEX_UPSTREAM_MAX_RETRIES = '3';
-    expect(upstreamMaxRetries()).toBe(3);
-    process.env.CLODEX_UPSTREAM_MAX_RETRIES = '5';
-    expect(upstreamMaxRetries()).toBe(5);
-  });
-
-  it('accepts zero (retries disabled)', () => {
-    process.env.CLODEX_UPSTREAM_MAX_RETRIES = '0';
-    expect(upstreamMaxRetries()).toBe(0);
-  });
-
-  it('treats a whitespace-only value as unset, not zero', () => {
-    process.env.CLODEX_UPSTREAM_MAX_RETRIES = '   ';
-    expect(upstreamMaxRetries()).toBeUndefined();
-  });
-
-  it('honors a large budget and warns once instead of clamping', () => {
-    const stderr = vi.spyOn(console, 'error').mockImplementation(() => {});
-    try {
-      // A retry-count ceiling assumes the default backoff schedule, but a
-      // short provider retry-after header packs more attempts into the same
-      // deadline — discarding operator-requested retries on a schedule guess
-      // silently shrinks explicit configuration.
-      process.env.CLODEX_UPSTREAM_MAX_RETRIES = '12';
-      expect(upstreamMaxRetries()).toBe(12);
-      expect(upstreamMaxRetries()).toBe(12);
-      expect(stderr).toHaveBeenCalledTimes(1);
-      expect(String(stderr.mock.calls[0]![0])).toContain('honored');
-      expect(String(stderr.mock.calls[0]![0])).toContain('retry-after');
-    } finally {
-      stderr.mockRestore();
-    }
-  });
-
-  it('passes budgets at or below the advisory threshold without warning', () => {
-    const stderr = vi.spyOn(console, 'error').mockImplementation(() => {});
-    try {
-      process.env.CLODEX_UPSTREAM_MAX_RETRIES = '5';
-      expect(upstreamMaxRetries()).toBe(5);
-      expect(stderr).not.toHaveBeenCalled();
-    } finally {
-      stderr.mockRestore();
-    }
-  });
-
-  it('warns once on stderr and ignores malformed values', () => {
-    const stderr = vi.spyOn(console, 'error').mockImplementation(() => {});
-    try {
-      const logged: string[] = [];
-      process.env.CLODEX_UPSTREAM_MAX_RETRIES = 'many';
-      expect(upstreamMaxRetries(message => logged.push(message))).toBeUndefined();
-      expect(upstreamMaxRetries(message => logged.push(message))).toBeUndefined();
-      expect(logged).toHaveLength(1);
-      expect(logged[0]).toContain('CLODEX_UPSTREAM_MAX_RETRIES=many');
-      expect(stderr).toHaveBeenCalledTimes(1);
-      process.env.CLODEX_UPSTREAM_MAX_RETRIES = '2.5';
-      expect(upstreamMaxRetries()).toBeUndefined();
-      process.env.CLODEX_UPSTREAM_MAX_RETRIES = '-1';
-      expect(upstreamMaxRetries()).toBeUndefined();
-    } finally {
-      stderr.mockRestore();
-    }
   });
 });

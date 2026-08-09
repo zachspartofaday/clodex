@@ -2,7 +2,8 @@ import { tool, jsonSchema, streamText, generateText } from 'ai';
 import type { LanguageModel, ModelMessage } from 'ai';
 import { parseToolArguments } from './proxy-shared.js';
 import type { SdkCallParams } from './sdk-adapter.js';
-import { SDK_TOTAL_TIMEOUT_MS, oauthServiceTier, upstreamMaxRetries } from './sdk-adapter.js';
+import { SDK_TOTAL_TIMEOUT_MS, oauthServiceTier } from './sdk-adapter.js';
+import { upstreamMaxRetries } from './upstream-retry.js';
 
 // ── OpenAI request shapes ───────────────────────────────────────────────────
 
@@ -215,10 +216,21 @@ export async function generateOpenAiResponse(
     // stream. Request a real stream from the SDK and collect it into one
     // response instead of issuing a non-streaming request upstream.
     const abortSignal = AbortSignal.timeout(SDK_TOTAL_TIMEOUT_MS);
-    const { stream } = streamText({ model, ...(params as any), ...(upstreamMaxRetries() !== undefined ? { maxRetries: upstreamMaxRetries() } : {}), abortSignal, onError: () => {} });
+    const { stream } = streamText({
+      model,
+      ...(params as any),
+      maxRetries: upstreamMaxRetries(),
+      abortSignal,
+      onError: () => {},
+    });
     result = await collectOpenAiStream(stream, abortSignal);
   } else {
-    result = (await generateText({ model, ...(params as any), ...(upstreamMaxRetries() !== undefined ? { maxRetries: upstreamMaxRetries() } : {}), abortSignal: AbortSignal.timeout(SDK_TOTAL_TIMEOUT_MS) })) as any;
+    result = (await generateText({
+      model,
+      ...(params as any),
+      maxRetries: upstreamMaxRetries(),
+      abortSignal: AbortSignal.timeout(SDK_TOTAL_TIMEOUT_MS),
+    })) as any;
   }
   const message: Record<string, any> = { role: 'assistant', content: result.text || null };
 
@@ -251,7 +263,12 @@ export async function streamOpenAiResponse(
   onChunk: (chunk: string) => void,
 ): Promise<void> {
   const abortSignal = AbortSignal.timeout(SDK_TOTAL_TIMEOUT_MS);
-  const { stream } = streamText({ model, ...(params as any), ...(upstreamMaxRetries() !== undefined ? { maxRetries: upstreamMaxRetries() } : {}), abortSignal });
+  const { stream } = streamText({
+    model,
+    ...(params as any),
+    maxRetries: upstreamMaxRetries(),
+    abortSignal,
+  });
   const baseData = {
     id: `chatcmpl-${Date.now()}`,
     object: 'chat.completion.chunk',
