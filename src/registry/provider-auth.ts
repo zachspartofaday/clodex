@@ -7,8 +7,10 @@ import open from 'open';
 import {
   probeProviderCredentialStore,
   provisionProviderCredential,
+  resolveProviderCredentialWithSource,
   saveProviderCredential,
 } from '../env.js';
+import { OAUTH_ACCOUNT_ENV } from '../oauth-account-selection.js';
 import { credentialInstanceAuthRef } from '../credential-helper.js';
 import { runOpenAiDeviceCodeFlow } from '../oauth/openai.js';
 import {
@@ -32,7 +34,7 @@ import {
   withProviderMutationLock,
   withRegistryWriteLock,
 } from './lock.js';
-import { refreshProviderModels } from './refresh-models.js';
+import { refreshProviderModelsWithCredential } from './refresh-models.js';
 import { OAUTH_ACCOUNT_NAME_RE, type RegistryProvider } from './types.js';
 
 export type { StoredOAuthCredential } from '../oauth/types.js';
@@ -126,6 +128,10 @@ async function upsertOAuthAccountSlot(
         },
       },
     };
+    if (entry.activeAuthAccount === account) {
+      delete updated.modelsCache;
+      delete updated.refreshedAt;
+    }
     const idx = registry.providers.findIndex(provider => provider.id === registryId);
     registry.providers[idx] = updated;
     if (previousAuthRef && previousAuthRef !== authRef) {
@@ -201,6 +207,10 @@ async function upsertOAuthProvider(
       };
     } else {
       entry = { ...entry, authType: 'oauth', authRef, templateId };
+      if (!entry.activeAuthAccount) {
+        delete entry.modelsCache;
+        delete entry.refreshedAt;
+      }
     }
 
     const idx = registry.providers.findIndex(provider => provider.id === registryId);
@@ -325,8 +335,34 @@ export async function authenticateProvider(
   const refreshSpinner = p.spinner();
   refreshSpinner.start('Refreshing model list...');
   try {
-    await refreshProviderModels(registryId, cred.access);
-    refreshSpinner.stop('Models refreshed');
+    // A named sign-in invalidates that slot's account-specific cache, so
+    // rebuild that exact slot even when another account currently wins. A
+    // default sign-in with no stored slot likewise invalidates the top-level
+    // cache and must ignore a one-process account selection. When a stored
+    // slot remains active, its top-level cache is still valid and the normal
+    // per-process selection can be refreshed instead.
+    const accountOverride = accountName
+      ?? (persisted.registryProvider.activeAuthAccount === undefined
+        ? null
+        : process.env[OAUTH_ACCOUNT_ENV] ?? null);
+    const refreshResult = await refreshProviderModelsWithCredential(
+      registryId,
+      async provider => resolveProviderCredentialWithSource(
+        provider.id,
+        provider.authRef,
+        undefined,
+        { ignoreProviderOverride: true },
+      ),
+      accountOverride,
+      { ignoreProviderOverride: true },
+    );
+    if (refreshResult.skipped) {
+      refreshSpinner.stop(`Models not refreshed${refreshResult.reason ? ` — ${refreshResult.reason}` : ''}`);
+    } else if (refreshResult.ok) {
+      refreshSpinner.stop('Models refreshed');
+    } else {
+      refreshSpinner.stop(`Could not refresh models${refreshResult.reason ? ` — ${refreshResult.reason}` : ''}`);
+    }
   } catch {
     refreshSpinner.stop('Could not refresh models — run clodex providers refresh-models later');
   }

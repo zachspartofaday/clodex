@@ -1,6 +1,10 @@
 // src/registry/load.ts — materialize registry into runtime LocalProvider[]
 
-import { resolveProviderCredential, resolveProviderOAuthAccountId, resolveProviderOAuthProviderData } from '../env.js';
+import {
+  resolveProviderCredentialWithSource,
+  resolveProviderOAuthAccountId,
+  resolveProviderOAuthProviderData,
+} from '../env.js';
 import type { CompatibilityAgent } from '../model-compatibility.js';
 import type { LocalProvider } from '../types.js';
 import { applySelectedOAuthAccount, isAnonymousProvider, materializeRegistry } from './materialize.js';
@@ -18,14 +22,29 @@ export async function loadRegistryProviders(
   const oauthAccountIds = new Map<string, string>();
   const oauthProviderData = new Map<string, Record<string, unknown>>();
   await Promise.all(providers.map(async provider => {
-    if (isAnonymousProvider(provider)) return;
+    if (
+      isAnonymousProvider(provider)
+      || provider.authType === 'none'
+      || provider.authRef === 'none:anonymous'
+    ) return;
+    let resolved;
     try {
-      const key = await resolveProviderCredential(provider.id, provider.authRef, diag);
-      if (key) keys.set(provider.id, key);
+      resolved = await resolveProviderCredentialWithSource(provider.id, provider.authRef, diag);
     } catch (err) {
       diag?.(`${provider.id}: credential unavailable — ${err instanceof Error ? err.message : String(err)}`);
+      return;
     }
-    if (provider.authType === 'oauth') {
+    const credentialOverride = resolved.credentialOverride !== undefined;
+    if (provider.enabled && resolved.credentialOverride) {
+      throw new Error(
+        `${resolved.credentialOverride.variable} is a process-scoped credential with no isolated model catalog `
+        + `for provider "${provider.id}". Save that credential as a provider or account and refresh its models, `
+        + 'or unset the variable.',
+      );
+    }
+    const credentialAvailable = Boolean(resolved.credential);
+    if (resolved.credential) keys.set(provider.id, resolved.credential);
+    if (provider.authType === 'oauth' && credentialAvailable && !credentialOverride) {
       try {
         const accountId = await resolveProviderOAuthAccountId(provider.authRef, diag);
         if (accountId) oauthAccountIds.set(provider.id, accountId);

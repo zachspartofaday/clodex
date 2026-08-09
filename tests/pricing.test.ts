@@ -52,6 +52,42 @@ describe('pricing enrich', () => {
     expect(enriched[0]?.cost?.input).toBe(0.59);
   });
 
+  it('enriches account-specific caches as well as the active top-level cache', () => {
+    const cache = {
+      fetchedAt: '2026-08-09T00:00:00.000Z',
+      models: [{
+        id: 'llama-3.3-70b-versatile',
+        name: 'Llama 3.3 70B',
+        upstreamModelId: 'llama-3.3-70b-versatile',
+        modelFormat: 'openai' as const,
+      }],
+    };
+    const registry = {
+      schemaVersion: 4,
+      providers: [{
+        id: 'groq',
+        templateId: 'groq',
+        name: 'Groq',
+        enabled: true,
+        authRef: 'keyring:provider:default',
+        authType: 'oauth' as const,
+        activeAuthAccount: 'work',
+        authAccounts: {
+          work: { authRef: 'keyring:provider:work', addedAt: cache.fetchedAt, modelsCache: structuredClone(cache) },
+          alt: { authRef: 'keyring:provider:alt', addedAt: cache.fetchedAt, modelsCache: structuredClone(cache) },
+        },
+        api: { npm: '@ai-sdk/groq' },
+        addedAt: cache.fetchedAt,
+        modelsCache: structuredClone(cache),
+      }],
+    };
+
+    expect(applyPricingToRegistryProviders(registry, loadBundledPricingCache())).toBe(true);
+    expect(registry.providers[0]?.modelsCache.models[0]?.cost?.input).toBe(0.59);
+    expect(registry.providers[0]?.authAccounts.work.modelsCache.models[0]?.cost?.input).toBe(0.59);
+    expect(registry.providers[0]?.authAccounts.alt.modelsCache.models[0]?.cost?.input).toBe(0.59);
+  });
+
   it('preserves provider-owned pricing when the registry opts out of enrichment', () => {
     const registry = {
       schemaVersion: 1 as const,

@@ -17,6 +17,37 @@ export const REGISTRY_SCHEMA_VERSION = 1;
 export const REGISTRY_SCHEMA_VERSION_WITH_ACCOUNT_SLOTS = 2;
 
 /**
+ * Written whenever any provider carries `activeAuthAccount`.
+ *
+ * A DISTINCT version, not a reuse of the slot version: a build from before the
+ * stored selector existed accepts version 2, parses the slots, silently
+ * ignores the unknown `activeAuthAccount`, and saves the registry back without
+ * it. Version 3 stops that, because its strict loader throws on a version it
+ * does not know. A registry whose selector is cleared falls back to 2 (or 1),
+ * so older builds interoperate again as soon as no selector state exists.
+ *
+ * KNOWN LIMITATION — this fences MUTATION, not launches. Older builds reach
+ * the registry through the lenient `loadRegistry()`, which never reads
+ * `schemaVersion` at all, so a pre-selector installation sharing this
+ * CLODEX_HOME still parses the provider, discards the selector it does not
+ * know, and launches as the provider default. No version number can fix that:
+ * the loader that would have to reject it has already shipped. Closing it
+ * needs the persisted bytes to carry the selection somewhere an old build
+ * already reads — pointing `authRef` at the selected slot and parking the
+ * original elsewhere — which changes credential storage and is tracked
+ * separately rather than bolted on here.
+ */
+export const REGISTRY_SCHEMA_VERSION_WITH_ACTIVE_ACCOUNT = 3;
+
+/**
+ * Written when a named OAuth slot carries its own model-entitlement cache.
+ * A cache is not a credential, but silently dropping it would make a temporary
+ * account reuse the persisted account's catalog. Version 4 therefore fences
+ * older mutating builds that know about slots but not their cache isolation.
+ */
+export const REGISTRY_SCHEMA_VERSION_WITH_ACCOUNT_MODEL_CACHES = 4;
+
+/**
  * Shape rule for a named OAuth account-slot name — the single home. Slot
  * names land in credential-store scopes and env values, and the registry
  * parser must accept exactly what `validateOAuthAccountName` admits, or a
@@ -58,6 +89,19 @@ export interface CachedModel {
   compatibility?: ModelRuntimeCompatibility;
 }
 
+export interface RegistryModelsCache {
+  fetchedAt: string;
+  models: CachedModel[];
+}
+
+export interface RegistryOAuthAccount {
+  authRef: string;
+  addedAt: string;
+  oauthAccountId?: string;
+  /** Catalog discovered with this named slot's credential. */
+  modelsCache?: RegistryModelsCache;
+}
+
 export interface RegistryProvider {
   id: string;
   templateId: string;
@@ -71,7 +115,19 @@ export interface RegistryProvider {
    * disjoint credential-store lineage; CLODEX_OAUTH_ACCOUNT selects one at
    * launch without touching the default `authRef`.
    */
-  authAccounts?: Record<string, { authRef: string; addedAt: string; oauthAccountId?: string }>;
+  authAccounts?: Record<string, RegistryOAuthAccount>;
+  /**
+   * The `authAccounts` slot every launch uses, so the running identity does not
+   * depend on remembering an environment variable. Absent means the provider's
+   * own default credential. CLODEX_OAUTH_ACCOUNT still overrides it for a
+   * single run.
+   *
+   * Only the NAME SHAPE is enforced when the registry loads. A name that no
+   * longer matches a slot is rejected at apply time instead: rejecting it at
+   * load would drop the entire provider record, so a stale selector would make
+   * the provider silently vanish from the CLI rather than say what is wrong.
+   */
+  activeAuthAccount?: string;
   subscriptionFilter?: RegistrySubscriptionFilter;
   /** Keep provider/curated costs instead of replacing them with the global pricing cache. */
   preserveModelPricing?: boolean;
@@ -82,10 +138,7 @@ export interface RegistryProvider {
     /** Static headers sent on every upstream request (e.g. a plan/auth-tracking header a custom endpoint requires). */
     headers?: Record<string, string>;
   };
-  modelsCache?: {
-    fetchedAt: string;
-    models: CachedModel[];
-  };
+  modelsCache?: RegistryModelsCache;
   addedAt: string;
   refreshedAt?: string;
 }

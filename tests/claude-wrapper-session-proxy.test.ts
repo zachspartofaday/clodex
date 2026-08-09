@@ -95,6 +95,14 @@ async function runWrapper(
   if (!Object.hasOwn(envOverrides, 'CLODEX_REQUIRE_SERVER')) {
     delete env['CLODEX_REQUIRE_SERVER'];
   }
+  if (!Object.hasOwn(envOverrides, 'CLODEX_OAUTH_ACCOUNT')) {
+    delete env['CLODEX_OAUTH_ACCOUNT'];
+  }
+  for (const name of Object.keys(env)) {
+    if (/^CLODEX_KEY_[A-Z0-9_]+$/.test(name) && !Object.hasOwn(envOverrides, name)) {
+      delete env[name];
+    }
+  }
   // Keep assertions independent of whatever Anthropic endpoint the test host
   // may have configured; the wrapper under test is responsible for adding one.
   delete env['ANTHROPIC_BASE_URL'];
@@ -194,6 +202,23 @@ describe('clodex-claude inherited session routing', () => {
     }
   });
 
+  it('keeps a provider key inside the live private session that owns its route snapshot', async () => {
+    const session = await openLoopbackServer();
+    const standalone = await openLoopbackServer();
+    advertiseEndpoint(standalone.port);
+    try {
+      const result = await runWrapper(
+        claudeInvocation(),
+        sessionEnv(session.port, { CLODEX_KEY_OPENAI_OAUTH: 'private-session-token' }),
+      );
+      expect(result).toMatchObject({ code: 0, signal: null });
+      expect(result.stderr).not.toContain('cannot override the credential snapshot');
+      expect(readLaunchEnv().httpProxy).toBe(`http://127.0.0.1:${session.port}`);
+    } finally {
+      await Promise.all([closeServer(session.server), closeServer(standalone.server)]);
+    }
+  });
+
   it('requires the marked session listener to answer before it can outrank a standalone server', async () => {
     // Hold this numeric port on IPv6 only so the wrapper's IPv4 probe gets a
     // deterministic refusal and the port cannot be reused during the test.
@@ -209,6 +234,24 @@ describe('clodex-claude inherited session routing', () => {
         sessionProxy: null,
         fable: null,
       });
+    } finally {
+      await Promise.all([closeServer(deadSession.server), closeServer(standalone.server)]);
+    }
+  });
+
+  it('rejects a provider key when a dead private session falls back to a standalone server', async () => {
+    const deadSession = await openLoopbackServer('::1', true);
+    const standalone = await openLoopbackServer();
+    advertiseEndpoint(standalone.port);
+    try {
+      const result = await runWrapper(
+        claudeInvocation(),
+        sessionEnv(deadSession.port, { CLODEX_KEY_OPENAI_OAUTH: 'fallback-token' }),
+      );
+      expect(result).toMatchObject({ code: 1, signal: null });
+      expect(result.stderr).toContain('CLODEX_KEY_OPENAI_OAUTH cannot override the credential snapshot');
+      expect(result.stderr).not.toContain('fallback-token');
+      expect(existsSync(launchMarker)).toBe(false);
     } finally {
       await Promise.all([closeServer(deadSession.server), closeServer(standalone.server)]);
     }

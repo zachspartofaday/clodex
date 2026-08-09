@@ -19,10 +19,14 @@ describe('provider-catalog-display', () => {
   let home: string;
   const prevHome = process.env.CLODEX_HOME;
   const prevHelper = process.env.CLODEX_CREDENTIAL_HELPER;
+  const prevProviderOverride = process.env.CLODEX_KEY_OPENAI_OAUTH;
+  const prevAccountOverride = process.env.CLODEX_OAUTH_ACCOUNT;
 
   beforeEach(() => {
     home = mkdtempSync(join(tmpdir(), 'clodex-display-'));
     process.env.CLODEX_HOME = home;
+    delete process.env.CLODEX_KEY_OPENAI_OAUTH;
+    delete process.env.CLODEX_OAUTH_ACCOUNT;
   });
 
   afterEach(() => {
@@ -30,6 +34,10 @@ describe('provider-catalog-display', () => {
     else process.env.CLODEX_HOME = prevHome;
     if (prevHelper === undefined) delete process.env.CLODEX_CREDENTIAL_HELPER;
     else process.env.CLODEX_CREDENTIAL_HELPER = prevHelper;
+    if (prevProviderOverride === undefined) delete process.env.CLODEX_KEY_OPENAI_OAUTH;
+    else process.env.CLODEX_KEY_OPENAI_OAUTH = prevProviderOverride;
+    if (prevAccountOverride === undefined) delete process.env.CLODEX_OAUTH_ACCOUNT;
+    else process.env.CLODEX_OAUTH_ACCOUNT = prevAccountOverride;
     rmSync(home, { recursive: true, force: true });
     vi.restoreAllMocks();
   });
@@ -183,6 +191,223 @@ describe('provider-catalog-display', () => {
       expect(entries.map(e => e.id)).toEqual(['groq']);
       expect(entries[0]?.name).toBe('Groq');
       expect(entries[0]?.inRegistry).toBe(true);
+    });
+
+    function saveSlotted(
+      activeAuthAccount?: string,
+      overrides: { enabled?: boolean; authType?: 'oauth' | 'api' | 'none' } = {},
+    ): void {
+      const registry = emptyRegistry();
+      registry.providers.push({
+        id: 'openai-oauth',
+        templateId: 'openai',
+        name: 'OpenAI (ChatGPT)',
+        enabled: overrides.enabled ?? true,
+        authRef: 'keyring:oauth:provider:openai-oauth::credential::v1:default',
+        authType: overrides.authType ?? 'oauth',
+        authAccounts: {
+          zachspartofaday: { authRef: 'keyring:oauth:provider:openai-oauth:account:zachspartofaday::credential::v1:z', addedAt: new Date().toISOString() },
+        },
+        ...(activeAuthAccount ? { activeAuthAccount } : {}),
+        api: { npm: '@ai-sdk/openai' },
+        addedAt: new Date().toISOString(),
+      });
+      withRegistryWriteLockSync(() => saveRegistry(registry));
+    }
+
+    it('marks which account a launch will actually use', async () => {
+      saveSlotted('zachspartofaday');
+      const entries = await resolveProvidersForDisplay();
+      expect(entries[0]?.authLabel).toContain('accounts: (provider default), zachspartofaday (active)');
+    });
+
+    it('marks the provider default as active when nothing is stored', async () => {
+      // Listing the slots without saying which one runs is what let a session
+      // run as an unintended identity for hours without anything showing it.
+      saveSlotted(undefined);
+      const entries = await resolveProvidersForDisplay();
+      expect(entries[0]?.authLabel).toContain('accounts: (provider default) (active), zachspartofaday');
+    });
+
+    it('reports the environment override, not the stored selection', async () => {
+      // CLODEX_OAUTH_ACCOUNT wins at launch, so it must win here: showing the
+      // stored one while a variable overrides it misreports the live identity
+      // in exactly the persistent shell this listing exists to clarify.
+      saveSlotted(undefined);
+      process.env['CLODEX_OAUTH_ACCOUNT'] = 'zachspartofaday';
+      try {
+        const entries = await resolveProvidersForDisplay();
+        expect(entries[0]?.authLabel).toContain('zachspartofaday (active, from CLODEX_OAUTH_ACCOUNT)');
+        expect(entries[0]?.authLabel).not.toContain('(provider default) (active)');
+      } finally {
+        delete process.env['CLODEX_OAUTH_ACCOUNT'];
+      }
+    });
+
+    it.each([true, false])(
+      'counts only models cached for the temporary account when enabled=%s',
+      async enabled => {
+      const model = (id: string) => ({
+        id,
+        name: id,
+        upstreamModelId: id,
+        modelFormat: 'openai' as const,
+      });
+      const registry = emptyRegistry();
+      registry.providers.push({
+        id: 'openai-oauth',
+        templateId: 'openai',
+        name: 'OpenAI (ChatGPT)',
+        enabled,
+        authRef: 'keyring:oauth:provider:openai-oauth::credential::v1:default',
+        authType: 'oauth',
+        activeAuthAccount: 'work',
+        authAccounts: {
+          work: {
+            authRef: 'keyring:oauth:provider:openai-oauth:account:work::credential::v1:w',
+            addedAt: '2026-08-09T00:00:00.000Z',
+          },
+          alt: {
+            authRef: 'keyring:oauth:provider:openai-oauth:account:alt::credential::v1:a',
+            addedAt: '2026-08-09T00:00:00.000Z',
+            modelsCache: {
+              fetchedAt: '2026-08-09T00:00:00.000Z',
+              models: [model('alt-only')],
+            },
+          },
+        },
+        api: { npm: '@ai-sdk/openai' },
+        addedAt: '2026-08-09T00:00:00.000Z',
+        modelsCache: {
+          fetchedAt: '2026-08-09T00:00:00.000Z',
+          models: [model('work-a'), model('work-b')],
+        },
+      });
+      withRegistryWriteLockSync(() => saveRegistry(registry));
+      process.env.CLODEX_OAUTH_ACCOUNT = 'alt';
+
+      expect((await resolveProvidersForDisplay())[0]?.modelCount).toBe(1);
+      },
+    );
+
+    it('does not count an OAuth account cache for a provider-key credential', async () => {
+      const registry = emptyRegistry();
+      registry.providers.push({
+        id: 'openai-oauth',
+        templateId: 'openai',
+        name: 'OpenAI (ChatGPT)',
+        enabled: true,
+        authRef: 'keyring:oauth:provider:openai-oauth::credential::v1:default',
+        authType: 'oauth',
+        activeAuthAccount: 'work',
+        authAccounts: {
+          work: {
+            authRef: 'keyring:oauth:provider:openai-oauth:account:work::credential::v1:w',
+            addedAt: '2026-08-09T00:00:00.000Z',
+          },
+        },
+        api: { npm: '@ai-sdk/openai' },
+        addedAt: '2026-08-09T00:00:00.000Z',
+        modelsCache: {
+          fetchedAt: '2026-08-09T00:00:00.000Z',
+          models: [{
+            id: 'work-only',
+            name: 'Work only',
+            upstreamModelId: 'work-only',
+            modelFormat: 'openai',
+          }],
+        },
+      });
+      withRegistryWriteLockSync(() => saveRegistry(registry));
+      process.env.CLODEX_KEY_OPENAI_OAUTH = 'provider-override-token';
+
+      expect((await resolveProvidersForDisplay())[0]?.modelCount).toBe(0);
+    });
+
+    it('reports the provider key as active without marking a slot active', async () => {
+      saveSlotted('zachspartofaday');
+      process.env.CLODEX_KEY_OPENAI_OAUTH = 'provider-override-token';
+
+      const label = (await resolveProvidersForDisplay())[0]?.authLabel ?? '';
+
+      expect(label).toContain('CLODEX_KEY_OPENAI_OAUTH (configured provider override');
+      expect(label).toContain('no isolated model catalog');
+      expect(label).toContain('zachspartofaday (selected; CLODEX_KEY_OPENAI_OAUTH configured; launch blocked');
+      expect(label).not.toContain('zachspartofaday (active)');
+      expect(label.match(/\(active\)/g)).toBeNull();
+      expect(label).not.toContain('provider-override-token');
+    });
+
+    it('keeps a broken OAuth selection ahead of the configured provider key', async () => {
+      saveSlotted('ghost');
+      process.env.CLODEX_KEY_OPENAI_OAUTH = 'provider-override-token';
+
+      const label = (await resolveProvidersForDisplay())[0]?.authLabel ?? '';
+
+      expect(label).toContain('CLODEX_KEY_OPENAI_OAUTH is configured but blocked');
+      expect(label).toContain('ghost (selected, MISSING — every launch fails)');
+      expect(label).not.toContain('active provider override');
+    });
+
+    it('reports an environment override that names no existing slot as broken', async () => {
+      // Corrected. This previously asserted the listing shows `zachspartofaday (active)`
+      // — but applySelectedOAuthAccount THROWS on an override naming a missing
+      // slot, so the listing was promising a launch that does not happen.
+      saveSlotted('zachspartofaday');
+      process.env['CLODEX_OAUTH_ACCOUNT'] = 'ghost';
+      try {
+        const label = (await resolveProvidersForDisplay())[0]?.authLabel ?? '';
+        expect(label).toContain('ghost (selected via CLODEX_OAUTH_ACCOUNT, MISSING');
+        expect(label).not.toContain('zachspartofaday (active)');
+      } finally {
+        delete process.env['CLODEX_OAUTH_ACCOUNT'];
+      }
+    });
+
+    it('projects an invalid environment override for a disabled OAuth provider', async () => {
+      saveSlotted('zachspartofaday', { enabled: false });
+      process.env['CLODEX_OAUTH_ACCOUNT'] = 'ghost';
+      try {
+        const label = (await resolveProvidersForDisplay())[0]?.authLabel ?? '';
+        expect(label).toContain('ghost (selected via CLODEX_OAUTH_ACCOUNT, MISSING');
+        expect(label).toContain('will fail if this provider is enabled');
+        expect(label).not.toContain('every launch fails');
+      } finally {
+        delete process.env['CLODEX_OAUTH_ACCOUNT'];
+      }
+    });
+
+    it('does not claim a non-OAuth provider is merely disabled', async () => {
+      saveSlotted('zachspartofaday', { authType: 'api' });
+      const label = (await resolveProvidersForDisplay())[0]?.authLabel ?? '';
+      expect(label).toContain('zachspartofaday (stored; provider is not OAuth)');
+      expect(label).not.toContain('provider disabled');
+    });
+
+    it('does not confuse a slot literally named default with the provider default', async () => {
+      // `default` is a valid slot name. Labelling the provider's own
+      // credential "default" too would render two identical entries and mark
+      // both active, leaving the listing unable to answer its only question.
+      const registry = emptyRegistry();
+      registry.providers.push({
+        id: 'openai-oauth',
+        templateId: 'openai',
+        name: 'OpenAI (ChatGPT)',
+        enabled: true,
+        authRef: 'keyring:oauth:provider:openai-oauth::credential::v1:default',
+        authType: 'oauth',
+        authAccounts: {
+          default: { authRef: 'keyring:oauth:provider:openai-oauth:account:default::credential::v1:d', addedAt: new Date().toISOString() },
+        },
+        activeAuthAccount: 'default',
+        api: { npm: '@ai-sdk/openai' },
+        addedAt: new Date().toISOString(),
+      });
+      withRegistryWriteLockSync(() => saveRegistry(registry));
+
+      const label = (await resolveProvidersForDisplay())[0]?.authLabel ?? '';
+      expect(label).toContain('accounts: (provider default), default (active)');
+      expect(label.match(/\(active\)/g)).toHaveLength(1);
     });
   });
 });
