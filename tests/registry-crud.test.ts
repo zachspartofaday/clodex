@@ -361,7 +361,7 @@ describe('setActiveOAuthAccount', () => {
           authRef: 'keyring:oauth:provider:openai-oauth::credential::v1:default',
           authType: 'oauth',
           authAccounts: {
-            varmez: { authRef: 'keyring:oauth:provider:openai-oauth:account:varmez::credential::v1:v', addedAt: '2026-08-09T00:00:00.000Z' },
+            zachspartofaday: { authRef: 'keyring:oauth:provider:openai-oauth:account:zachspartofaday::credential::v1:z', addedAt: '2026-08-09T00:00:00.000Z' },
           },
           api: { npm: '@ai-sdk/openai', url: 'https://api.openai.com/v1' },
           addedAt: '2026-08-09T00:00:00.000Z',
@@ -371,27 +371,27 @@ describe('setActiveOAuthAccount', () => {
   });
 
   it('persists the chosen account', () => {
-    const result = setActiveOAuthAccount('openai-oauth', 'varmez');
-    expect(result).toMatchObject({ updated: true, changed: true, account: 'varmez' });
-    expect(result.provider?.activeAuthAccount).toBe('varmez');
-    expect(registryState.current.providers[0]?.activeAuthAccount).toBe('varmez');
+    const result = setActiveOAuthAccount('openai-oauth', 'zachspartofaday');
+    expect(result).toMatchObject({ updated: true, changed: true, account: 'zachspartofaday' });
+    expect(result.provider?.activeAuthAccount).toBe('zachspartofaday');
+    expect(registryState.current.providers[0]?.activeAuthAccount).toBe('zachspartofaday');
   });
 
   it('reports an unchanged selection as a no-op', () => {
-    registryState.current.providers[0]!.activeAuthAccount = 'varmez';
+    registryState.current.providers[0]!.activeAuthAccount = 'zachspartofaday';
 
-    const result = setActiveOAuthAccount('openai-oauth', 'varmez');
+    const result = setActiveOAuthAccount('openai-oauth', 'zachspartofaday');
 
     expect(result).toMatchObject({
       updated: true,
       changed: false,
-      account: 'varmez',
+      account: 'zachspartofaday',
     });
-    expect(result.provider?.activeAuthAccount).toBe('varmez');
+    expect(result.provider?.activeAuthAccount).toBe('zachspartofaday');
   });
 
   it('clears the field rather than storing a sentinel when returning to the default', () => {
-    setActiveOAuthAccount('openai-oauth', 'varmez');
+    setActiveOAuthAccount('openai-oauth', 'zachspartofaday');
     const result = setActiveOAuthAccount('openai-oauth', undefined);
     expect(result).toMatchObject({ updated: true });
     expect(result.provider?.activeAuthAccount).toBeUndefined();
@@ -405,12 +405,12 @@ describe('setActiveOAuthAccount', () => {
     // must be unreachable through the picker rather than merely diagnosed.
     const result = setActiveOAuthAccount('openai-oauth', 'ghost');
     expect(result.updated).toBe(false);
-    expect(result.error).toMatch(/no account named "ghost" \(available: varmez\)/);
+    expect(result.error).toMatch(/no account named "ghost" \(available: zachspartofaday\)/);
     expect(registryState.current.providers[0]?.activeAuthAccount).toBeUndefined();
   });
 
   it('reports an unknown provider instead of writing', () => {
-    expect(setActiveOAuthAccount('nope', 'varmez')).toEqual({
+    expect(setActiveOAuthAccount('nope', 'zachspartofaday')).toEqual({
       updated: false,
       error: 'Provider not found: nope',
     });

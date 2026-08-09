@@ -117,11 +117,11 @@ describe('the stored account selection', () => {
     // absent slot table is reachable. Returning the provider default here
     // would run every launch as the wrong identity in silence — the whole
     // failure this feature exists to prevent.
-    const orphaned: RegistryProvider = { ...base, activeAuthAccount: 'varmez' };
+    const orphaned: RegistryProvider = { ...base, activeAuthAccount: 'zachspartofaday' };
     expect(() => applySelectedOAuthAccount(orphaned, undefined)).toThrow(
       /has no named accounts.*clodex providers/s,
     );
-    const emptyTable: RegistryProvider = { ...base, authAccounts: {}, activeAuthAccount: 'varmez' };
+    const emptyTable: RegistryProvider = { ...base, authAccounts: {}, activeAuthAccount: 'zachspartofaday' };
     expect(() => applySelectedOAuthAccount(emptyTable, undefined)).toThrow(/has no named accounts/);
   });
 
@@ -132,17 +132,17 @@ describe('the stored account selection', () => {
     // substitution the check exists to refuse. The environment cannot rescue a
     // broken stored selection anyway, since with no slot table it has nothing
     // to select either.
-    const orphaned: RegistryProvider = { ...base, activeAuthAccount: 'varmez' };
+    const orphaned: RegistryProvider = { ...base, activeAuthAccount: 'zachspartofaday' };
     expect(() => applySelectedOAuthAccount(orphaned, 'anything')).toThrow(/has no named accounts/);
     // ...and the message names the STORED account, not whatever the variable said.
-    expect(() => applySelectedOAuthAccount(orphaned, 'anything')).toThrow(/"varmez"/);
+    expect(() => applySelectedOAuthAccount(orphaned, 'anything')).toThrow(/"zachspartofaday"/);
     expect(() => applySelectedOAuthAccount(orphaned, 'anything')).not.toThrow(/"anything"/);
   });
 
   it('still ignores an ENVIRONMENT selector on a provider with no slots', () => {
     // Unchanged contract: the variable only ever chooses among slots, and a
     // stale one must not take down a catalog load for providers that can run.
-    expect(applySelectedOAuthAccount(base, 'varmez')).toBe(base);
+    expect(applySelectedOAuthAccount(base, 'zachspartofaday')).toBe(base);
   });
 });
 
@@ -316,15 +316,15 @@ describe('oauthProviderIdFromAccount', () => {
 
 describe('shouldOfferAccountSwitch', () => {
   it('offers the switch when slots exist', () => {
-    expect(shouldOfferAccountSwitch({ authAccounts: { varmez: { authRef: 'k', addedAt: 'x' } } })).toBe(true);
+    expect(shouldOfferAccountSwitch({ authAccounts: { zachspartofaday: { authRef: 'k', addedAt: 'x' } } })).toBe(true);
   });
 
   it('offers the switch for an ORPHANED selector, so the advertised repair is reachable', () => {
     // Launch now throws for this state and tells the user to fix it with
     // `clodex providers`. Gating the action on slots would hide that repair and
     // leave re-authenticating or hand-editing the registry as the only ways out.
-    expect(shouldOfferAccountSwitch({ activeAuthAccount: 'varmez' })).toBe(true);
-    expect(shouldOfferAccountSwitch({ authAccounts: {}, activeAuthAccount: 'varmez' })).toBe(true);
+    expect(shouldOfferAccountSwitch({ activeAuthAccount: 'zachspartofaday' })).toBe(true);
+    expect(shouldOfferAccountSwitch({ authAccounts: {}, activeAuthAccount: 'zachspartofaday' })).toBe(true);
   });
 
   it('stays hidden for a provider with neither', () => {

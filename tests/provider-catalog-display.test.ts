@@ -198,7 +198,7 @@ describe('provider-catalog-display', () => {
         authRef: 'keyring:oauth:provider:openai-oauth::credential::v1:default',
         authType: overrides.authType ?? 'oauth',
         authAccounts: {
-          varmez: { authRef: 'keyring:oauth:provider:openai-oauth:account:varmez::credential::v1:v', addedAt: new Date().toISOString() },
+          zachspartofaday: { authRef: 'keyring:oauth:provider:openai-oauth:account:zachspartofaday::credential::v1:z', addedAt: new Date().toISOString() },
         },
         ...(activeAuthAccount ? { activeAuthAccount } : {}),
         api: { npm: '@ai-sdk/openai' },
@@ -208,9 +208,9 @@ describe('provider-catalog-display', () => {
     }
 
     it('marks which account a launch will actually use', async () => {
-      saveSlotted('varmez');
+      saveSlotted('zachspartofaday');
       const entries = await resolveProvidersForDisplay();
-      expect(entries[0]?.authLabel).toContain('accounts: (provider default), varmez (active)');
+      expect(entries[0]?.authLabel).toContain('accounts: (provider default), zachspartofaday (active)');
     });
 
     it('marks the provider default as active when nothing is stored', async () => {
@@ -218,7 +218,7 @@ describe('provider-catalog-display', () => {
       // run as an unintended identity for hours without anything showing it.
       saveSlotted(undefined);
       const entries = await resolveProvidersForDisplay();
-      expect(entries[0]?.authLabel).toContain('accounts: (provider default) (active), varmez');
+      expect(entries[0]?.authLabel).toContain('accounts: (provider default) (active), zachspartofaday');
     });
 
     it('reports the environment override, not the stored selection', async () => {
@@ -226,10 +226,10 @@ describe('provider-catalog-display', () => {
       // stored one while a variable overrides it misreports the live identity
       // in exactly the persistent shell this listing exists to clarify.
       saveSlotted(undefined);
-      process.env['CLODEX_OAUTH_ACCOUNT'] = 'varmez';
+      process.env['CLODEX_OAUTH_ACCOUNT'] = 'zachspartofaday';
       try {
         const entries = await resolveProvidersForDisplay();
-        expect(entries[0]?.authLabel).toContain('varmez (active, from CLODEX_OAUTH_ACCOUNT)');
+        expect(entries[0]?.authLabel).toContain('zachspartofaday (active, from CLODEX_OAUTH_ACCOUNT)');
         expect(entries[0]?.authLabel).not.toContain('(provider default) (active)');
       } finally {
         delete process.env['CLODEX_OAUTH_ACCOUNT'];
@@ -237,22 +237,22 @@ describe('provider-catalog-display', () => {
     });
 
     it('reports an environment override that names no existing slot as broken', async () => {
-      // Corrected. This previously asserted the listing shows `varmez (active)`
+      // Corrected. This previously asserted the listing shows `zachspartofaday (active)`
       // — but applySelectedOAuthAccount THROWS on an override naming a missing
       // slot, so the listing was promising a launch that does not happen.
-      saveSlotted('varmez');
+      saveSlotted('zachspartofaday');
       process.env['CLODEX_OAUTH_ACCOUNT'] = 'ghost';
       try {
         const label = (await resolveProvidersForDisplay())[0]?.authLabel ?? '';
         expect(label).toContain('ghost (selected via CLODEX_OAUTH_ACCOUNT, MISSING');
-        expect(label).not.toContain('varmez (active)');
+        expect(label).not.toContain('zachspartofaday (active)');
       } finally {
         delete process.env['CLODEX_OAUTH_ACCOUNT'];
       }
     });
 
     it('projects an invalid environment override for a disabled OAuth provider', async () => {
-      saveSlotted('varmez', { enabled: false });
+      saveSlotted('zachspartofaday', { enabled: false });
       process.env['CLODEX_OAUTH_ACCOUNT'] = 'ghost';
       try {
         const label = (await resolveProvidersForDisplay())[0]?.authLabel ?? '';
@@ -265,9 +265,9 @@ describe('provider-catalog-display', () => {
     });
 
     it('does not claim a non-OAuth provider is merely disabled', async () => {
-      saveSlotted('varmez', { authType: 'api' });
+      saveSlotted('zachspartofaday', { authType: 'api' });
       const label = (await resolveProvidersForDisplay())[0]?.authLabel ?? '';
-      expect(label).toContain('varmez (stored; provider is not OAuth)');
+      expect(label).toContain('zachspartofaday (stored; provider is not OAuth)');
       expect(label).not.toContain('provider disabled');
     });
 
