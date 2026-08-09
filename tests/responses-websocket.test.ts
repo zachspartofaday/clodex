@@ -1230,6 +1230,38 @@ describe('createResponsesWebSocketFetch', () => {
     expect(verdict?.isRetryable).toBe(false);
   });
 
+  it('preserves a context-limit failure as 400 so auto-compaction still fires', async () => {
+    // isContextLengthExceededError trusts a frame's structured discriminator
+    // over its prose, and the proxy handlers require a 400 before emitting
+    // Claude Code's prompt-too-long response. As a 502 a long-context request
+    // is retried as a server fault AND loses the signal that would have made
+    // room for it — the worst of both.
+    for (const frame of [
+      { type: 'response.failed', response: { id: 'r', status: 'failed', error: { code: 'context_length_exceeded', message: 'too long' } } },
+      { type: 'error', error: { type: 'invalid_request_error', code: 'context_length_exceeded', message: 'too long' } },
+    ]) {
+      const verdict = await classifyThroughSdk(await failWith(frame));
+      expect(verdict, JSON.stringify(frame)).toMatchObject({ statusCode: 400 });
+      expect(verdict?.isRetryable, JSON.stringify(frame)).toBe(false);
+    }
+  });
+
+  it('classifies output-less terminals with the same rules as a status-carrying frame', async () => {
+    // Delegating to frameStatusCode rather than a local whitelist is what keeps
+    // these in step; 502 stands in only where that classifier has no opinion.
+    const auth = await classifyThroughSdk(await failWith({
+      type: 'response.failed',
+      response: { id: 'r', status: 'failed', error: { type: 'authentication_error', message: 'nope' } },
+    }));
+    expect(auth).toMatchObject({ statusCode: 401 });
+
+    const overload = await classifyThroughSdk(await failWith({
+      type: 'response.failed',
+      response: { id: 'r', status: 'failed', error: { type: 'overloaded_error', message: 'busy' } },
+    }));
+    expect(overload).toMatchObject({ statusCode: 503 });
+  });
+
   it('carries an output-less usage-limit backoff in the message text', async () => {
     // The AI SDK's chunk schema is a closed zod object that strips
     // `retry_after_seconds`, so a hint carried only in the frame field never

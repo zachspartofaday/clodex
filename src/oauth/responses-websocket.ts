@@ -12,7 +12,7 @@ import type { FetchFunction } from '@ai-sdk/provider-utils';
 import type { RawData, WebSocket as WsWebSocket } from 'ws';
 import { CODEX_RESPONSES_WEBSOCKETS_BETA } from '../constants.js';
 import { outboundWsProxyAgent } from '../outbound-proxy.js';
-import { anthropicErrorType, clampRetryAfterSeconds } from '../upstream-error.js';
+import { anthropicErrorType, clampRetryAfterSeconds, frameStatusCode } from '../upstream-error.js';
 import { sanitizeToolInput } from '../tool-input-sanitize.js';
 
 const RESPONSES_LITE_HEADER = 'x-openai-internal-codex-responses-lite';
@@ -1704,21 +1704,37 @@ function handleSocketMessage(entry: ConnectionEntry, data: RawData): void {
       .filter((value): value is string => typeof value === 'string');
     const summary = 'OpenAI ended the response with no output'
       + (named.length ? ` (${named.join(' / ')})` : ` (${type})`);
-    // A usage limit is a real 429 however upstream chose to spell it. Mapping it
-    // to 502 instead would present an exhausted account as a server fault and
-    // spend the client's whole retry budget re-asking a question already answered.
-    const usageLimited = named.some(value => value.includes('usage_limit'));
-    // Deterministic outcomes must not be retryable. `frameIsRetryable` treats
-    // every status >= 500 as transient, so a blanket 502 would make the SDK
-    // repeat a request upstream has already settled — a filtered completion, a
-    // hit output cap, a malformed request — burning the retry budget and then
-    // reporting a server fault for something that was never one.
-    const deterministic = named.some(value =>
-      value === 'max_output_tokens'
-      || value === 'content_filter'
-      || value === 'invalid_request_error'
-      || value === 'invalid_prompt');
-    const statusCode = usageLimited ? 429 : deterministic ? 400 : 502;
+    // Classified by the SAME discriminator rules a status-carrying frame goes
+    // through, rather than a local whitelist that would drift from them.
+    //
+    // That matters beyond tidiness: `context_length_exceeded` has to land on
+    // 400. `isContextLengthExceededError` trusts a frame's structured
+    // discriminator over its prose, and the proxy handlers require a 400 before
+    // emitting Claude Code's prompt-too-long response — so as a 502 a
+    // long-context request is retried as a server fault AND loses the
+    // auto-compaction signal that would have made room for it.
+    //
+    // 502 stands in only where the shared classifier has no opinion (its 500
+    // default): an indeterminate failure genuinely is worth retrying, and 502
+    // is the honest "upstream gave us nothing usable" for an output-less
+    // terminal. Every class it does recognise — deterministic 400s, usage
+    // limits, auth, overload — keeps the status the rest of the stack expects.
+    const discriminator = [details.errorType, details.errorCode]
+      .filter((value): value is string => typeof value === 'string')
+      .join(' ')
+      .toLowerCase();
+    // `incomplete_details.reason` is a DIFFERENT vocabulary from a frame's
+    // code/type, so it is classified here rather than fed to frameStatusCode,
+    // which documents itself as reading the latter. These are the reasons that
+    // describe a settled outcome rather than a fault: retrying re-runs a
+    // request upstream has already answered.
+    const settledReason = details.incompleteReason === 'content_filter'
+      || details.incompleteReason === 'max_output_tokens';
+    const classified = discriminator ? frameStatusCode(undefined, discriminator) : 500;
+    const statusCode = classified !== 500
+      ? classified
+      : settledReason ? 400 : 502;
+    const usageLimited = statusCode === 429;
     // Only when upstream stated one, and only baked into the TEXT: the AI SDK's
     // chunk schema is a closed zod object that strips `retry_after_seconds`, so
     // a hint carried only in the frame field never reaches the client. This is
