@@ -232,11 +232,18 @@ export function accountSwitchHint(
       ? `${OAUTH_ACCOUNT_ENV}=${effective.name} names no such account — every launch fails`
       : `Selected account "${effective.name}" no longer exists — every launch fails; clear it here`;
   }
-  if (effective.kind === 'default') return `Every launch currently uses ${PROVIDER_DEFAULT_ACCOUNT_LABEL}`;
+  // A stored selection an override is masking is still broken; say so, or this
+  // screen reads as healthy until the variable is unset.
+  const masked = effective.latentOrphan
+    ? ` — stored "${effective.latentOrphan}" no longer exists and will fail without it`
+    : '';
+  if (effective.kind === 'default') {
+    return `Every launch currently uses ${PROVIDER_DEFAULT_ACCOUNT_LABEL}${masked}`;
+  }
   return effective.fromEnvironment
     ? `${OAUTH_ACCOUNT_ENV}=${effective.name} overrides the stored `
-      + `${provider.activeAuthAccount ?? PROVIDER_DEFAULT_ACCOUNT_LABEL}`
-    : `Every launch currently uses ${effective.name}`;
+      + `${provider.activeAuthAccount ?? PROVIDER_DEFAULT_ACCOUNT_LABEL}${masked}`
+    : `Every launch currently uses ${effective.name}${masked}`;
 }
 
 export function shouldOfferAccountSwitch(

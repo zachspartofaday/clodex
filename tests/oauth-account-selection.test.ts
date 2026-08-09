@@ -402,6 +402,24 @@ describe('resolveActiveAccount', () => {
       .toEqual({ kind: 'slot', name: 'work', fromEnvironment: false });
   });
 
+  it('keeps a stored orphan visible when an override is masking it', () => {
+    // The override hides the breakage only while the variable is set. Reporting
+    // just the live answer made the listing and the hint read healthy right up
+    // until someone opened a shell without it, at which point every launch
+    // failed on a selection nothing had ever mentioned.
+    const masked = { ...withSlots, activeAuthAccount: 'ghost' } as RegistryProvider;
+    expect(resolveActiveAccount(masked, { CLODEX_OAUTH_ACCOUNT: 'work' }))
+      .toEqual({ kind: 'slot', name: 'work', fromEnvironment: true, latentOrphan: 'ghost' });
+    // Unset the variable and the same registry is openly broken.
+    expect(resolveActiveAccount(masked, {}))
+      .toEqual({ kind: 'broken', name: 'ghost', fromEnvironment: false });
+  });
+
+  it('does not invent a latent orphan for a healthy stored selection', () => {
+    expect(resolveActiveAccount(oauth, { CLODEX_OAUTH_ACCOUNT: 'work' }))
+      .toEqual({ kind: 'slot', name: 'work', fromEnvironment: true });
+  });
+
   it('reports the provider default as its own kind, never as a name', () => {
     expect(resolveActiveAccount(withSlots, {})).toEqual({ kind: 'default' });
   });
@@ -413,6 +431,15 @@ describe('accountSwitchHint', () => {
       .toContain('every launch fails');
     expect(accountSwitchHint({ activeAuthAccount: 'alt' }, { kind: 'broken', name: 'ghost', fromEnvironment: true }))
       .toContain('names no such account');
+  });
+
+  it('flags a masked stored orphan in the hint', () => {
+    const hint = accountSwitchHint(
+      { activeAuthAccount: 'ghost' },
+      { kind: 'slot', name: 'work', fromEnvironment: true, latentOrphan: 'ghost' },
+    );
+    expect(hint).toContain('stored "ghost" no longer exists');
+    expect(hint).toContain('will fail without it');
   });
 
   it('names the live account otherwise', () => {

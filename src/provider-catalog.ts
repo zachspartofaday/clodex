@@ -98,11 +98,21 @@ export const PROVIDER_DEFAULT_ACCOUNT_LABEL = '(provider default)';
  */
 export type ActiveAccount =
   /** Launches on the provider's own credential. */
-  | { kind: 'default' }
+  | { kind: 'default'; latentOrphan?: string }
   /** Launches on this named slot. */
-  | { kind: 'slot'; name: string; fromEnvironment: boolean }
-  /** Launches on nothing: applySelectedOAuthAccount throws for this selector. */
+  | { kind: 'slot'; name: string; fromEnvironment: boolean; latentOrphan?: string }
+  /** Launches on nothing: this selector names no such slot. */
   | { kind: 'broken'; name: string; fromEnvironment: boolean };
+
+/**
+ * `latentOrphan` — a STORED selection that names no slot while something else
+ * is currently winning, so it is not breaking anything yet.
+ *
+ * It has to be reported anyway. An environment override masks it for exactly
+ * as long as the variable is set: unset it, or open a shell without it, and
+ * every launch starts failing on a selection the listing had been calling
+ * healthy the whole time.
+ */
 
 export function resolveActiveAccount(
   provider: Pick<
@@ -134,8 +144,12 @@ export function resolveActiveAccount(
       : { kind: 'broken', name: stored, fromEnvironment: false };
   }
 
+  // Carried on whatever answer wins below: a stored selection that names no
+  // slot is still broken while an override happens to be masking it.
+  const latentOrphan = stored && !has(stored) ? { latentOrphan: stored } : {};
+
   if (override) {
-    if (has(override)) return { kind: 'slot', name: override, fromEnvironment: true };
+    if (has(override)) return { kind: 'slot', name: override, fromEnvironment: true, ...latentOrphan };
     // The environment is ignored only where there is no slot table at all;
     // otherwise it names a missing slot and the launch throws on it.
     if (Object.keys(slots).length > 0) {
@@ -175,6 +189,10 @@ export async function resolveProvidersForDisplay(): Promise<ProviderDisplayEntry
     // shared resolver rather than re-derived here, which is how the detail hint
     // drifted out of step in the first place.
     const broken = effective.kind === 'broken' ? effective : undefined;
+    // Masked, not fixed. An override hides a broken stored selection only while
+    // the variable is set; the listing has to say so, or it reads as healthy
+    // right up until someone opens a shell without it.
+    const latent = effective.kind !== 'broken' ? effective.latentOrphan : undefined;
     const label = (name: string, isActive: boolean): string => {
       if (!isActive) return name;
       return overrideApplies
@@ -187,8 +205,11 @@ export async function resolveProvidersForDisplay(): Promise<ProviderDisplayEntry
       ...(broken
         ? [`${broken.name} (selected${broken.fromEnvironment ? ` via ${OAUTH_ACCOUNT_ENV}` : ''}, MISSING — every launch fails)`]
         : []),
+      ...(latent
+        ? [`${latent} (stored, MISSING — masked by ${OAUTH_ACCOUNT_ENV}; launches fail without it)`]
+        : []),
     ].join(', ');
-    const authLabel = accountNames.length || broken
+    const authLabel = accountNames.length || broken || latent
       ? `${formatRegistryAuthLabel(provider)}; accounts: ${accountList}`
       : formatRegistryAuthLabel(provider);
     entries.push({
