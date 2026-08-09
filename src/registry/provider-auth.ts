@@ -7,7 +7,7 @@ import open from 'open';
 import {
   probeProviderCredentialStore,
   provisionProviderCredential,
-  resolveProviderCredential,
+  resolveProviderCredentialWithSource,
   saveProviderCredential,
 } from '../env.js';
 import { OAUTH_ACCOUNT_ENV } from '../oauth-account-selection.js';
@@ -334,11 +334,16 @@ export async function authenticateProvider(
     const accountOverride = process.env[OAUTH_ACCOUNT_ENV] ?? null;
     const refreshResult = await refreshProviderModelsWithCredential(
       registryId,
-      async provider => resolveProviderCredential(provider.id, provider.authRef),
+      async provider => resolveProviderCredentialWithSource(provider.id, provider.authRef),
       accountOverride,
     );
-    if (refreshResult.ok) refreshSpinner.stop('Models refreshed');
-    else refreshSpinner.stop(`Could not refresh models${refreshResult.reason ? ` — ${refreshResult.reason}` : ''}`);
+    if (refreshResult.skipped) {
+      refreshSpinner.stop(`Models not refreshed${refreshResult.reason ? ` — ${refreshResult.reason}` : ''}`);
+    } else if (refreshResult.ok) {
+      refreshSpinner.stop('Models refreshed');
+    } else {
+      refreshSpinner.stop(`Could not refresh models${refreshResult.reason ? ` — ${refreshResult.reason}` : ''}`);
+    }
   } catch {
     refreshSpinner.stop('Could not refresh models — run clodex providers refresh-models later');
   }

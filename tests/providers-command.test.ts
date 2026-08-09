@@ -34,6 +34,8 @@ const authenticateProviderMock = vi.hoisted(() => vi.fn());
 const logErrorMock = vi.hoisted(() => vi.fn());
 const logSuccessMock = vi.hoisted(() => vi.fn());
 const warnMock = vi.hoisted(() => vi.fn());
+const refreshProviderModelsWithCredentialMock = vi.hoisted(() => vi.fn());
+const refreshAllProviderModelsMock = vi.hoisted(() => vi.fn());
 const TEST_HELPER_ID = 'a'.repeat(64);
 const helperRef = (account: string): string => `helper:v1:${TEST_HELPER_ID}:${account}`;
 
@@ -71,6 +73,12 @@ vi.mock('../src/registry/add-template.js', async importOriginal => {
     addProviderFromTemplate: addTemplateMock,
   };
 });
+
+vi.mock('../src/registry/refresh-models.js', async importOriginal => ({
+  ...await importOriginal<typeof import('../src/registry/refresh-models.js')>(),
+  refreshProviderModelsWithCredential: refreshProviderModelsWithCredentialMock,
+  refreshAllProviderModels: refreshAllProviderModelsMock,
+}));
 
 vi.mock('../src/registry/provider-auth.js', async importOriginal => {
   const actual = await importOriginal<typeof import('../src/registry/provider-auth.js')>();
@@ -277,6 +285,105 @@ describe('providers auth command', () => {
       'Could not save OAuth tokens to the credential store: credential write failed',
     );
     expect(logSuccessMock).not.toHaveBeenCalled();
+  });
+});
+
+describe('interactive OAuth account switching', () => {
+  let home: string;
+  const prevHome = process.env.CLODEX_HOME;
+  const prevProviderOverride = process.env.CLODEX_KEY_OPENAI_OAUTH;
+
+  function slottedProvider(activeAuthAccount?: string): RegistryProvider {
+    return {
+      id: 'openai-oauth',
+      templateId: 'openai',
+      name: 'OpenAI (ChatGPT)',
+      enabled: true,
+      authRef: 'keyring:oauth:provider:openai-oauth::credential::v1:default',
+      authType: 'oauth',
+      authAccounts: {
+        work: {
+          authRef: 'keyring:oauth:provider:openai-oauth:account:work::credential::v1:w',
+          addedAt: '2026-08-09T00:00:00.000Z',
+        },
+      },
+      ...(activeAuthAccount ? { activeAuthAccount } : {}),
+      api: { npm: '@ai-sdk/openai', url: 'https://api.openai.com/v1' },
+      modelsCache: {
+        fetchedAt: '2026-08-09T00:00:00.000Z',
+        models: [{
+          id: 'default-only-model',
+          name: 'Default-only model',
+          upstreamModelId: 'default-only-model',
+          modelFormat: 'openai',
+        }],
+      },
+      addedAt: '2026-08-09T00:00:00.000Z',
+    };
+  }
+
+  beforeEach(() => {
+    home = mkdtempSync(join(tmpdir(), 'clodex-account-switch-'));
+    process.env.CLODEX_HOME = home;
+    delete process.env.CLODEX_KEY_OPENAI_OAUTH;
+    selectMock.mockReset();
+    logErrorMock.mockReset();
+    logSuccessMock.mockReset();
+    warnMock.mockReset();
+    refreshProviderModelsWithCredentialMock.mockReset();
+    refreshAllProviderModelsMock.mockReset();
+  });
+
+  afterEach(() => {
+    if (prevHome === undefined) delete process.env.CLODEX_HOME;
+    else process.env.CLODEX_HOME = prevHome;
+    if (prevProviderOverride === undefined) delete process.env.CLODEX_KEY_OPENAI_OAUTH;
+    else process.env.CLODEX_KEY_OPENAI_OAUTH = prevProviderOverride;
+    rmSync(home, { recursive: true, force: true });
+    vi.restoreAllMocks();
+  });
+
+  it('invalidates then immediately refreshes after a real account transition', async () => {
+    const registry = emptyRegistry();
+    registry.providers.push(slottedProvider());
+    withRegistryWriteLockSync(() => saveRegistry(registry));
+    selectMock
+      .mockResolvedValueOnce('provider:openai-oauth')
+      .mockResolvedValueOnce('account')
+      .mockResolvedValueOnce('work')
+      .mockResolvedValueOnce('done');
+    refreshProviderModelsWithCredentialMock.mockImplementation(async () => {
+      expect(loadRegistry().providers[0]?.modelsCache).toBeUndefined();
+      return {
+        id: 'openai-oauth',
+        name: 'OpenAI (ChatGPT)',
+        ok: false,
+        reason: 'simulated discovery failure',
+      };
+    });
+
+    await expect(runProvidersCommand([])).resolves.toBe(0);
+
+    expect(refreshProviderModelsWithCredentialMock).toHaveBeenCalledOnce();
+    expect(loadRegistry().providers[0]).toMatchObject({ activeAuthAccount: 'work' });
+    expect(loadRegistry().providers[0]?.modelsCache).toBeUndefined();
+    expect(logErrorMock).toHaveBeenCalledWith('OpenAI (ChatGPT): simulated discovery failure');
+  });
+
+  it('preserves the cache and skips refresh for a no-op selection', async () => {
+    const registry = emptyRegistry();
+    registry.providers.push(slottedProvider('work'));
+    withRegistryWriteLockSync(() => saveRegistry(registry));
+    selectMock
+      .mockResolvedValueOnce('provider:openai-oauth')
+      .mockResolvedValueOnce('account')
+      .mockResolvedValueOnce('work')
+      .mockResolvedValueOnce('done');
+
+    await expect(runProvidersCommand([])).resolves.toBe(0);
+
+    expect(refreshProviderModelsWithCredentialMock).not.toHaveBeenCalled();
+    expect(loadRegistry().providers[0]?.modelsCache?.models[0]?.id).toBe('default-only-model');
   });
 });
 

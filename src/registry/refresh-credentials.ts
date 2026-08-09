@@ -1,6 +1,11 @@
 // src/registry/refresh-credentials.ts — keys for refresh-models (OpenCode placeholders, env fallbacks)
 
 import { applySelectedOAuthAccount, isAnonymousProvider } from './materialize.js';
+import {
+  resolveProviderCredentialOverrideState,
+  type ProviderCredentialOverrideState,
+  type ResolvedProviderCredential,
+} from '../env.js';
 import { OAUTH_ACCOUNT_ENV } from '../oauth-account-selection.js';
 import type { RegistryProvider } from './types.js';
 
@@ -27,6 +32,8 @@ export interface RefreshCredentialSnapshot {
     addedAt: string;
     oauthAccountId?: string;
   };
+  /** Redaction-safe identity of the namespaced provider key, when it wins. */
+  credentialOverride?: ProviderCredentialOverrideState;
 }
 
 function providerForRefresh(
@@ -58,6 +65,10 @@ export function refreshCredentialSnapshot(
   const selectedAccount = provider.authType === 'oauth' && selectedName
     ? provider.authAccounts?.[selectedName]
     : undefined;
+  const credentialOverride = effective.authType !== 'none'
+    && effective.authRef !== 'none:anonymous'
+    ? resolveProviderCredentialOverrideState(effective.id)
+    : null;
   return {
     provider: {
       id: provider.id,
@@ -85,6 +96,7 @@ export function refreshCredentialSnapshot(
           },
         }
       : {}),
+    ...(credentialOverride ? { credentialOverride } : {}),
   };
 }
 
@@ -137,32 +149,68 @@ export function skipWithCachedModels(
   };
 }
 
-export async function resolveRefreshCredential(
+export type RefreshCredentialResolver = (
   provider: RegistryProvider,
-  resolveKey: (provider: RegistryProvider) => Promise<string | null>,
+) => Promise<string | null | ResolvedProviderCredential>;
+
+/** Resolve the refresh credential together with its actual provider-override source. */
+export async function resolveRefreshCredentialWithSource(
+  provider: RegistryProvider,
+  resolveKey: RefreshCredentialResolver,
   selected: string | null | undefined = process.env[OAUTH_ACCOUNT_ENV],
-): Promise<string | null> {
+): Promise<ResolvedProviderCredential> {
   // Model entitlements are account-specific. Resolve exactly the provider
   // identity a launch in this process would use, never the registry's default
   // authRef merely because it is the field persisted at the top level.
   const effectiveProvider = providerForRefresh(provider, selected ?? undefined);
-  if (isAnonymousProvider(effectiveProvider)) return null;
+  if (
+    isAnonymousProvider(effectiveProvider)
+    || effectiveProvider.authType === 'none'
+    || effectiveProvider.authRef === 'none:anonymous'
+  ) return { credential: null };
 
   // OAuth token refresh (e.g. an expired/revoked refresh token returning 401) throws
   // rather than resolving to null. Treat that the same as "no key" so callers fall
   // through to refreshProviderModels' existing friendly "sign in again" messaging
   // instead of crashing the whole refresh with an unhandled exception.
-  let key: string | null;
+  let resolved: ResolvedProviderCredential;
   try {
-    key = await resolveKey(effectiveProvider);
+    const result = await resolveKey(effectiveProvider);
+    resolved = typeof result === 'object' && result !== null
+      ? result
+      : {
+          credential: result,
+          // Backwards-compatible resolvers return only the key. Attribute the
+          // current usable override for them; production resolvers return the
+          // source atomically with the credential and close this race fully.
+          ...(result
+            ? {
+                credentialOverride:
+                  resolveProviderCredentialOverrideState(effectiveProvider.id) ?? undefined,
+              }
+            : {}),
+        };
   } catch {
-    key = null;
+    resolved = { credential: null };
   }
-  if (!isLikelyPlaceholderKey(key)) return key;
+  // A namespaced provider key is an explicit runtime override, even if its
+  // spelling resembles an OpenCode placeholder. Refresh must use the same
+  // credential a launch will use rather than silently falling through.
+  if (resolved.credentialOverride || !isLikelyPlaceholderKey(resolved.credential)) {
+    return resolved;
+  }
 
   for (const envVar of ENV_FALLBACK_BY_PROVIDER[effectiveProvider.id] ?? []) {
     const fromEnv = process.env[envVar]?.trim();
-    if (fromEnv && !isLikelyPlaceholderKey(fromEnv)) return fromEnv;
+    if (fromEnv && !isLikelyPlaceholderKey(fromEnv)) return { credential: fromEnv };
   }
-  return key;
+  return resolved;
+}
+
+export async function resolveRefreshCredential(
+  provider: RegistryProvider,
+  resolveKey: RefreshCredentialResolver,
+  selected: string | null | undefined = process.env[OAUTH_ACCOUNT_ENV],
+): Promise<string | null> {
+  return (await resolveRefreshCredentialWithSource(provider, resolveKey, selected)).credential;
 }

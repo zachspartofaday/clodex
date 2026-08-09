@@ -199,6 +199,80 @@ describe('refreshProviderModels', () => {
     expect(saveRegistry).not.toHaveBeenCalled();
   });
 
+  it('does not send after the namespaced provider override changes post-resolution', async () => {
+    const provider = {
+      id: 'groq',
+      templateId: 'groq',
+      name: 'Groq',
+      enabled: true,
+      authRef: 'keyring:provider:groq',
+      authType: 'api' as const,
+      api: { npm: '@ai-sdk/groq', url: 'https://api.groq.com/openai/v1' },
+      addedAt: '2026-01-01T00:00:00.000Z',
+    };
+    const registry: ProviderRegistry = { schemaVersion: 1, providers: [provider] };
+    const previous = process.env.CLODEX_KEY_GROQ;
+    process.env.CLODEX_KEY_GROQ = 'override-generation-one';
+    try {
+      const snapshot = refreshCredentialSnapshot(provider, null);
+      process.env.CLODEX_KEY_GROQ = 'override-generation-two';
+
+      const result = await refreshProviderModels(
+        'groq',
+        'override-generation-one',
+        registry,
+        snapshot,
+      );
+
+      expect(result).toMatchObject({
+        ok: false,
+        reason: 'Provider credential override changed while models were refreshing.',
+      });
+      expect(fetchTemplateModels).not.toHaveBeenCalled();
+      expect(saveRegistry).not.toHaveBeenCalled();
+    } finally {
+      if (previous === undefined) delete process.env.CLODEX_KEY_GROQ;
+      else process.env.CLODEX_KEY_GROQ = previous;
+    }
+  });
+
+  it('does not begin discovery or commit while a provider override owns the credential', async () => {
+    const provider = {
+      id: 'groq',
+      templateId: 'groq',
+      name: 'Groq',
+      enabled: true,
+      authRef: 'keyring:provider:groq',
+      authType: 'api' as const,
+      api: { npm: '@ai-sdk/groq', url: 'https://api.groq.com/openai/v1' },
+      addedAt: '2026-01-01T00:00:00.000Z',
+    };
+    const registry: ProviderRegistry = { schemaVersion: 1, providers: [provider] };
+    vi.mocked(loadRegistryStrict).mockReturnValue(registry);
+    const previous = process.env.CLODEX_KEY_GROQ;
+    process.env.CLODEX_KEY_GROQ = 'override-generation-one';
+    try {
+      const snapshot = refreshCredentialSnapshot(provider, null);
+      const result = await refreshProviderModels(
+        'groq',
+        'override-generation-one',
+        registry,
+        snapshot,
+      );
+
+      expect(result).toMatchObject({
+        ok: true,
+        skipped: true,
+        reason: expect.stringContaining('process-scoped provider credential override'),
+      });
+      expect(fetchTemplateModels).not.toHaveBeenCalled();
+      expect(saveRegistry).not.toHaveBeenCalled();
+    } finally {
+      if (previous === undefined) delete process.env.CLODEX_KEY_GROQ;
+      else process.env.CLODEX_KEY_GROQ = previous;
+    }
+  });
+
   it('does not send or commit with a reauthenticated named slot that kept its authRef', async () => {
     const startedProvider = {
       id: 'groq',
@@ -350,7 +424,7 @@ describe('refreshProviderModels', () => {
     }));
   });
 
-  it('uses the captured environment slot for the whole locked refresh', async () => {
+  it('resolves but does not persist a transient environment account catalog', async () => {
     const provider = {
       id: 'groq',
       templateId: 'groq',
@@ -368,13 +442,6 @@ describe('refreshProviderModels', () => {
     };
     const registry: ProviderRegistry = { schemaVersion: 3, providers: [provider] };
     vi.mocked(loadRegistryStrict).mockReturnValue(registry);
-    vi.mocked(fetchTemplateModels).mockImplementation(async () => {
-      expect(providerMutationState.active).toBe(true);
-      return {
-        baseUrl: 'https://api.groq.com/openai/v1',
-        models: [{ id: 'live-a', name: 'Live A', upstreamModelId: 'live-a', modelFormat: 'openai' }],
-      };
-    });
     const resolveKey = vi.fn(async () => {
       expect(providerMutationState.active).toBe(true);
       return 'alt-token';
@@ -382,11 +449,57 @@ describe('refreshProviderModels', () => {
 
     const result = await refreshProviderModelsWithCredential('groq', resolveKey, 'alt');
 
-    expect(result).toMatchObject({ ok: true, modelCount: 1 });
+    expect(result).toMatchObject({
+      ok: true,
+      skipped: true,
+      reason: expect.stringContaining('CLODEX_OAUTH_ACCOUNT=alt temporarily selects a different account'),
+    });
     expect(resolveKey).toHaveBeenCalledWith(expect.objectContaining({
       authRef: 'keyring:provider:alt',
     }));
+    expect(fetchTemplateModels).not.toHaveBeenCalled();
+    expect(saveRegistry).not.toHaveBeenCalled();
     expect(providerMutationState.active).toBe(false);
+  });
+
+  it('rejects the resolved provider-override generation even if the environment changes back', async () => {
+    const provider = {
+      id: 'groq',
+      templateId: 'groq',
+      name: 'Groq',
+      enabled: true,
+      authRef: 'keyring:provider:groq',
+      authType: 'api' as const,
+      api: { npm: '@ai-sdk/groq', url: 'https://api.groq.com/openai/v1' },
+      addedAt: '2026-01-01T00:00:00.000Z',
+    };
+    vi.mocked(loadRegistryStrict).mockReturnValue({ schemaVersion: 1, providers: [provider] });
+    const previous = process.env.CLODEX_KEY_GROQ;
+    process.env.CLODEX_KEY_GROQ = 'override-generation-one';
+    try {
+      const result = await refreshProviderModelsWithCredential('groq', async () => {
+        process.env.CLODEX_KEY_GROQ = 'override-generation-two';
+        const fingerprint = (await import('node:crypto'))
+          .createHash('sha256')
+          .update('override-generation-two')
+          .digest('hex');
+        process.env.CLODEX_KEY_GROQ = 'override-generation-one';
+        return {
+          credential: 'override-generation-two',
+          credentialOverride: { variable: 'CLODEX_KEY_GROQ', fingerprint },
+        };
+      }, null);
+
+      expect(result).toMatchObject({
+        ok: false,
+        reason: 'Provider credential override changed while models were refreshing.',
+      });
+      expect(fetchTemplateModels).not.toHaveBeenCalled();
+      expect(saveRegistry).not.toHaveBeenCalled();
+    } finally {
+      if (previous === undefined) delete process.env.CLODEX_KEY_GROQ;
+      else process.env.CLODEX_KEY_GROQ = previous;
+    }
   });
 
   it('rejects restricted provider API URLs before refreshing models', async () => {

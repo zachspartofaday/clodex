@@ -267,6 +267,24 @@ export interface ResolveCredentialOptions {
   rejectedAccessToken?: string;
 }
 
+/**
+ * Redaction-safe identity for a usable namespaced provider credential.
+ *
+ * The fingerprint is sufficient to fence an environment change without ever
+ * copying the credential itself into registry snapshots, diagnostics, or UI
+ * state.
+ */
+export interface ProviderCredentialOverrideState {
+  variable: string;
+  fingerprint: string;
+}
+
+export interface ResolvedProviderCredential {
+  credential: string | null;
+  /** Present only when the namespaced provider environment variable won. */
+  credentialOverride?: ProviderCredentialOverrideState;
+}
+
 /** Parse registry credential references. */
 export function parseAuthRef(authRef: string): ParsedAuthRef | null {
   if (authRef === 'none:anonymous') return { kind: 'none' };
@@ -290,8 +308,11 @@ export function clodexKeyEnvVar(providerId: string): string {
   return `CLODEX_KEY_${providerId.toUpperCase().replace(/[^A-Z0-9]/g, '_')}`;
 }
 
-function readEnvCredential(varName: string): string | null {
-  const raw = process.env[varName];
+function readEnvCredential(
+  varName: string,
+  env: NodeJS.ProcessEnv = process.env,
+): string | null {
+  const raw = env[varName];
   if (!raw?.trim()) return null;
   return raw.trim().split(/\r?\n/)[0]?.trim() || null;
 }
@@ -325,6 +346,39 @@ function usableEnvCredential(
     rejectedEnvCredentialFingerprints.delete(source);
   }
   return value;
+}
+
+function readProviderCredentialOverride(
+  providerId: string,
+  env: NodeJS.ProcessEnv,
+  options: ResolveCredentialOptions,
+): { credential: string; state: ProviderCredentialOverrideState } | null {
+  const variable = clodexKeyEnvVar(providerId);
+  const credential = usableEnvCredential(
+    `provider:${providerId}`,
+    readEnvCredential(variable, env),
+    options.rejectedAccessToken,
+  );
+  if (!credential) return null;
+  return {
+    credential,
+    state: {
+      variable,
+      fingerprint: credentialFingerprint(credential),
+    },
+  };
+}
+
+/**
+ * Inspect the usable namespaced provider override without exposing its value.
+ * This deliberately shares the resolver's remembered-rejection semantics.
+ */
+export function resolveProviderCredentialOverrideState(
+  providerId: string,
+  env: NodeJS.ProcessEnv = process.env,
+  options: ResolveCredentialOptions = {},
+): ProviderCredentialOverrideState | null {
+  return readProviderCredentialOverride(providerId, env, options)?.state ?? null;
 }
 
 function readKeyringEntry(keyring: KeyringApi, service: string, account: string): string | null {
@@ -2266,6 +2320,44 @@ async function deleteStoredCredential(
   }
 }
 
+/**
+ * Resolve a provider secret and retain only redaction-safe provenance when the
+ * namespaced environment override supplies it.
+ */
+export async function resolveProviderCredentialWithSource(
+  providerId: string,
+  authRef: string,
+  diag?: (msg: string) => void,
+  options: ResolveCredentialOptions = {},
+): Promise<ResolvedProviderCredential> {
+  const parsed = parseAuthRef(authRef);
+  if (parsed?.kind === 'none') return { credential: null };
+
+  const namespaced = readProviderCredentialOverride(providerId, process.env, options);
+  if (namespaced) {
+    return {
+      credential: namespaced.credential,
+      credentialOverride: namespaced.state,
+    };
+  }
+
+  if (!parsed) return { credential: null };
+
+  if (parsed.kind === 'env') {
+    return {
+      credential: usableEnvCredential(
+        `provider:${providerId}:env:${parsed.varName}`,
+        readEnvCredential(parsed.varName),
+        options.rejectedAccessToken,
+      ),
+    };
+  }
+
+  return {
+    credential: await readProviderSecret(parsed, diag, options.rejectedAccessToken),
+  };
+}
+
 /** Resolve a provider secret from a namespaced env var or its configured store. */
 export async function resolveProviderCredential(
   providerId: string,
@@ -2273,28 +2365,12 @@ export async function resolveProviderCredential(
   diag?: (msg: string) => void,
   options: ResolveCredentialOptions = {},
 ): Promise<string | null> {
-  const parsed = parseAuthRef(authRef);
-  if (parsed?.kind === 'none') return null;
-
-  const namespacedVar = clodexKeyEnvVar(providerId);
-  const namespaced = usableEnvCredential(
-    `provider:${providerId}`,
-    readEnvCredential(namespacedVar),
-    options.rejectedAccessToken,
-  );
-  if (namespaced) return namespaced;
-
-  if (!parsed) return null;
-
-  if (parsed.kind === 'env') {
-    return usableEnvCredential(
-      `provider:${providerId}:env:${parsed.varName}`,
-      readEnvCredential(parsed.varName),
-      options.rejectedAccessToken,
-    );
-  }
-
-  return readProviderSecret(parsed, diag, options.rejectedAccessToken);
+  return (await resolveProviderCredentialWithSource(
+    providerId,
+    authRef,
+    diag,
+    options,
+  )).credential;
 }
 
 /** Read OAuth metadata retained alongside the access token. */

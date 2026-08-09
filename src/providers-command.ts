@@ -2,7 +2,7 @@
 
 import pc from 'picocolors';
 import * as p from '@clack/prompts';
-import { resolveProviderCredential } from './env.js';
+import { resolveProviderCredentialWithSource } from './env.js';
 import {
   formatRegistryAuthLabel,
   PROVIDER_DEFAULT_ACCOUNT_LABEL,
@@ -199,6 +199,29 @@ export function accountSwitchOutcome(
 ): { ok: boolean; message: string } {
   const savedLabel = saved ?? PROVIDER_DEFAULT_ACCOUNT_LABEL;
 
+  if (effective.kind === 'credential-override') {
+    const variable = effective.credentialOverride.variable;
+    if (effective.inactiveReason === 'non-oauth') {
+      return {
+        ok: true,
+        message: `Saved ${savedLabel} for ${providerName}, but this provider is not configured for OAuth account selection; `
+          + `${variable} remains the active provider credential override.`,
+      };
+    }
+    if (effective.inactiveReason === 'disabled') {
+      return {
+        ok: true,
+        message: `Saved ${savedLabel} for ${providerName} (provider disabled); ${variable} is configured to override `
+          + 'the selected account credential if the provider is enabled in this shell.',
+      };
+    }
+    return {
+      ok: true,
+      message: `Saved ${savedLabel} for ${providerName}, but ${variable} is the active provider credential override; `
+        + 'no OAuth account credential is active in this shell.',
+    };
+  }
+
   if (effective.inactiveReason === 'non-oauth') {
     return {
       ok: true,
@@ -208,13 +231,16 @@ export function accountSwitchOutcome(
 
   if (effective.inactiveReason === 'disabled') {
     if (effective.kind === 'broken') {
+      const blockedOverride = effective.credentialOverride
+        ? ` ${effective.credentialOverride.variable} is configured, but OAuth account selection is validated before credential resolution.`
+        : '';
       return {
         ok: false,
         message: effective.fromEnvironment
           ? `Saved ${savedLabel} for ${providerName} (provider disabled), but ${OAUTH_ACCOUNT_ENV}=${effective.name} `
-            + 'names no such account — enabling it in this shell will fail until the variable is unset or corrected.'
+            + `names no such account — enabling it in this shell will fail until the variable is unset or corrected.${blockedOverride}`
           : `Saved ${savedLabel} for ${providerName} (provider disabled), but that account no longer exists — `
-            + 'enabling the provider will fail.',
+            + `enabling the provider will fail.${blockedOverride}`,
       };
     }
     if (effective.kind === 'slot' && effective.fromEnvironment && effective.name !== saved) {
@@ -231,13 +257,16 @@ export function accountSwitchOutcome(
   }
 
   if (effective.kind === 'broken') {
+    const blockedOverride = effective.credentialOverride
+      ? ` ${effective.credentialOverride.variable} is configured, but OAuth account selection is validated before credential resolution.`
+      : '';
     return {
       ok: false,
       message: effective.fromEnvironment
         ? `Saved ${savedLabel} for ${providerName}, but ${OAUTH_ACCOUNT_ENV}=${effective.name} `
-          + 'names no such account — every launch fails until it is unset or corrected.'
+          + `names no such account — every launch fails until it is unset or corrected.${blockedOverride}`
         : `Saved ${savedLabel} for ${providerName}, but it names no existing account — `
-          + 'every launch fails.',
+          + `every launch fails.${blockedOverride}`,
     };
   }
   if (effective.kind === 'slot' && effective.fromEnvironment && effective.name !== saved) {
@@ -269,6 +298,27 @@ export function accountSwitchHint(
   provider: Pick<RegistryProvider, 'activeAuthAccount'>,
   effective: ActiveAccount,
 ): string {
+  if (effective.kind === 'credential-override') {
+    const variable = effective.credentialOverride.variable;
+    const selected = effective.selection;
+    const account = selected.kind === 'slot'
+      ? `account ${selected.name}`
+      : selected.kind === 'default'
+        ? PROVIDER_DEFAULT_ACCOUNT_LABEL
+        : `missing stored OAuth account "${selected.name}"`;
+    const masked = selected.latentOrphan
+      ? `; stored "${selected.latentOrphan}" is missing and will fail without ${OAUTH_ACCOUNT_ENV}`
+      : '';
+    if (effective.inactiveReason === 'non-oauth') {
+      return `${variable} is the active provider credential override; OAuth selection (${account}) is stored but inactive `
+        + `because this provider is not configured for OAuth${masked}`;
+    }
+    if (effective.inactiveReason === 'disabled') {
+      return `${variable} is configured to override ${account}'s credential if this provider is enabled${masked}`;
+    }
+    return `${variable} overrides ${account}'s credential; no OAuth account credential is currently active${masked}`;
+  }
+
   if (effective.inactiveReason === 'non-oauth') {
     if (effective.kind === 'broken') {
       return `Stored OAuth account "${effective.name}" no longer exists — provider is not configured for OAuth selection`;
@@ -284,9 +334,12 @@ export function accountSwitchHint(
       ? `; stored "${effective.latentOrphan}" is missing and will fail if enabled without the override`
       : '';
     if (effective.kind === 'broken') {
+      const blockedOverride = effective.credentialOverride
+        ? `; ${effective.credentialOverride.variable} cannot bypass account selection`
+        : '';
       return effective.fromEnvironment
-        ? `${OAUTH_ACCOUNT_ENV}=${effective.name} names no such account — enabling this provider will fail${masked}`
-        : `Selected account "${effective.name}" no longer exists — enabling this provider will fail`;
+        ? `${OAUTH_ACCOUNT_ENV}=${effective.name} names no such account — enabling this provider will fail${masked}${blockedOverride}`
+        : `Selected account "${effective.name}" no longer exists — enabling this provider will fail${blockedOverride}`;
     }
     if (effective.kind === 'slot') {
       return effective.fromEnvironment
@@ -304,9 +357,13 @@ export function accountSwitchHint(
     const also = effective.latentOrphan
       ? ` (and stored "${effective.latentOrphan}" is missing too)`
       : '';
+    const blockedOverride = effective.credentialOverride
+      ? `; ${effective.credentialOverride.variable} cannot bypass account selection`
+      : '';
     return effective.fromEnvironment
       ? `${OAUTH_ACCOUNT_ENV}=${effective.name} names no such account — every launch fails${also}`
-      : `Selected account "${effective.name}" no longer exists — every launch fails; clear it here`;
+        + blockedOverride
+      : `Selected account "${effective.name}" no longer exists — every launch fails; clear it here${blockedOverride}`;
   }
   // A stored selection an override is masking is still broken; say so, or this
   // screen reads as healthy until the variable is unset.
@@ -368,7 +425,7 @@ export async function runProvidersAuth(providerId: string, method?: ProviderAuth
 
 export async function runProvidersRefreshModels(providerId?: string): Promise<number> {
   const resolveKey = async (provider: import('./registry/types.js').RegistryProvider) =>
-    resolveProviderCredential(provider.id, provider.authRef);
+    resolveProviderCredentialWithSource(provider.id, provider.authRef);
 
   if (providerId) {
     const registry = loadRegistry();
@@ -384,7 +441,7 @@ export async function runProvidersRefreshModels(providerId?: string): Promise<nu
     try {
       result = await refreshProviderModelsWithCredential(
         providerId,
-        async candidate => resolveProviderCredential(candidate.id, candidate.authRef),
+        async candidate => resolveProviderCredentialWithSource(candidate.id, candidate.authRef),
         accountOverride,
       );
     } catch (err) {
@@ -769,6 +826,11 @@ async function runProviderDetail(id: string): Promise<'back' | 'removed'> {
       result.changed,
     );
     if (restartWarning) p.log.warn(restartWarning);
+    // The catalog belongs to the credential identity. The write above clears
+    // it atomically on a real transition; refresh immediately so a failure
+    // leaves an empty cache rather than advertising the previous account's
+    // entitlements. A no-op preserves and does not re-fetch the valid cache.
+    if (result.changed) await runProvidersRefreshModels(id);
     return 'back';
   }
 

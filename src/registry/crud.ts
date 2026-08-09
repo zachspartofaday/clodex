@@ -135,7 +135,14 @@ export function setActiveOAuthAccount(
       delete provider.activeAuthAccount;
     }
     const changed = previous !== name;
-    if (changed) saveRegistry(registry);
+    if (changed) {
+      // Model availability is credential/account-specific. Invalidate under
+      // the same registry lock as the selection so no reader can observe the
+      // new identity paired with the old identity's catalog. The interactive
+      // command immediately attempts a targeted refresh after this mutation.
+      delete provider.modelsCache;
+      saveRegistry(registry);
+    }
     // Return the state that actually won the write lock. The provider may have
     // been disabled, retyped, or otherwise changed while the picker was open;
     // post-switch messages must not be derived from the stale pre-prompt copy.

@@ -476,11 +476,57 @@ describe('resolveActiveAccount', () => {
     expect(resolveActiveAccount(withSlots, {})).toEqual({ kind: 'default' });
   });
 
-  it('exhausts the auth-type/enabled/slots/stored/environment state grid', () => {
+  it('reports the provider credential override without calling an OAuth account active', () => {
+    const effective = resolveActiveAccount(oauth, {
+      CLODEX_KEY_OPENAI_OAUTH: 'provider-override-token',
+    });
+    expect(effective).toMatchObject({
+      kind: 'credential-override',
+      credentialOverride: {
+        variable: 'CLODEX_KEY_OPENAI_OAUTH',
+        fingerprint: expect.stringMatching(/^[0-9a-f]{64}$/),
+      },
+      selection: { kind: 'slot', name: 'alt', fromEnvironment: false },
+    });
+    expect(JSON.stringify(effective)).not.toContain('provider-override-token');
+  });
+
+  it('keeps a broken OAuth selector authoritative over the provider credential override', () => {
+    const effective = resolveActiveAccount(
+      { ...withSlots, activeAuthAccount: 'ghost' },
+      { CLODEX_KEY_OPENAI_OAUTH: 'provider-override-token' },
+    );
+    expect(effective).toMatchObject({
+      kind: 'broken',
+      name: 'ghost',
+      credentialOverride: { variable: 'CLODEX_KEY_OPENAI_OAUTH' },
+    });
+  });
+
+  it('applies no-auth markers in the same order as runtime account selection', () => {
+    const env = { CLODEX_KEY_OPENAI_OAUTH: 'stale-provider-override' };
+    // A valid OAuth slot swaps authRef before credential resolution, so its
+    // non-none reference makes the provider override reachable at runtime.
+    expect(resolveActiveAccount({
+      ...withSlots,
+      authRef: 'none:anonymous',
+      authType: 'oauth',
+      activeAuthAccount: 'work',
+    }, env).kind).toBe('credential-override');
+    // authType none prevents account selection and credential resolution.
+    expect(resolveActiveAccount({
+      ...withSlots,
+      authType: 'none',
+      activeAuthAccount: 'work',
+    }, env).kind).toBe('slot');
+  });
+
+  it('exhausts the auth-type/enabled/slots/stored/account-env/provider-key grid', () => {
     const authTypes: Array<RegistryProvider['authType']> = ['oauth', 'api', 'none', undefined];
     const slotStates = [false, true];
     const storedStates = [undefined, 'work', 'ghost'];
     const environmentStates = [undefined, 'work', 'ghost'];
+    const providerOverrideStates = [false, true];
     let cases = 0;
 
     for (const authType of authTypes) {
@@ -488,50 +534,73 @@ describe('resolveActiveAccount', () => {
         for (const hasSlots of slotStates) {
           for (const activeAuthAccount of storedStates) {
             for (const environmentAccount of environmentStates) {
-              cases++;
-              const provider: RegistryProvider = {
-                ...base,
-                enabled,
-                authType,
-                ...(hasSlots ? { authAccounts: withSlots.authAccounts } : { authAccounts: undefined }),
-                ...(activeAuthAccount ? { activeAuthAccount } : { activeAuthAccount: undefined }),
-              };
-              const env = environmentAccount
-                ? { CLODEX_OAUTH_ACCOUNT: environmentAccount }
-                : {};
-              const shown = resolveActiveAccount(provider, env);
+              for (const providerOverride of providerOverrideStates) {
+                cases++;
+                const provider: RegistryProvider = {
+                  ...base,
+                  enabled,
+                  authType,
+                  ...(hasSlots ? { authAccounts: withSlots.authAccounts } : { authAccounts: undefined }),
+                  ...(activeAuthAccount ? { activeAuthAccount } : { activeAuthAccount: undefined }),
+                };
+                const env: NodeJS.ProcessEnv = {
+                  ...(environmentAccount ? { CLODEX_OAUTH_ACCOUNT: environmentAccount } : {}),
+                  ...(providerOverride ? { CLODEX_KEY_OPENAI_OAUTH: `provider-override-${cases}` } : {}),
+                };
+                const shown = resolveActiveAccount(provider, env);
+                const selection = shown.kind === 'credential-override' ? shown.selection : shown;
 
-              if (authType === 'oauth' && enabled) {
-                expect(shown.inactiveReason, `active OAuth case ${cases}`).toBeUndefined();
-                try {
-                  const applied = applySelectedOAuthAccount(provider, environmentAccount);
-                  const selectedSlot = Object.entries(provider.authAccounts ?? {})
-                    .find(([, slot]) => slot.authRef === applied.authRef)?.[0];
-                  expect(shown.kind, `active OAuth case ${cases}`).toBe(selectedSlot ? 'slot' : 'default');
-                  if (shown.kind === 'slot') expect(shown.name).toBe(selectedSlot);
-                } catch {
-                  expect(shown.kind, `throwing OAuth case ${cases}`).toBe('broken');
+                if (authType === 'oauth' && enabled) {
+                  expect(shown.inactiveReason, `active OAuth case ${cases}`).toBeUndefined();
+                  try {
+                    const applied = applySelectedOAuthAccount(provider, environmentAccount);
+                    const selectedSlot = Object.entries(provider.authAccounts ?? {})
+                      .find(([, slot]) => slot.authRef === applied.authRef)?.[0];
+                    if (providerOverride && applied.authRef !== 'none:anonymous') {
+                      expect(shown.kind, `overridden OAuth case ${cases}`).toBe('credential-override');
+                    } else {
+                      expect(shown.kind, `active OAuth case ${cases}`).toBe(selectedSlot ? 'slot' : 'default');
+                    }
+                    expect(selection.kind, `selected OAuth case ${cases}`).toBe(selectedSlot ? 'slot' : 'default');
+                    if (selection.kind === 'slot') expect(selection.name).toBe(selectedSlot);
+                  } catch {
+                    expect(shown.kind, `throwing OAuth case ${cases}`).toBe('broken');
+                    if (providerOverride) expect(shown.credentialOverride).toBeDefined();
+                  }
+                  continue;
                 }
-                continue;
-              }
 
-              if (authType === 'oauth') {
-                expect(shown.inactiveReason, `disabled OAuth case ${cases}`).toBe('disabled');
-                const { inactiveReason: _ignored, ...projected } = shown;
-                expect(projected).toEqual(resolveActiveAccount({ ...provider, enabled: true }, env));
-                continue;
-              }
+                if (authType === 'oauth') {
+                  expect(shown.inactiveReason, `disabled OAuth case ${cases}`).toBe('disabled');
+                  let wouldThrow = false;
+                  try {
+                    applySelectedOAuthAccount({ ...provider, enabled: true }, environmentAccount);
+                  } catch {
+                    wouldThrow = true;
+                  }
+                  if (wouldThrow) {
+                    expect(shown.kind, `future broken OAuth case ${cases}`).toBe('broken');
+                  } else if (providerOverride) {
+                    expect(shown.kind, `future overridden OAuth case ${cases}`).toBe('credential-override');
+                  }
+                  expect(selection.inactiveReason).toBe('disabled');
+                  continue;
+                }
 
-              expect(shown.inactiveReason, `non-OAuth case ${cases}`).toBe('non-oauth');
-              expect(shown).toEqual(resolveActiveAccount(provider, {}));
-              if (shown.kind !== 'default') expect(shown.fromEnvironment).toBe(false);
+                expect(shown.inactiveReason, `non-OAuth case ${cases}`).toBe('non-oauth');
+                if (providerOverride && authType !== 'none') {
+                  expect(shown.kind, `overridden non-OAuth case ${cases}`).toBe('credential-override');
+                }
+                expect(selection.inactiveReason).toBe('non-oauth');
+                if (selection.kind !== 'default') expect(selection.fromEnvironment).toBe(false);
+              }
             }
           }
         }
       }
     }
 
-    expect(cases).toBe(144);
+    expect(cases).toBe(288);
   });
 });
 
@@ -557,6 +626,16 @@ describe('accountSwitchHint', () => {
       .toContain('currently uses alt');
     expect(accountSwitchHint({}, { kind: 'default' })).toContain('(provider default)');
   });
+
+  it('does not call an account credential active when the provider key wins', () => {
+    const hint = accountSwitchHint({ activeAuthAccount: 'work' }, {
+      kind: 'credential-override',
+      credentialOverride: { variable: 'CLODEX_KEY_OPENAI_OAUTH', fingerprint: 'a'.repeat(64) },
+      selection: { kind: 'slot', name: 'work', fromEnvironment: false },
+    });
+    expect(hint).toContain('CLODEX_KEY_OPENAI_OAUTH overrides account work');
+    expect(hint).toContain('no OAuth account credential is currently active');
+  });
 });
 
 describe('accountSwitchOutcome', () => {
@@ -579,6 +658,18 @@ describe('accountSwitchOutcome', () => {
     });
     expect(outcome.ok).toBe(true);
     expect(outcome.message).toContain('overrides it in this shell');
+  });
+
+  it('reports that the provider key shadows the saved account credential', () => {
+    const outcome = accountSwitchOutcome('OpenAI', 'work', {
+      kind: 'credential-override',
+      credentialOverride: { variable: 'CLODEX_KEY_OPENAI_OAUTH', fingerprint: 'b'.repeat(64) },
+      selection: { kind: 'slot', name: 'work', fromEnvironment: false },
+    });
+    expect(outcome.ok).toBe(true);
+    expect(outcome.message).toContain('CLODEX_KEY_OPENAI_OAUTH is the active provider credential override');
+    expect(outcome.message).toContain('no OAuth account credential is active');
+    expect(outcome.message).not.toContain('will launch as work');
   });
 
   it('confirms plainly when the saved choice is what will launch', () => {

@@ -23,8 +23,9 @@ import {
   cachedModelCount,
   isLikelyPlaceholderKey,
   refreshCredentialSnapshot,
-  resolveRefreshCredential,
+  resolveRefreshCredentialWithSource,
   skipWithCachedModels,
+  type RefreshCredentialResolver,
   type RefreshCredentialSnapshot,
 } from './refresh-credentials.js';
 import { OAUTH_ACCOUNT_ENV } from '../oauth-account-selection.js';
@@ -351,6 +352,9 @@ function assertRefreshCredentialStillCurrent(
   if (!isDeepStrictEqual(currentSnapshot.selectedAccount, snapshot.selectedAccount)) {
     throw new Error('Provider account credentials changed while models were refreshing.');
   }
+  if (!isDeepStrictEqual(currentSnapshot.credentialOverride, snapshot.credentialOverride)) {
+    throw new Error('Provider credential override changed while models were refreshing.');
+  }
 }
 
 export async function refreshProviderModels(
@@ -375,6 +379,26 @@ export async function refreshProviderModels(
         reason: err instanceof Error ? err.message : String(err),
       };
     }
+  }
+
+  if (credentialSnapshot?.credentialOverride) {
+    return skipWithCachedModels(
+      provider,
+      `${credentialSnapshot.credentialOverride.variable} is a process-scoped provider credential override — `
+      + 'skipped the persistent model refresh so another shell cannot inherit this credential\'s catalog.',
+    );
+  }
+  if (
+    provider.authType === 'oauth'
+    && credentialSnapshot?.environmentAccount
+    && credentialSnapshot.selectedAccount
+    && credentialSnapshot.environmentAccount !== credentialSnapshot.activeAuthAccount
+  ) {
+    return skipWithCachedModels(
+      provider,
+      `${OAUTH_ACCOUNT_ENV}=${credentialSnapshot.environmentAccount} temporarily selects a different account — `
+      + 'skipped the persistent model refresh so launches without that override cannot inherit its catalog.',
+    );
   }
 
   const source = resolveModelSource(provider);
@@ -525,7 +549,7 @@ export async function refreshProviderModels(
  */
 export async function refreshProviderModelsWithCredential(
   providerId: string,
-  resolveKey: (provider: RegistryProvider) => Promise<string | null>,
+  resolveKey: RefreshCredentialResolver,
   selected: string | null | undefined = process.env[OAUTH_ACCOUNT_ENV],
   options: { requireEnabled?: boolean } = {},
 ): Promise<RefreshProviderResult> {
@@ -545,13 +569,21 @@ export async function refreshProviderModelsWithCredential(
     }
     const accountOverride = selected === null ? null : selected ?? process.env[OAUTH_ACCOUNT_ENV] ?? null;
     const snapshot = refreshCredentialSnapshot(provider, accountOverride);
-    const key = await resolveRefreshCredential(provider, resolveKey, accountOverride);
-    return refreshProviderModels(provider.id, key, undefined, snapshot);
+    const resolved = await resolveRefreshCredentialWithSource(provider, resolveKey, accountOverride);
+    if (!isDeepStrictEqual(resolved.credentialOverride, snapshot.credentialOverride)) {
+      return {
+        id: provider.id,
+        name: provider.name,
+        ok: false,
+        reason: 'Provider credential override changed while models were refreshing.',
+      };
+    }
+    return refreshProviderModels(provider.id, resolved.credential, undefined, snapshot);
   });
 }
 
 export async function refreshAllProviderModels(
-  resolveKey: (provider: RegistryProvider) => Promise<string | null>,
+  resolveKey: RefreshCredentialResolver,
 ): Promise<RefreshModelsResult> {
   const refreshed: RefreshProviderResult[] = [];
   const registry = loadRegistryStrict();

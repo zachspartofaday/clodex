@@ -19,10 +19,12 @@ describe('provider-catalog-display', () => {
   let home: string;
   const prevHome = process.env.CLODEX_HOME;
   const prevHelper = process.env.CLODEX_CREDENTIAL_HELPER;
+  const prevProviderOverride = process.env.CLODEX_KEY_OPENAI_OAUTH;
 
   beforeEach(() => {
     home = mkdtempSync(join(tmpdir(), 'clodex-display-'));
     process.env.CLODEX_HOME = home;
+    delete process.env.CLODEX_KEY_OPENAI_OAUTH;
   });
 
   afterEach(() => {
@@ -30,6 +32,8 @@ describe('provider-catalog-display', () => {
     else process.env.CLODEX_HOME = prevHome;
     if (prevHelper === undefined) delete process.env.CLODEX_CREDENTIAL_HELPER;
     else process.env.CLODEX_CREDENTIAL_HELPER = prevHelper;
+    if (prevProviderOverride === undefined) delete process.env.CLODEX_KEY_OPENAI_OAUTH;
+    else process.env.CLODEX_KEY_OPENAI_OAUTH = prevProviderOverride;
     rmSync(home, { recursive: true, force: true });
     vi.restoreAllMocks();
   });
@@ -234,6 +238,30 @@ describe('provider-catalog-display', () => {
       } finally {
         delete process.env['CLODEX_OAUTH_ACCOUNT'];
       }
+    });
+
+    it('reports the provider key as active without marking a slot active', async () => {
+      saveSlotted('zachspartofaday');
+      process.env.CLODEX_KEY_OPENAI_OAUTH = 'provider-override-token';
+
+      const label = (await resolveProvidersForDisplay())[0]?.authLabel ?? '';
+
+      expect(label).toContain('CLODEX_KEY_OPENAI_OAUTH (active provider override');
+      expect(label).toContain('zachspartofaday (selected; credential overridden by CLODEX_KEY_OPENAI_OAUTH)');
+      expect(label).not.toContain('zachspartofaday (active)');
+      expect(label.match(/\(active\)/g)).toBeNull();
+      expect(label).not.toContain('provider-override-token');
+    });
+
+    it('keeps a broken OAuth selection ahead of the configured provider key', async () => {
+      saveSlotted('ghost');
+      process.env.CLODEX_KEY_OPENAI_OAUTH = 'provider-override-token';
+
+      const label = (await resolveProvidersForDisplay())[0]?.authLabel ?? '';
+
+      expect(label).toContain('CLODEX_KEY_OPENAI_OAUTH is configured but blocked');
+      expect(label).toContain('ghost (selected, MISSING — every launch fails)');
+      expect(label).not.toContain('active provider override');
     });
 
     it('reports an environment override that names no existing slot as broken', async () => {

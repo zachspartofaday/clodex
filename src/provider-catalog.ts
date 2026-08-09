@@ -1,4 +1,8 @@
-import { resolveProviderCredential } from './env.js';
+import {
+  resolveProviderCredential,
+  resolveProviderCredentialOverrideState,
+  type ProviderCredentialOverrideState,
+} from './env.js';
 import type { CompatibilityAgent } from './model-compatibility.js';
 import { oauthAuthRef } from './registry/import-build.js';
 import { loadRegistry } from './registry/io.js';
@@ -97,13 +101,28 @@ export const PROVIDER_DEFAULT_ACCOUNT_LABEL = '(provider default)';
  * promises a launch that will not happen — which is how the detail hint came
  * to claim a missing account was in use.
  */
-export type ActiveAccount =
+export type AccountSelection =
   /** Launches on the provider's own credential. */
-  | { kind: 'default'; latentOrphan?: string; inactiveReason?: AccountSelectionInactiveReason }
+  | { kind: 'default'; latentOrphan?: string; inactiveReason?: AccountSelectionInactiveReason; credentialOverride?: ProviderCredentialOverrideState }
   /** Launches on this named slot. */
-  | { kind: 'slot'; name: string; fromEnvironment: boolean; latentOrphan?: string; inactiveReason?: AccountSelectionInactiveReason }
+  | { kind: 'slot'; name: string; fromEnvironment: boolean; latentOrphan?: string; inactiveReason?: AccountSelectionInactiveReason; credentialOverride?: ProviderCredentialOverrideState }
   /** Cannot be honoured: this selector names no such slot. */
-  | { kind: 'broken'; name: string; fromEnvironment: boolean; latentOrphan?: string; inactiveReason?: AccountSelectionInactiveReason };
+  | { kind: 'broken'; name: string; fromEnvironment: boolean; latentOrphan?: string; inactiveReason?: AccountSelectionInactiveReason; credentialOverride?: ProviderCredentialOverrideState };
+
+export type ActiveAccount =
+  | AccountSelection
+  /**
+   * The provider-scoped key is the credential a launch will actually use.
+   * `selection` remains explicit because saved/orphaned/dormant OAuth state is
+   * still operationally important even though no account credential is live.
+   */
+  | {
+      kind: 'credential-override';
+      credentialOverride: ProviderCredentialOverrideState;
+      selection: AccountSelection;
+      latentOrphan?: string;
+      inactiveReason?: AccountSelectionInactiveReason;
+    };
 
 export type AccountSelectionInactiveReason = 'disabled' | 'non-oauth';
 
@@ -129,7 +148,7 @@ export type AccountSelectionInactiveReason = 'disabled' | 'non-oauth';
 export function resolveActiveAccount(
   provider: Pick<
     import('./registry/types.js').RegistryProvider,
-    'authAccounts' | 'activeAuthAccount' | 'authType' | 'enabled'
+    'id' | 'authRef' | 'authAccounts' | 'activeAuthAccount' | 'authType' | 'enabled'
   >,
   env: NodeJS.ProcessEnv = process.env,
 ): ActiveAccount {
@@ -138,7 +157,7 @@ export function resolveActiveAccount(
   const stored = provider.activeAuthAccount?.trim();
   const override = env[OAUTH_ACCOUNT_ENV]?.trim();
 
-  const projectOAuthSelection = (environmentSelection: string | undefined): ActiveAccount => {
+  const projectOAuthSelection = (environmentSelection: string | undefined): AccountSelection => {
     // Carried on whatever answer wins below: a stored selection that names no
     // slot is still broken while an override happens to be masking it. Only
     // carry a DIFFERENT stored name, or one failure is rendered twice.
@@ -175,14 +194,34 @@ export function resolveActiveAccount(
 
   // Non-OAuth providers never apply this selector, even when enabled. Ignore
   // the process-wide OAuth override and expose only stale/saved registry state.
-  if (provider.authType !== 'oauth') {
-    return { ...projectOAuthSelection(undefined), inactiveReason: 'non-oauth' };
+  const selected = provider.authType !== 'oauth'
+    ? { ...projectOAuthSelection(undefined), inactiveReason: 'non-oauth' as const }
+    : provider.enabled
+      ? projectOAuthSelection(override)
+      : { ...projectOAuthSelection(override), inactiveReason: 'disabled' as const };
+
+  // A missing OAuth slot fails in applySelectedOAuthAccount before credential
+  // resolution. Preserve the redaction-safe override evidence, but never call
+  // it effective or imply that it can rescue the broken selection.
+  const effectiveAuthRef = provider.authType === 'oauth' && selected.kind === 'slot'
+    ? slots[selected.name]?.authRef
+    : provider.authRef;
+  const credentialOverride = provider.authType !== 'none'
+    && effectiveAuthRef !== 'none:anonymous'
+    ? resolveProviderCredentialOverrideState(provider.id, env)
+    : null;
+  if (!credentialOverride) return selected;
+  if (provider.authType === 'oauth' && selected.kind === 'broken') {
+    return { ...selected, credentialOverride };
   }
 
-  const projected = projectOAuthSelection(override);
-  return provider.enabled
-    ? projected
-    : { ...projected, inactiveReason: 'disabled' };
+  return {
+    kind: 'credential-override',
+    credentialOverride,
+    selection: selected,
+    ...(selected.latentOrphan ? { latentOrphan: selected.latentOrphan } : {}),
+    ...(selected.inactiveReason ? { inactiveReason: selected.inactiveReason } : {}),
+  };
 }
 
 export async function resolveProvidersForDisplay(): Promise<ProviderDisplayEntry[]> {
@@ -205,38 +244,54 @@ export async function resolveProvidersForDisplay(): Promise<ProviderDisplayEntry
     // misreport the live identity in exactly the persistent shell this feature
     // is meant to make visible.
     const effective = resolveActiveAccount(provider);
+    const selection = effective.kind === 'credential-override'
+      ? effective.selection
+      : effective;
+    const credentialOverride = effective.credentialOverride;
+    const credentialOverrideWins = effective.kind === 'credential-override';
     // `(active)` is a claim about what a launch will do now. Disabled OAuth
     // providers expose a projected selection instead; non-OAuth providers say
     // explicitly that the stale OAuth state is inactive.
-    const active = effective.kind === 'slot' && !effective.inactiveReason
-      ? effective.name
+    const active = !credentialOverrideWins && selection.kind === 'slot' && !selection.inactiveReason
+      ? selection.name
       : undefined;
-    const projected = effective.kind === 'slot' && effective.inactiveReason === 'disabled'
-      ? effective.name
+    const projected = !credentialOverrideWins
+      && selection.kind === 'slot'
+      && selection.inactiveReason === 'disabled'
+      ? selection.name
       : undefined;
-    const storedButInapplicable = effective.kind === 'slot' && effective.inactiveReason === 'non-oauth'
-      ? effective.name
+    const storedButInapplicable = selection.kind === 'slot' && selection.inactiveReason === 'non-oauth'
+      ? selection.name
       : undefined;
-    const overrideApplies = effective.kind !== 'default' && effective.fromEnvironment;
+    const accountOverrideApplies = selection.kind !== 'default' && selection.fromEnvironment;
     // A broken selection is the reason every launch for this provider fails,
     // so it is the LAST thing the listing should hide — and it is read from the
     // shared resolver rather than re-derived here, which is how the detail hint
     // drifted out of step in the first place.
-    const broken = effective.kind === 'broken' ? effective : undefined;
+    const broken = selection.kind === 'broken' ? selection : undefined;
     // Masked, not fixed. An override hides a broken stored selection only while
     // the variable is set; the listing has to say so, or it reads as healthy
     // right up until someone opens a shell without it.
     // Reported on a broken override too: the stored selection behind it is a
     // second, independent failure that survives fixing the variable.
-    const latent = effective.latentOrphan;
+    const latent = selection.latentOrphan;
     const label = (name: string): string => {
       if (name === active) {
-        return overrideApplies
+        return accountOverrideApplies
           ? `${name} (active, from ${OAUTH_ACCOUNT_ENV})`
           : `${name} (active)`;
       }
+      if (credentialOverrideWins && selection.kind === 'slot' && name === selection.name) {
+        if (selection.inactiveReason === 'non-oauth') {
+          return `${name} (stored; provider is not OAuth)`;
+        }
+        const selectedFrom = accountOverrideApplies ? `, from ${OAUTH_ACCOUNT_ENV}` : '';
+        return selection.inactiveReason === 'disabled'
+          ? `${name} (selected${selectedFrom}; provider disabled; ${credentialOverride!.variable} will override its credential if enabled)`
+          : `${name} (selected${selectedFrom}; credential overridden by ${credentialOverride!.variable})`;
+      }
       if (name === projected) {
-        return overrideApplies
+        return accountOverrideApplies
           ? `${name} (selected, from ${OAUTH_ACCOUNT_ENV}; provider disabled)`
           : `${name} (selected; provider disabled)`;
       }
@@ -245,16 +300,22 @@ export async function resolveProvidersForDisplay(): Promise<ProviderDisplayEntry
       }
       return name;
     };
-    const defaultLabel = effective.kind !== 'default'
+    const defaultLabel = selection.kind !== 'default'
       ? PROVIDER_DEFAULT_ACCOUNT_LABEL
-      : effective.inactiveReason === 'disabled'
-        ? `${PROVIDER_DEFAULT_ACCOUNT_LABEL} (selected; provider disabled)`
-        : effective.inactiveReason === 'non-oauth'
-          ? `${PROVIDER_DEFAULT_ACCOUNT_LABEL} (OAuth selection inactive; provider is not OAuth)`
-          : `${PROVIDER_DEFAULT_ACCOUNT_LABEL} (active)`;
-    const brokenConsequence = effective.inactiveReason === 'disabled'
+      : credentialOverrideWins
+        ? selection.inactiveReason === 'disabled'
+          ? `${PROVIDER_DEFAULT_ACCOUNT_LABEL} (selected; provider disabled; ${credentialOverride!.variable} will override its credential if enabled)`
+          : selection.inactiveReason === 'non-oauth'
+            ? `${PROVIDER_DEFAULT_ACCOUNT_LABEL} (OAuth selection inactive; provider is not OAuth)`
+            : `${PROVIDER_DEFAULT_ACCOUNT_LABEL} (selected; credential overridden by ${credentialOverride!.variable})`
+        : selection.inactiveReason === 'disabled'
+          ? `${PROVIDER_DEFAULT_ACCOUNT_LABEL} (selected; provider disabled)`
+          : selection.inactiveReason === 'non-oauth'
+            ? `${PROVIDER_DEFAULT_ACCOUNT_LABEL} (OAuth selection inactive; provider is not OAuth)`
+            : `${PROVIDER_DEFAULT_ACCOUNT_LABEL} (active)`;
+    const brokenConsequence = selection.inactiveReason === 'disabled'
       ? 'will fail if this provider is enabled'
-      : effective.inactiveReason === 'non-oauth'
+      : selection.inactiveReason === 'non-oauth'
         ? 'ignored because this provider is not OAuth'
         : 'every launch fails';
     const accountList = [
@@ -264,17 +325,25 @@ export async function resolveProvidersForDisplay(): Promise<ProviderDisplayEntry
       // OAuth outcome. A disabled provider is excluded from materialization;
       // a non-OAuth provider may launch, but never applies these selectors.
       ...(broken
-        ? [`${broken.name} (${effective.inactiveReason === 'non-oauth' ? 'stored' : 'selected'}${broken.fromEnvironment ? ` via ${OAUTH_ACCOUNT_ENV}` : ''}, MISSING — `
+        ? [`${broken.name} (${selection.inactiveReason === 'non-oauth' ? 'stored' : 'selected'}${broken.fromEnvironment ? ` via ${OAUTH_ACCOUNT_ENV}` : ''}, MISSING — `
           + `${brokenConsequence})`]
         : []),
       ...(latent
         ? [`${latent} (stored, MISSING — masked by ${OAUTH_ACCOUNT_ENV}; `
-          + `${effective.inactiveReason === 'disabled' ? 'will fail if enabled without it' : 'launches fail without it'})`]
+          + `${selection.inactiveReason === 'disabled' ? 'will fail if enabled without it' : 'launches fail without it'})`]
         : []),
     ].join(', ');
+    const storedAuthLabel = formatRegistryAuthLabel(provider);
+    const effectiveAuthLabel = !credentialOverride
+      ? storedAuthLabel
+      : credentialOverrideWins
+        ? provider.enabled
+          ? `${credentialOverride.variable} (active provider override; stored auth: ${storedAuthLabel})`
+          : `${credentialOverride.variable} (configured provider override; provider disabled; stored auth: ${storedAuthLabel})`
+        : `${storedAuthLabel}; ${credentialOverride.variable} is configured but blocked by the invalid OAuth account selection`;
     const authLabel = accountNames.length || broken || latent
-      ? `${formatRegistryAuthLabel(provider)}; accounts: ${accountList}`
-      : formatRegistryAuthLabel(provider);
+      ? `${effectiveAuthLabel}; accounts: ${accountList}`
+      : effectiveAuthLabel;
     entries.push({
       id: provider.id,
       name: provider.name,

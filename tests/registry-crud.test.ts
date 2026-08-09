@@ -371,14 +371,34 @@ describe('setActiveOAuthAccount', () => {
   });
 
   it('persists the chosen account', () => {
+    registryState.current.providers[0]!.modelsCache = {
+      fetchedAt: '2026-08-09T00:00:00.000Z',
+      models: [{
+        id: 'default-only-model',
+        name: 'Default-only model',
+        upstreamModelId: 'default-only-model',
+        modelFormat: 'openai',
+      }],
+    };
     const result = setActiveOAuthAccount('openai-oauth', 'zachspartofaday');
     expect(result).toMatchObject({ updated: true, changed: true, account: 'zachspartofaday' });
     expect(result.provider?.activeAuthAccount).toBe('zachspartofaday');
+    expect(result.provider?.modelsCache).toBeUndefined();
     expect(registryState.current.providers[0]?.activeAuthAccount).toBe('zachspartofaday');
+    expect(registryState.current.providers[0]?.modelsCache).toBeUndefined();
   });
 
   it('reports an unchanged selection as a no-op', () => {
     registryState.current.providers[0]!.activeAuthAccount = 'zachspartofaday';
+    registryState.current.providers[0]!.modelsCache = {
+      fetchedAt: '2026-08-09T00:00:00.000Z',
+      models: [{
+        id: 'still-current-model',
+        name: 'Still current model',
+        upstreamModelId: 'still-current-model',
+        modelFormat: 'openai',
+      }],
+    };
 
     const result = setActiveOAuthAccount('openai-oauth', 'zachspartofaday');
 
@@ -388,6 +408,8 @@ describe('setActiveOAuthAccount', () => {
       account: 'zachspartofaday',
     });
     expect(result.provider?.activeAuthAccount).toBe('zachspartofaday');
+    expect(result.provider?.modelsCache?.models[0]?.id).toBe('still-current-model');
+    expect(registryState.current.providers[0]?.modelsCache?.models[0]?.id).toBe('still-current-model');
   });
 
   it('clears the field rather than storing a sentinel when returning to the default', () => {

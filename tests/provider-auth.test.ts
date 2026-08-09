@@ -276,6 +276,27 @@ describe('authenticateProvider', () => {
     expect(stop).not.toHaveBeenCalledWith('Models refreshed');
   });
 
+  it('reports a transient-credential refresh skip instead of claiming success', async () => {
+    const stop = vi.fn();
+    vi.mocked(prompts.spinner)
+      .mockReturnValueOnce({ start: vi.fn(), stop: vi.fn() })
+      .mockReturnValueOnce({ start: vi.fn(), stop });
+    vi.mocked(refreshProviderModels).mockResolvedValueOnce({
+      id: 'openai-oauth',
+      name: 'OpenAI',
+      ok: true,
+      skipped: true,
+      reason: 'CLODEX_KEY_OPENAI_OAUTH is a process-scoped provider credential override.',
+    });
+
+    await authenticateProvider('openai');
+
+    expect(stop).toHaveBeenCalledWith(
+      'Models not refreshed — CLODEX_KEY_OPENAI_OAUTH is a process-scoped provider credential override.',
+    );
+    expect(stop).not.toHaveBeenCalledWith('Models refreshed');
+  });
+
   it('rejects a named account before the default sign-in exists', async () => {
     await expect(authenticateProvider('openai', { account: 'work' }))
       .rejects.toThrow(/default sign-in first/);

@@ -1,4 +1,5 @@
 import { describe, it, expect } from 'vitest';
+import { createHash } from 'node:crypto';
 import {
   isLikelyPlaceholderKey,
   isPlaceholderProviderKey,
@@ -45,6 +46,41 @@ describe('isPlaceholderProviderKey', () => {
 });
 
 describe('resolveRefreshCredential', () => {
+  it('captures only redaction-safe provider override provenance in the snapshot', () => {
+    const previous = process.env.CLODEX_KEY_OPENAI;
+    const credential = 'snapshot-provider-override-secret';
+    process.env.CLODEX_KEY_OPENAI = credential;
+    try {
+      const snapshot = refreshCredentialSnapshot(makeProvider(), null);
+      expect(snapshot.credentialOverride).toEqual({
+        variable: 'CLODEX_KEY_OPENAI',
+        fingerprint: createHash('sha256').update(credential).digest('hex'),
+      });
+      expect(JSON.stringify(snapshot)).not.toContain(credential);
+    } finally {
+      if (previous === undefined) delete process.env.CLODEX_KEY_OPENAI;
+      else process.env.CLODEX_KEY_OPENAI = previous;
+    }
+  });
+
+  it('does not capture or resolve an override when either no-auth marker is authoritative', async () => {
+    const previous = process.env.CLODEX_KEY_OPENAI;
+    process.env.CLODEX_KEY_OPENAI = 'stale-provider-override';
+    try {
+      for (const provider of [
+        makeProvider({ authRef: 'none:anonymous' }),
+        makeProvider({ authType: 'none' }),
+      ]) {
+        expect(refreshCredentialSnapshot(provider, null).credentialOverride).toBeUndefined();
+        const resolveKey = async () => 'must-not-resolve';
+        await expect(resolveRefreshCredential(provider, resolveKey, null)).resolves.toBeNull();
+      }
+    } finally {
+      if (previous === undefined) delete process.env.CLODEX_KEY_OPENAI;
+      else process.env.CLODEX_KEY_OPENAI = previous;
+    }
+  });
+
   it('returns the resolved key when it looks real', async () => {
     const key = await resolveRefreshCredential(makeProvider(), async () => 'sk-real-key-123456');
     expect(key).toBe('sk-real-key-123456');

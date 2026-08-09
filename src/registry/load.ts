@@ -1,6 +1,10 @@
 // src/registry/load.ts — materialize registry into runtime LocalProvider[]
 
-import { resolveProviderCredential, resolveProviderOAuthAccountId, resolveProviderOAuthProviderData } from '../env.js';
+import {
+  resolveProviderCredentialWithSource,
+  resolveProviderOAuthAccountId,
+  resolveProviderOAuthProviderData,
+} from '../env.js';
 import type { CompatibilityAgent } from '../model-compatibility.js';
 import type { LocalProvider } from '../types.js';
 import { applySelectedOAuthAccount, isAnonymousProvider, materializeRegistry } from './materialize.js';
@@ -18,14 +22,22 @@ export async function loadRegistryProviders(
   const oauthAccountIds = new Map<string, string>();
   const oauthProviderData = new Map<string, Record<string, unknown>>();
   await Promise.all(providers.map(async provider => {
-    if (isAnonymousProvider(provider)) return;
+    if (
+      isAnonymousProvider(provider)
+      || provider.authType === 'none'
+      || provider.authRef === 'none:anonymous'
+    ) return;
+    let credentialOverride = false;
+    let credentialAvailable = false;
     try {
-      const key = await resolveProviderCredential(provider.id, provider.authRef, diag);
-      if (key) keys.set(provider.id, key);
+      const resolved = await resolveProviderCredentialWithSource(provider.id, provider.authRef, diag);
+      credentialOverride = resolved.credentialOverride !== undefined;
+      credentialAvailable = Boolean(resolved.credential);
+      if (resolved.credential) keys.set(provider.id, resolved.credential);
     } catch (err) {
       diag?.(`${provider.id}: credential unavailable — ${err instanceof Error ? err.message : String(err)}`);
     }
-    if (provider.authType === 'oauth') {
+    if (provider.authType === 'oauth' && credentialAvailable && !credentialOverride) {
       try {
         const accountId = await resolveProviderOAuthAccountId(provider.authRef, diag);
         if (accountId) oauthAccountIds.set(provider.id, accountId);
