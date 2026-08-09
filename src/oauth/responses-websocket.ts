@@ -1312,9 +1312,17 @@ function failContext(
   diagnosticDetails: Record<string, unknown>,
   statusCode?: number,
   retryAfterSeconds?: number,
+  /**
+   * What to write to the persistent debug log, when that must differ from what
+   * the client is told. `message` reaches the operator's screen and can carry
+   * upstream prose worth reading; the log is a file users attach to bug
+   * reports, and `redactTraceLine` only strips known credential shapes.
+   * Defaults to `message`.
+   */
+  logMessage: string = message,
 ): void {
   if (ctx.closed || entry.current !== ctx) return;
-  entry.debug(`fail: ${message}`);
+  entry.debug(`fail: ${logMessage}`);
   emitResponseErrorDiagnostic(entry, ctx, {
     ...diagnosticDetails,
     ...diagnosticTextFingerprint('errorMessage', message),
@@ -1694,24 +1702,48 @@ function handleSocketMessage(entry: ConnectionEntry, data: RawData): void {
     // time a session goes silent, without dumping upstream text.
     const named = [details.errorType, details.errorCode, details.incompleteReason]
       .filter((value): value is string => typeof value === 'string');
-    const reason = responseErrorMessage(event)
-      ?? `OpenAI ended the response with no output`
-        + (named.length ? ` (${named.join(' / ')})` : ` (${type})`);
+    const summary = 'OpenAI ended the response with no output'
+      + (named.length ? ` (${named.join(' / ')})` : ` (${type})`);
     // A usage limit is a real 429 however upstream chose to spell it. Mapping it
     // to 502 instead would present an exhausted account as a server fault and
     // spend the client's whole retry budget re-asking a question already answered.
     const usageLimited = named.some(value => value.includes('usage_limit'));
+    // Deterministic outcomes must not be retryable. `frameIsRetryable` treats
+    // every status >= 500 as transient, so a blanket 502 would make the SDK
+    // repeat a request upstream has already settled — a filtered completion, a
+    // hit output cap, a malformed request — burning the retry budget and then
+    // reporting a server fault for something that was never one.
+    const deterministic = named.some(value =>
+      value === 'max_output_tokens'
+      || value === 'content_filter'
+      || value === 'invalid_request_error'
+      || value === 'invalid_prompt');
+    const statusCode = usageLimited ? 429 : deterministic ? 400 : 502;
+    // Only when upstream stated one, and only baked into the TEXT: the AI SDK's
+    // chunk schema is a closed zod object that strips `retry_after_seconds`, so
+    // a hint carried only in the frame field never reaches the client. This is
+    // the same reason the status-carrying branch above spells it out.
+    const retryAfterSeconds = usageLimited && responseRetryAfterSeconds(event) !== undefined
+      ? clampRetryAfterSeconds(responseRetryAfterSeconds(event))
+      : undefined;
+    const reason = responseErrorMessage(event) ?? summary;
     failContext(
       entry,
       ctx,
-      reason,
+      retryAfterSeconds === undefined ? reason : `${reason}; retry after ${retryAfterSeconds}s`,
       {
         source: 'empty_failure_terminal',
         upstreamEventType: type,
         ...details,
       },
-      usageLimited ? 429 : 502,
-      usageLimited ? clampRetryAfterSeconds(responseRetryAfterSeconds(event)) : undefined,
+      statusCode,
+      retryAfterSeconds,
+      // Logged INSTEAD of the reason. A `response.failed` body can echo request
+      // content or backend detail, and `redactTraceLine` only removes known
+      // credential shapes — so the raw text would survive on disk in a file
+      // users attach to bug reports. The bounded summary names the cause; the
+      // raw message is still recorded as a length+hash in the diagnostic.
+      summary,
     );
     return;
   }

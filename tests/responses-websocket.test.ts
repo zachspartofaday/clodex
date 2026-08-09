@@ -1199,23 +1199,88 @@ describe('createResponsesWebSocketFetch', () => {
   // used to be forwarded verbatim with nothing emitted, so the client received a
   // successful, EMPTY 200 and rendered a turn where the model said nothing —
   // indistinguishable from deliberate silence, and the reason never surfaced.
-  it.each([
-    ['response.failed', {
-      type: 'response.failed',
-      response: { id: 'resp_x', status: 'failed', error: { type: 'server_error', message: 'why it died' } },
-    }],
-    ['response.incomplete', {
-      type: 'response.incomplete',
-      response: { id: 'resp_x', status: 'incomplete', incomplete_details: { reason: 'content_filter' } },
-    }],
-  ])('fails a %s terminal that emitted nothing instead of ending the stream empty', async (_label, frame) => {
+  async function failWith(frame: unknown): Promise<string> {
     const wsFetch = createResponsesWebSocketFetch(WS_URL);
     const res = await wsFetch('https://x', { method: 'POST', headers: {}, body: '{}' });
     const socket = lastSocket();
     socket.emit('open');
     socket.emit('message', Buffer.from(JSON.stringify(frame)));
+    return readAll(res);
+  }
 
-    expect(await classifyThroughSdk(await readAll(res))).toMatchObject({ statusCode: 502 });
+  it('fails an indeterminate output-less terminal as a retryable server fault', async () => {
+    const body = await failWith({
+      type: 'response.failed',
+      response: { id: 'resp_x', status: 'failed', error: { type: 'server_error', message: 'why it died' } },
+    });
+    expect(await classifyThroughSdk(body)).toMatchObject({ statusCode: 502, isRetryable: true });
+  });
+
+  // Deterministic outcomes must NOT be retryable. frameIsRetryable treats every
+  // status >= 500 as transient, so a blanket 502 would make the SDK repeat a
+  // request upstream has already settled and then report a server fault for
+  // something that was never one.
+  it.each([
+    ['content_filter', { type: 'response.incomplete', response: { id: 'r', status: 'incomplete', incomplete_details: { reason: 'content_filter' } } }],
+    ['max_output_tokens', { type: 'response.incomplete', response: { id: 'r', status: 'incomplete', incomplete_details: { reason: 'max_output_tokens' } } }],
+    ['invalid_request_error', { type: 'response.failed', response: { id: 'r', status: 'failed', error: { type: 'invalid_request_error', message: 'bad' } } }],
+  ])('does not make a deterministic %s outcome retryable', async (_label, frame) => {
+    const verdict = await classifyThroughSdk(await failWith(frame));
+    expect(verdict).toMatchObject({ statusCode: 400 });
+    expect(verdict?.isRetryable).toBe(false);
+  });
+
+  it('carries an output-less usage-limit backoff in the message text', async () => {
+    // The AI SDK's chunk schema is a closed zod object that strips
+    // `retry_after_seconds`, so a hint carried only in the frame field never
+    // reaches the client — it has to be baked into the prose.
+    const body = await failWith({
+      type: 'response.failed',
+      response: {
+        id: 'r',
+        status: 'failed',
+        error: { type: 'usage_limit_reached', message: 'weekly limit reached', retry_after_seconds: 1800 },
+      },
+    });
+    // Clamped to MAX_RETRY_AFTER_SECONDS: a hint of hours must not park the
+    // client past the 120s no-event stream abort.
+    expect(body).toContain('retry after 60s');
+    expect(await classifyThroughSdk(body)).toMatchObject({ statusCode: 429, retryAfterSeconds: 60 });
+  });
+
+  it('asserts no backoff upstream never stated', async () => {
+    const body = await failWith({
+      type: 'response.failed',
+      response: { id: 'r', status: 'failed', error: { type: 'usage_limit_reached', message: 'limit' } },
+    });
+    expect(body).not.toContain('retry after');
+    expect(await classifyThroughSdk(body)).toMatchObject({ statusCode: 429 });
+  });
+
+  it('keeps an upstream failure message out of the debug log', async () => {
+    // A response.failed body can echo request content, and redactTraceLine only
+    // strips known credential shapes — so the raw text would survive on disk in
+    // a file users attach to bug reports. The client still sees it.
+    const logged: string[] = [];
+    const wsFetch = createResponsesWebSocketFetch(WS_URL, line => logged.push(line));
+    const res = await wsFetch('https://x', { method: 'POST', headers: {}, body: '{}' });
+    const socket = lastSocket();
+    socket.emit('open');
+    socket.emit('message', Buffer.from(JSON.stringify({
+      type: 'response.failed',
+      response: {
+        id: 'r',
+        status: 'failed',
+        error: { type: 'server_error', message: 'SECRET-ECHOED-PROMPT-CONTENT' },
+      },
+    })));
+    const body = await readAll(res);
+
+    expect(body).toContain('SECRET-ECHOED-PROMPT-CONTENT');
+    const failLines = logged.filter(line => line.includes('fail:'));
+    expect(failLines.length).toBeGreaterThan(0);
+    expect(failLines.join('\n')).not.toContain('SECRET-ECHOED-PROMPT-CONTENT');
+    expect(failLines.join('\n')).toContain('server_error');
   });
 
   it('maps an output-less usage limit to 429 rather than a server fault', async () => {
