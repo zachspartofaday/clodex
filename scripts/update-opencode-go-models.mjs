@@ -59,13 +59,19 @@ const TRANSPORTS = {
 // endpoint. It travels with the transport map rather than being read from the
 // feed, so a hostile or wrong feed cannot change what clodex puts on the wire.
 //
-// models.dev DOES publish a per-model `reasoning_options` (an effort ladder, a
-// bare toggle, or nothing), and it is the closest thing to an authority on
-// what OpenCode's GATEWAY accepts — which is not the same set the upstream
-// vendor documents for its own endpoint. Treat it as the cross-check these
-// entries are validated against, never as their source: `assertEffortLadders`
-// below fails this updater if a map would send an effort value the feed does
-// not publish, and reports the safe direction rather than failing on it.
+// models.dev publishes a per-model `reasoning_options` (an effort ladder, a
+// bare toggle, or nothing). It is NOT a statement of what OpenCode's gateway
+// accepts: models.dev is a community-maintained catalog of model
+// specifications — open TOML in GitHub, created by OpenCode but independent of
+// it — and its own docs describe model metadata, not provider API contracts.
+//
+// So it is a third opinion, alongside the upstream vendor's documentation, and
+// neither is authoritative here. Only a live call to the gateway is, which is
+// what "validated against the live endpoint" above means and what these values
+// are supposed to be. `reportEffortLadderDivergence` below prints where the
+// two disagree so a divergence prompts someone to go and test that model — it
+// deliberately does NOT fail the update, because failing on a community
+// catalog would block a ladder that had been live-validated.
 const PATCHES = {
   'deepseek-v4-flash': {
     reasoningEffortMap: { minimal: null, low: null, medium: null, high: 'high', max: 'max' },
@@ -93,12 +99,15 @@ const PATCHES = {
     maxTokensField: 'max_tokens',
   },
   'glm-5.2': {
-    // Z.ai's own API documents the full ladder ("max, xhigh, high, medium,
-    // low, minimal, none"), but that describes Z.ai's endpoint, not OpenCode's
-    // gateway in front of it: models.dev — the feed OpenCode itself routes
-    // from — publishes effort=high/max for this model. The gateway is what we
-    // actually talk to, so its narrower set wins until the wider one is
-    // validated live.
+    // UNVERIFIED, kept narrow deliberately. Z.ai's own API documents the full
+    // ladder ("max, xhigh, high, medium, low, minimal, none"); models.dev
+    // lists high/max. Neither settles it — Z.ai describes its own endpoint,
+    // not OpenCode's gateway in front of it, and models.dev is a community
+    // catalog rather than a statement of what that gateway accepts.
+    //
+    // Narrow is the safe side of an unverified guess: sending fewer levels
+    // than the gateway accepts hides capability, while sending one it rejects
+    // fails the request. Widen only after a live call confirms it.
     reasoningEffortMap: { off: null, minimal: null, low: null, medium: null, high: 'high', xhigh: null, max: 'max' },
     supportsStore: false,
     supportsDeveloperRole: false,
@@ -141,9 +150,10 @@ const PATCHES = {
     maxTokensField: 'max_tokens',
   },
   'kimi-k3': {
-    // Moonshot's own API documents low/high/max (default max), but models.dev
-    // publishes effort=max for OpenCode's deployment. Same reasoning as
-    // glm-5.2: the gateway's set is the one that reaches the wire.
+    // UNVERIFIED, kept narrow for the same reason as glm-5.2. Moonshot's own
+    // API documents low/high/max (default max); models.dev lists max. Neither
+    // describes what OpenCode's gateway accepts, so the safe side wins until a
+    // live call says otherwise.
     reasoningEffortMap: { off: null, minimal: null, low: null, medium: null, high: null, xhigh: null, max: 'max' },
     supportsStore: false,
     supportsDeveloperRole: false,
@@ -213,22 +223,20 @@ const PATCHES = {
 };
 
 /**
- * Cross-check every local effort map against what the feed publishes.
+ * Report where the local effort maps and models.dev disagree.
  *
- * The invariant is a SUBSET, not equality, and the asymmetry is the point.
- * Sending a value the gateway does not publish risks a rejected request, so it
- * fails the update. Sending fewer than it publishes is merely conservative —
- * `deepseek-v4-flash` omits a `low` the feed lists — so that is reported and
- * left to a human, because widening a ladder is exactly the change that wants
- * live validation rather than a script's confidence.
+ * ADVISORY ONLY — it never fails the update. models.dev is a community
+ * catalog of model specifications, not a description of what OpenCode's
+ * gateway accepts, so a disagreement means "go test that model against the
+ * live endpoint", not "this entry is wrong". Failing here would block a ladder
+ * somebody had validated live, which is the one source that does settle it.
  *
- * This exists because the vendor's own API and OpenCode's gateway disagree:
- * Z.ai documents seven effort levels for GLM-5.2 and Moonshot documents three
- * for K3, while the feed publishes `high/max` and `max`. Two entries were
- * briefly widened to the vendor ladders before that was understood.
+ * Both directions are worth printing. Sending a value the catalog does not
+ * list may mean the catalog is incomplete, or may mean the gateway will reject
+ * it. Sending fewer than it lists may mean capability is being left on the
+ * table. Only a live call distinguishes them.
  */
-function assertEffortLadders(supported, devModels) {
-  const errors = [];
+function reportEffortLadderDivergence(supported, devModels) {
   const notes = [];
   for (const model of supported) {
     const options = devModels[model.id]?.reasoning_options;
@@ -240,47 +248,39 @@ function assertEffortLadders(supported, devModels) {
     const compatibility = model.compatibility ?? {};
     if (compatibility.supportsReasoningEffort === false) {
       if (published.size > 0) {
-        notes.push(`${model.id}: suppressed locally, feed publishes ${[...published].sort().join('/')}`);
+        notes.push(`${model.id}: suppressed locally, catalog lists ${[...published].sort().join('/')}`);
       }
       continue;
     }
     const map = compatibility.reasoningEffortMap;
     if (!map) {
-      notes.push(`${model.id}: no local map — falls back to generic rules, cannot be cross-checked`);
+      notes.push(`${model.id}: no local map — falls back to generic rules, nothing to compare`);
       continue;
     }
     const sent = new Set(Object.values(map).filter(value => value !== null));
-    // A model the feed describes as a bare TOGGLE, mapped locally with a
-    // thinkingFormat, is the one legitimate way to send an effort the feed does
-    // not publish: the value is an internal signal that makes the transform
-    // inject the upstream's real control (`enable_thinking`), and the upstream
-    // ignores the effort string itself. Recognised by shape rather than by id,
-    // so any future toggle-only model gets the same treatment — and still
-    // reported, because the honest fix is to send the vendor's own field.
+    // An effort used purely as an internal signal for the thinkingFormat
+    // transform is expected to be absent from a catalog that lists a bare
+    // toggle; the upstream ignores the value itself.
     const togglesOnly = published.size === 0
       && (Array.isArray(options) ? options : []).some(option => option?.type === 'toggle')
       && compatibility.thinkingFormat !== undefined;
     if (togglesOnly) {
-      notes.push(
-        `${model.id}: effort is a toggle proxy (feed publishes a toggle, not a ladder) — `
-        + 'the value is an internal signal for the thinkingFormat transform',
-      );
+      notes.push(`${model.id}: effort is a toggle proxy for the thinkingFormat transform`);
       continue;
     }
-    const unpublished = [...sent].filter(value => !published.has(value)).sort();
-    if (unpublished.length > 0) {
-      errors.push(
-        `${model.id}: maps to ${unpublished.join('/')}, which models.dev does not publish `
-        + `(feed: ${[...published].sort().join('/') || 'no effort ladder'})`,
-      );
-      continue;
-    }
+    const unlisted = [...sent].filter(value => !published.has(value)).sort();
     const unused = [...published].filter(value => !sent.has(value)).sort();
+    if (unlisted.length > 0) {
+      notes.push(
+        `${model.id}: sends ${unlisted.join('/')}, not listed by models.dev `
+        + `(catalog: ${[...published].sort().join('/') || 'no effort ladder'}) — verify against the live endpoint`,
+      );
+    }
     if (unused.length > 0) {
-      notes.push(`${model.id}: feed also publishes ${unused.join('/')}, not sent locally`);
+      notes.push(`${model.id}: models.dev also lists ${unused.join('/')}, not sent locally`);
     }
   }
-  return { errors, notes };
+  return { notes };
 }
 
 async function fetchJson(url) {
@@ -408,13 +408,7 @@ async function main() {
     throw new Error(`models.dev returned unusable metadata:\n  ${invalid.join('\n  ')}`);
   }
 
-  const ladders = assertEffortLadders(supported, devModels);
-  if (ladders.errors.length > 0) {
-    throw new Error(
-      'Local effort maps send values models.dev does not publish for the OpenCode gateway:\n  '
-      + ladders.errors.join('\n  '),
-    );
-  }
+  const ladders = reportEffortLadderDivergence(supported, devModels);
 
   // Resolve the constants content before either write, so the likely failure —
   // the regex no longer matching — aborts with both files untouched rather
@@ -426,7 +420,7 @@ async function main() {
 
   console.log(`Updated ${supported.length} OpenCode Go models from ${MODELS_DEV_URL} (${PROVIDER_ID}).`);
   for (const note of ladders.notes) {
-    console.log(`Effort ladder note — ${note}`);
+    console.log(`Effort ladder (advisory) — ${note}`);
   }
   if (unmapped.length > 0) {
     console.log(
