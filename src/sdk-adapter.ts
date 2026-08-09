@@ -566,6 +566,20 @@ export function translateRequest(
  * Codex CLI spelling and normalized to `priority`; the SDK's providerOptions
  * schema takes only auto/default/flex/priority.
  */
+/**
+ * Whether a route is the ChatGPT-OAuth (Codex) backend — the only one that
+ * carries a service tier.
+ *
+ * Exported so the request diagnostic reports the tier for exactly the routes
+ * the adapter applies it to. Recomputing the predicate at each site is how a
+ * log grows into a confident lie about what went on the wire.
+ */
+export function isOpenAiOAuthRoute(
+  route: { npm?: string; authType?: string } | undefined,
+): boolean {
+  return route?.npm === '@ai-sdk/openai' && route.authType === 'oauth';
+}
+
 const SERVICE_TIERS = new Set(['auto', 'default', 'flex', 'priority']);
 let warnedServiceTier = false;
 export function oauthServiceTier(log?: (message: string) => void): string | undefined {
