@@ -6,6 +6,7 @@ import { resolveProviderCredential } from './env.js';
 import {
   formatRegistryAuthLabel,
   PROVIDER_DEFAULT_ACCOUNT_LABEL,
+  resolveActiveAccount,
   resolveProvidersForDisplay,
   type ProviderDisplayEntry,
 } from './provider-catalog.js';
@@ -500,13 +501,18 @@ async function runProviderDetail(id: string): Promise<'back' | 'removed'> {
     });
   }
   const accountSlots = Object.keys(provider.authAccounts ?? {}).sort();
+  const effective = resolveActiveAccount(provider);
   if (shouldOfferAccountSwitch(provider)) {
     detailOptions.push({
       value: 'account',
       label: 'Switch account',
+      // Same resolver the list view uses, so this screen cannot contradict it
+      // about which identity is live.
       hint: accountSlots.length === 0
         ? `Selected account "${provider.activeAuthAccount}" no longer exists — clear it here`
-        : `Every launch currently uses ${provider.activeAuthAccount ?? PROVIDER_DEFAULT_ACCOUNT_LABEL}`,
+        : effective.fromEnvironment
+          ? `${OAUTH_ACCOUNT_ENV}=${effective.name} overrides the stored ${provider.activeAuthAccount ?? PROVIDER_DEFAULT_ACCOUNT_LABEL}`
+          : `Every launch currently uses ${effective.name ?? PROVIDER_DEFAULT_ACCOUNT_LABEL}`,
     });
   }
   detailOptions.push(
@@ -573,7 +579,9 @@ async function runProviderDetail(id: string): Promise<'back' | 'removed'> {
         ...accountSlots.map(name => ({
           value: name,
           label: name,
-          hint: name === provider.activeAuthAccount ? 'current' : '',
+          hint: name === effective.name
+            ? (effective.fromEnvironment ? `active via ${OAUTH_ACCOUNT_ENV}` : 'current')
+            : name === provider.activeAuthAccount ? 'stored' : '',
         })),
       ],
     });

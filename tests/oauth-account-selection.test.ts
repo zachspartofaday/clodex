@@ -4,6 +4,7 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { applySelectedOAuthAccount } from '../src/registry/materialize.js';
 import { shouldOfferAccountSwitch } from '../src/providers-command.js';
+import { resolveActiveAccount } from '../src/provider-catalog.js';
 import { emptyRegistry, loadRegistry, loadRegistryStrict, saveRegistry } from '../src/registry/io.js';
 import { credentialIsReferenced } from '../src/registry/credential-lifecycle.js';
 import { withRegistryWriteLockSync } from '../src/registry/lock.js';
@@ -310,5 +311,37 @@ describe('shouldOfferAccountSwitch', () => {
   it('stays hidden for a provider with neither', () => {
     expect(shouldOfferAccountSwitch({})).toBe(false);
     expect(shouldOfferAccountSwitch({ authAccounts: {} })).toBe(false);
+  });
+});
+
+describe('resolveActiveAccount', () => {
+  const oauth = { ...withSlots, activeAuthAccount: 'alt' } as RegistryProvider;
+
+  it('reports the stored selection when nothing overrides it', () => {
+    expect(resolveActiveAccount(oauth, {})).toEqual({ name: 'alt', fromEnvironment: false });
+  });
+
+  it('reports the environment override, which is what a launch will use', () => {
+    // The drift this closes: the list view was corrected to respect the
+    // variable while the interactive hint went on naming the stored account,
+    // so one screen contradicted the other about the live identity.
+    expect(resolveActiveAccount(oauth, { CLODEX_OAUTH_ACCOUNT: 'work' }))
+      .toEqual({ name: 'work', fromEnvironment: true });
+  });
+
+  it('mirrors applySelectedOAuthAccount rather than trusting the variable', () => {
+    // A variable naming a missing slot makes the launch THROW rather than
+    // select anything, so reporting it as active would be a second lie. Same
+    // for a provider that cannot participate in the launch at all.
+    expect(resolveActiveAccount(oauth, { CLODEX_OAUTH_ACCOUNT: 'ghost' }))
+      .toEqual({ name: 'alt', fromEnvironment: false });
+    expect(resolveActiveAccount({ ...oauth, enabled: false }, { CLODEX_OAUTH_ACCOUNT: 'work' }))
+      .toEqual({ name: 'alt', fromEnvironment: false });
+    expect(resolveActiveAccount({ ...oauth, authType: 'api' }, { CLODEX_OAUTH_ACCOUNT: 'work' }))
+      .toEqual({ name: 'alt', fromEnvironment: false });
+  });
+
+  it('reports the provider default as undefined, never as a name', () => {
+    expect(resolveActiveAccount(withSlots, {})).toEqual({ name: undefined, fromEnvironment: false });
   });
 });

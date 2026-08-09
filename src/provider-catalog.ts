@@ -85,6 +85,34 @@ export interface ProviderDisplayEntry {
  */
 export const PROVIDER_DEFAULT_ACCOUNT_LABEL = '(provider default)';
 
+/**
+ * The account a launch will ACTUALLY use, and whether the environment chose it.
+ *
+ * One home for the precedence, because the two surfaces that report it drifted
+ * apart the moment they each computed it: the list view was corrected to
+ * respect CLODEX_OAUTH_ACCOUNT while the interactive detail hint went on
+ * naming the stored selection, so the same screen contradicted itself about
+ * the live identity. Mirrors `applySelectedOAuthAccount`: the environment wins,
+ * but only for an enabled OAuth provider whose slot actually exists — a
+ * variable naming a missing slot makes the launch throw rather than select
+ * anything, so reporting it as active here would be a second lie.
+ */
+export function resolveActiveAccount(
+  provider: Pick<
+    import('./registry/types.js').RegistryProvider,
+    'authAccounts' | 'activeAuthAccount' | 'authType' | 'enabled'
+  >,
+  env: NodeJS.ProcessEnv = process.env,
+): { name: string | undefined; fromEnvironment: boolean } {
+  const override = env[OAUTH_ACCOUNT_ENV]?.trim();
+  const applies = Boolean(override)
+    && provider.authType === 'oauth'
+    && provider.enabled
+    && Object.prototype.hasOwnProperty.call(provider.authAccounts ?? {}, override!);
+  if (applies) return { name: override!, fromEnvironment: true };
+  return { name: provider.activeAuthAccount, fromEnvironment: false };
+}
+
 export async function resolveProvidersForDisplay(): Promise<ProviderDisplayEntry[]> {
   const reg = loadRegistry();
   const entries: ProviderDisplayEntry[] = [];
@@ -104,12 +132,7 @@ export async function resolveProvidersForDisplay(): Promise<ProviderDisplayEntry
     // here too; showing the stored one while a variable overrides it would
     // misreport the live identity in exactly the persistent shell this feature
     // is meant to make visible.
-    const override = process.env[OAUTH_ACCOUNT_ENV]?.trim();
-    const overrideApplies = Boolean(override)
-      && provider.authType === 'oauth'
-      && provider.enabled
-      && accountNames.includes(override!);
-    const active = overrideApplies ? override! : provider.activeAuthAccount;
+    const { name: active, fromEnvironment: overrideApplies } = resolveActiveAccount(provider);
     const label = (name: string, isActive: boolean): string => {
       if (!isActive) return name;
       return overrideApplies
