@@ -110,4 +110,33 @@ describe('account-switch catalog lifecycle', () => {
     expect(fetchTemplateModels).not.toHaveBeenCalled();
     expect(loadRegistry().providers[0]?.modelsCache).toBeUndefined();
   });
+
+  it('rebuilds the switched account cache when a different process account is selected', async () => {
+    expect(setActiveOAuthAccount('groq', 'work')).toMatchObject({ changed: true });
+    process.env.CLODEX_OAUTH_ACCOUNT = 'alt';
+    vi.mocked(fetchTemplateModels).mockResolvedValue({
+      models: [{
+        id: 'work-model',
+        name: 'Work model',
+        upstreamModelId: 'work-model',
+        modelFormat: 'openai',
+      }],
+      baseUrl: 'https://api.groq.com/openai/v1',
+    });
+
+    const result = await refreshProviderModelsWithCredential(
+      'groq',
+      async provider => {
+        expect(provider.authRef).toBe('keyring:provider:work');
+        return 'persisted-work-token';
+      },
+      null,
+    );
+
+    expect(result).toMatchObject({ ok: true, modelCount: 1 });
+    expect(fetchTemplateModels).toHaveBeenCalledOnce();
+    expect(loadRegistry().providers[0]?.modelsCache?.models.map(model => model.id)).toEqual([
+      'work-model',
+    ]);
+  });
 });

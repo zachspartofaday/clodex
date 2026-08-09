@@ -423,7 +423,10 @@ export async function runProvidersAuth(providerId: string, method?: ProviderAuth
   return runProvidersAuthWithCleanupState(providerId, method);
 }
 
-export async function runProvidersRefreshModels(providerId?: string): Promise<number> {
+export async function runProvidersRefreshModels(
+  providerId?: string,
+  options: { accountOverride?: string | null } = {},
+): Promise<number> {
   const resolveKey = async (provider: import('./registry/types.js').RegistryProvider) =>
     resolveProviderCredentialWithSource(provider.id, provider.authRef);
 
@@ -436,7 +439,9 @@ export async function runProvidersRefreshModels(providerId?: string): Promise<nu
     }
     const spinner = p.spinner();
     spinner.start(`Refreshing ${provider.name}...`);
-    const accountOverride = process.env[OAUTH_ACCOUNT_ENV] ?? null;
+    const accountOverride = options.accountOverride === undefined
+      ? process.env[OAUTH_ACCOUNT_ENV] ?? null
+      : options.accountOverride;
     let result: Awaited<ReturnType<typeof refreshProviderModelsWithCredential>>;
     try {
       result = await refreshProviderModelsWithCredential(
@@ -830,7 +835,11 @@ async function runProviderDetail(id: string): Promise<'back' | 'removed'> {
     // it atomically on a real transition; refresh immediately so a failure
     // leaves an empty cache rather than advertising the previous account's
     // entitlements. A no-op preserves and does not re-fetch the valid cache.
-    if (result.changed) await runProvidersRefreshModels(id);
+    // This refresh belongs to the persisted transition, not to a temporary
+    // per-process account override. Explicit refresh commands still honor the
+    // environment; the switch refresh deliberately rebuilds the cache for the
+    // identity every future launch will use after that override is unset.
+    if (result.changed) await runProvidersRefreshModels(id, { accountOverride: null });
     return 'back';
   }
 

@@ -292,6 +292,7 @@ describe('interactive OAuth account switching', () => {
   let home: string;
   const prevHome = process.env.CLODEX_HOME;
   const prevProviderOverride = process.env.CLODEX_KEY_OPENAI_OAUTH;
+  const prevAccountOverride = process.env.CLODEX_OAUTH_ACCOUNT;
 
   function slottedProvider(activeAuthAccount?: string): RegistryProvider {
     return {
@@ -304,6 +305,10 @@ describe('interactive OAuth account switching', () => {
       authAccounts: {
         work: {
           authRef: 'keyring:oauth:provider:openai-oauth:account:work::credential::v1:w',
+          addedAt: '2026-08-09T00:00:00.000Z',
+        },
+        alt: {
+          authRef: 'keyring:oauth:provider:openai-oauth:account:alt::credential::v1:a',
           addedAt: '2026-08-09T00:00:00.000Z',
         },
       },
@@ -326,6 +331,7 @@ describe('interactive OAuth account switching', () => {
     home = mkdtempSync(join(tmpdir(), 'clodex-account-switch-'));
     process.env.CLODEX_HOME = home;
     delete process.env.CLODEX_KEY_OPENAI_OAUTH;
+    delete process.env.CLODEX_OAUTH_ACCOUNT;
     selectMock.mockReset();
     logErrorMock.mockReset();
     logSuccessMock.mockReset();
@@ -339,6 +345,8 @@ describe('interactive OAuth account switching', () => {
     else process.env.CLODEX_HOME = prevHome;
     if (prevProviderOverride === undefined) delete process.env.CLODEX_KEY_OPENAI_OAUTH;
     else process.env.CLODEX_KEY_OPENAI_OAUTH = prevProviderOverride;
+    if (prevAccountOverride === undefined) delete process.env.CLODEX_OAUTH_ACCOUNT;
+    else process.env.CLODEX_OAUTH_ACCOUNT = prevAccountOverride;
     rmSync(home, { recursive: true, force: true });
     vi.restoreAllMocks();
   });
@@ -365,9 +373,41 @@ describe('interactive OAuth account switching', () => {
     await expect(runProvidersCommand([])).resolves.toBe(0);
 
     expect(refreshProviderModelsWithCredentialMock).toHaveBeenCalledOnce();
+    expect(refreshProviderModelsWithCredentialMock).toHaveBeenCalledWith(
+      'openai-oauth',
+      expect.any(Function),
+      null,
+    );
     expect(loadRegistry().providers[0]).toMatchObject({ activeAuthAccount: 'work' });
     expect(loadRegistry().providers[0]?.modelsCache).toBeUndefined();
     expect(logErrorMock).toHaveBeenCalledWith('OpenAI (ChatGPT): simulated discovery failure');
+  });
+
+  it('refreshes the persisted account instead of a temporary process selection', async () => {
+    const registry = emptyRegistry();
+    registry.providers.push(slottedProvider());
+    withRegistryWriteLockSync(() => saveRegistry(registry));
+    process.env.CLODEX_OAUTH_ACCOUNT = 'alt';
+    selectMock
+      .mockResolvedValueOnce('provider:openai-oauth')
+      .mockResolvedValueOnce('account')
+      .mockResolvedValueOnce('work')
+      .mockResolvedValueOnce('done');
+    refreshProviderModelsWithCredentialMock.mockResolvedValue({
+      id: 'openai-oauth',
+      name: 'OpenAI (ChatGPT)',
+      ok: true,
+      modelCount: 1,
+    });
+
+    await expect(runProvidersCommand([])).resolves.toBe(0);
+
+    expect(loadRegistry().providers[0]).toMatchObject({ activeAuthAccount: 'work' });
+    expect(refreshProviderModelsWithCredentialMock).toHaveBeenCalledWith(
+      'openai-oauth',
+      expect.any(Function),
+      null,
+    );
   });
 
   it('preserves the cache and skips refresh for a no-op selection', async () => {
