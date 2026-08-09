@@ -1,6 +1,12 @@
 import { describe, expect, it } from 'vitest';
 import { applyBuiltinModelOverrides, BUILTIN_ALIAS_ENV } from '../src/env.js';
-import { applyBuiltinModelOverridesWithProvenance, insideSessionProxy, routableBuiltinOverrides, WRAPPER_INJECTED_BUILTINS_ENV } from '../src/builtin-alias-env.js';
+import {
+  applyBuiltinModelOverridesWithProvenance,
+  insideSessionProxy,
+  routableBuiltinOverrides,
+  SONNET_DEFAULT_PROBE_MARKER_ENV,
+  WRAPPER_INJECTED_BUILTINS_ENV,
+} from '../src/builtin-alias-env.js';
 import { CONFLICTING_ENV_VARS } from '../src/constants.js';
 
 describe('applyBuiltinModelOverrides', () => {
@@ -128,11 +134,73 @@ describe('applyBuiltinModelOverridesWithProvenance', () => {
     expect(env[WRAPPER_INJECTED_BUILTINS_ENV]).toBeUndefined();
   });
 
+  it('marks an injected Sonnet default so auto mode keeps its native classifier', () => {
+    const baseEnv: NodeJS.ProcessEnv = {};
+    const env: NodeJS.ProcessEnv = {};
+    applyBuiltinModelOverridesWithProvenance(env, { sonnet: 'luna' }, baseEnv);
+    expect(env.ANTHROPIC_DEFAULT_SONNET_MODEL).toBe('luna');
+    expect(env[SONNET_DEFAULT_PROBE_MARKER_ENV]).toBe('luna');
+    expect(env[WRAPPER_INJECTED_BUILTINS_ENV]).toBe('sonnet=luna');
+  });
+
+  it('clears the classifier marker with an inherited Sonnet injection', () => {
+    const baseEnv: NodeJS.ProcessEnv = {
+      ANTHROPIC_DEFAULT_SONNET_MODEL: 'old-injected',
+      [SONNET_DEFAULT_PROBE_MARKER_ENV]: 'old-injected',
+      [WRAPPER_INJECTED_BUILTINS_ENV]: 'sonnet=old-injected',
+    };
+    const env: NodeJS.ProcessEnv = { ...baseEnv };
+    applyBuiltinModelOverridesWithProvenance(env, {}, baseEnv);
+    expect(env.ANTHROPIC_DEFAULT_SONNET_MODEL).toBeUndefined();
+    expect(env[SONNET_DEFAULT_PROBE_MARKER_ENV]).toBeUndefined();
+  });
+
+  it('clears our classifier marker even when a descendant replaced the value', () => {
+    // stillOurs() is false here — the replacement is user-explicit and must
+    // survive — but the marker beside it is still ours, and the sentinel that
+    // identifies it is deleted in the same pass. Left behind it is orphaned,
+    // and a later explicit default equal to 'old-injected' would be read as a
+    // clodex injection and bypassed for auto-mode classification.
+    const baseEnv: NodeJS.ProcessEnv = {
+      ANTHROPIC_DEFAULT_SONNET_MODEL: 'user-replaced',
+      [SONNET_DEFAULT_PROBE_MARKER_ENV]: 'old-injected',
+      [WRAPPER_INJECTED_BUILTINS_ENV]: 'sonnet=old-injected',
+    };
+    const env: NodeJS.ProcessEnv = { ...baseEnv };
+    applyBuiltinModelOverridesWithProvenance(env, {}, baseEnv);
+    expect(env.ANTHROPIC_DEFAULT_SONNET_MODEL).toBe('user-replaced');
+    expect(env[SONNET_DEFAULT_PROBE_MARKER_ENV]).toBeUndefined();
+  });
+
+  it('clears our classifier marker when a descendant unset the value entirely', () => {
+    const baseEnv: NodeJS.ProcessEnv = {
+      [SONNET_DEFAULT_PROBE_MARKER_ENV]: 'old-injected',
+      [WRAPPER_INJECTED_BUILTINS_ENV]: 'sonnet=old-injected',
+    };
+    const env: NodeJS.ProcessEnv = { ...baseEnv };
+    applyBuiltinModelOverridesWithProvenance(env, {}, baseEnv);
+    expect(env[SONNET_DEFAULT_PROBE_MARKER_ENV]).toBeUndefined();
+  });
+
+  it("never claims a marker that is not ours by the sentinel's own record", () => {
+    // A parent Claude Code's own probe-written default: no sentinel entry
+    // claims it, so both the value and its marker must survive untouched.
+    const baseEnv: NodeJS.ProcessEnv = {
+      ANTHROPIC_DEFAULT_SONNET_MODEL: 'parent-written',
+      [SONNET_DEFAULT_PROBE_MARKER_ENV]: 'parent-written',
+    };
+    const env: NodeJS.ProcessEnv = { ...baseEnv };
+    applyBuiltinModelOverridesWithProvenance(env, {}, baseEnv);
+    expect(env.ANTHROPIC_DEFAULT_SONNET_MODEL).toBe('parent-written');
+    expect(env[SONNET_DEFAULT_PROBE_MARKER_ENV]).toBe('parent-written');
+  });
+
   it('a true user-set env var still outranks everything and is never claimed', () => {
     const baseEnv: NodeJS.ProcessEnv = { ANTHROPIC_DEFAULT_SONNET_MODEL: 'user-pinned' };
     const env: NodeJS.ProcessEnv = { ...baseEnv };
     applyBuiltinModelOverridesWithProvenance(env, { sonnet: 'snapshot', fable: 'wjudge' }, baseEnv);
     expect(env.ANTHROPIC_DEFAULT_SONNET_MODEL).toBe('user-pinned');
+    expect(env[SONNET_DEFAULT_PROBE_MARKER_ENV]).toBeUndefined();
     expect(env.ANTHROPIC_DEFAULT_FABLE_MODEL).toBe('wjudge');
     // Only what THIS launch injected is claimed by the sentinel, with its value.
     expect(env[WRAPPER_INJECTED_BUILTINS_ENV]).toBe('fable=wjudge');
