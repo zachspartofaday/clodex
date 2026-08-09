@@ -729,6 +729,7 @@ export async function writeAnthropicStream(
   let openType: 'text' | 'thinking' | 'tool' | null = null;
   let pendingThinkingSig: string | undefined;
   const idToBlock = new Map<string, number>();
+  const toolNameById = new Map<string, string>();
   // Tool input deltas are buffered (not forwarded raw) so the complete input
   // can be sanitized once the SDK's parsed `tool-call` part arrives.
   const toolJsonBuffer = new Map<string, string>();
@@ -768,14 +769,31 @@ export async function writeAnthropicStream(
       });
       pendingThinkingSig = undefined;
     }
-    // Stream ended (or moved on) without a tool-call part for this block: emit
-    // the buffered raw JSON so the deltas that did arrive are not lost.
+    // Stream ended (or moved on) without a tool-call part for this block. Parse
+    // and sanitize complete buffered JSON when possible; malformed or partial
+    // JSON still passes through unchanged so the deltas are not lost.
     if (openType === 'tool' && openToolId !== null && !flushedTools.has(openToolId)) {
       const buffered = toolJsonBuffer.get(openToolId);
-      if (buffered) {
+      let json = buffered;
+      const toolName = toolNameById.get(openToolId);
+      if (buffered && toolName) {
+        try {
+          const parsed = JSON.parse(buffered) as unknown;
+          if (parsed && typeof parsed === 'object' && !Array.isArray(parsed)) {
+            json = JSON.stringify(sanitizeToolInput(
+              parsed as Record<string, unknown>,
+              requiredProps.get(toolName),
+              toolName,
+            ));
+          }
+        } catch {
+          // Preserve malformed/partial JSON exactly; the client owns its error.
+        }
+      }
+      if (json) {
         emit('content_block_delta', {
           type: 'content_block_delta', index: blockIndex,
-          delta: { type: 'input_json_delta', partial_json: buffered },
+          delta: { type: 'input_json_delta', partial_json: json },
         });
       }
       flushedTools.add(openToolId);
@@ -839,6 +857,7 @@ export async function writeAnthropicStream(
           type: 'tool_use', id: encodeToolUseId(part.id ?? '', sig), name: part.toolName, input: {},
         });
         idToBlock.set(part.id ?? '', blockIndex);
+        toolNameById.set(part.id ?? '', part.toolName ?? '');
         openToolId = part.id ?? '';
         break;
       }
@@ -857,7 +876,7 @@ export async function writeAnthropicStream(
           // falling back to the buffered raw JSON if the SDK gave no parsed input.
           if (!flushedTools.has(id)) {
             const json = part.input !== undefined && part.input !== null
-              ? JSON.stringify(sanitizeToolInput(part.input as Record<string, unknown>, requiredProps.get(part.toolName ?? '')))
+              ? JSON.stringify(sanitizeToolInput(part.input as Record<string, unknown>, requiredProps.get(part.toolName ?? ''), part.toolName))
               : (toolJsonBuffer.get(id) ?? '');
             if (json) {
               emit('content_block_delta', {
@@ -875,7 +894,7 @@ export async function writeAnthropicStream(
           });
           emit('content_block_delta', {
             type: 'content_block_delta', index: blockIndex,
-            delta: { type: 'input_json_delta', partial_json: JSON.stringify(sanitizeToolInput(part.input as Record<string, unknown> ?? {}, requiredProps.get(part.toolName ?? ''))) },
+            delta: { type: 'input_json_delta', partial_json: JSON.stringify(sanitizeToolInput(part.input as Record<string, unknown> ?? {}, requiredProps.get(part.toolName ?? ''), part.toolName)) },
           });
           flushedTools.add(id);
         }
@@ -1099,7 +1118,7 @@ export async function generateAnthropicResponse(
         type: 'tool_use',
         id: encodeToolUseId(tc.toolCallId, grabRoundTripSignature(tc as FullStreamPart)),
         name: tc.toolName,
-        input: sanitizeToolInput(tc.input as Record<string, unknown> ?? {}, requiredProps.get(tc.toolName)),
+        input: sanitizeToolInput(tc.input as Record<string, unknown> ?? {}, requiredProps.get(tc.toolName), tc.toolName),
       })),
     ],
     stop_reason: finishReason === 'tool-calls' ? 'tool_use' : 'end_turn',
