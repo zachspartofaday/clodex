@@ -42,7 +42,8 @@
     "typecheck": "tsc --noEmit",
     "prepare": "husky",
     "prepublishOnly": "pnpm build",
-    "update:opencode-go": "node scripts/update-opencode-go-models.mjs"
+    "update:opencode-go": "node scripts/update-opencode-go-models.mjs",
+    "probe:opencode-effort": "node scripts/probe-opencode-effort.mjs"
   },
   "dependencies": {
     "@ai-sdk/anthropic": "4.0.12",
