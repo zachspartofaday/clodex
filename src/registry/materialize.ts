@@ -128,17 +128,26 @@ export function applySelectedOAuthAccount(
   if (!provider.enabled) return provider;
   if (provider.authType !== 'oauth') return provider;
   const slots = provider.authAccounts;
+  const stored = provider.activeAuthAccount?.trim();
+  // Keyed on whether a STORED selection exists, not on which selector won.
+  //
   // An environment selector aimed at a provider with no slots at all is
-  // ignored — it only ever chooses AMONG slots, and a stale variable must not
-  // take down a catalog load. A STORED selector is different: the registry
-  // serializes selector-only state as valid, so a missing slot table means the
-  // deliberate choice can no longer be honoured, and returning here would run
+  // ignored: it only ever chooses AMONG slots, and a stale variable must not
+  // take down a catalog load. A stored selection is different — the registry
+  // serializes selector-only state as valid, so a missing slot table means a
+  // deliberate choice can no longer be honoured, and continuing would run
   // every launch as the wrong identity in silence.
+  //
+  // Gating on `fromEnvironment` conflated the two: exporting the variable for
+  // ANY provider made every orphaned stored selection silently resolve to the
+  // provider default, which is the exact substitution this branch exists to
+  // refuse. The environment cannot rescue a broken stored selection, because
+  // with no slot table it has nothing to select either.
   if (!slots || Object.keys(slots).length === 0) {
-    if (fromEnvironment) return provider;
+    if (stored === undefined || stored === '') return provider;
     throw new Error(
-      `Provider "${provider.id}" is set to use account "${name}", but it has no named accounts. `
-      + 'Re-add the account with: clodex providers auth openai --account ' + name
+      `Provider "${provider.id}" is set to use account "${stored}", but it has no named accounts. `
+      + 'Re-add the account with: clodex providers auth openai --account ' + stored
       + ', or clear the selection with: clodex providers',
     );
   }

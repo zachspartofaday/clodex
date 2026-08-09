@@ -120,6 +120,20 @@ describe('the stored account selection', () => {
     expect(() => applySelectedOAuthAccount(emptyTable, undefined)).toThrow(/has no named accounts/);
   });
 
+  it('an environment selector cannot mask an orphaned stored selection', () => {
+    // Gating the orphan check on which selector WON conflated two things:
+    // exporting the variable for any provider made every orphaned stored
+    // selection resolve silently to the provider default — the exact
+    // substitution the check exists to refuse. The environment cannot rescue a
+    // broken stored selection anyway, since with no slot table it has nothing
+    // to select either.
+    const orphaned: RegistryProvider = { ...base, activeAuthAccount: 'varmez' };
+    expect(() => applySelectedOAuthAccount(orphaned, 'anything')).toThrow(/has no named accounts/);
+    // ...and the message names the STORED account, not whatever the variable said.
+    expect(() => applySelectedOAuthAccount(orphaned, 'anything')).toThrow(/"varmez"/);
+    expect(() => applySelectedOAuthAccount(orphaned, 'anything')).not.toThrow(/"anything"/);
+  });
+
   it('still ignores an ENVIRONMENT selector on a provider with no slots', () => {
     // Unchanged contract: the variable only ever chooses among slots, and a
     // stale one must not take down a catalog load for providers that can run.

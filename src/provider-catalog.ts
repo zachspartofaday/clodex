@@ -139,11 +139,20 @@ export async function resolveProvidersForDisplay(): Promise<ProviderDisplayEntry
         ? `${name} (active, from ${OAUTH_ACCOUNT_ENV})`
         : `${name} (active)`;
     };
+    // An orphaned stored selection — one naming a slot that is gone — is the
+    // reason every launch for this provider now fails, so it is the LAST thing
+    // the listing should hide. Rendering only existing slots left it invisible,
+    // and an empty slot table suppressed the accounts section outright, so the
+    // non-interactive view showed nothing at all about a provider that could
+    // not launch.
+    const orphaned = provider.activeAuthAccount !== undefined
+      && !accountNames.includes(provider.activeAuthAccount);
     const accountList = [
-      label(PROVIDER_DEFAULT_ACCOUNT_LABEL, active === undefined),
+      label(PROVIDER_DEFAULT_ACCOUNT_LABEL, active === undefined && !orphaned),
       ...accountNames.map(name => label(name, name === active)),
+      ...(orphaned ? [`${provider.activeAuthAccount} (selected, MISSING — every launch fails)`] : []),
     ].join(', ');
-    const authLabel = accountNames.length
+    const authLabel = accountNames.length || orphaned
       ? `${formatRegistryAuthLabel(provider)}; accounts: ${accountList}`
       : formatRegistryAuthLabel(provider);
     entries.push({

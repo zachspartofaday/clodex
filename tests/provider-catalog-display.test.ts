@@ -246,6 +246,33 @@ describe('provider-catalog-display', () => {
       }
     });
 
+    it('surfaces an orphaned selection instead of hiding it', async () => {
+      // This selection is why every launch for the provider fails, so it is the
+      // last thing the listing should omit. Rendering only existing slots left
+      // it invisible; an empty slot table suppressed the accounts section
+      // entirely, so the non-interactive view said nothing at all.
+      const registry = emptyRegistry();
+      registry.providers.push({
+        id: 'openai-oauth',
+        templateId: 'openai',
+        name: 'OpenAI (ChatGPT)',
+        enabled: true,
+        authRef: 'keyring:oauth:provider:openai-oauth::credential::v1:default',
+        authType: 'oauth',
+        activeAuthAccount: 'varmez',
+        api: { npm: '@ai-sdk/openai' },
+        addedAt: new Date().toISOString(),
+      });
+      withRegistryWriteLockSync(() => saveRegistry(registry));
+
+      const label = (await resolveProvidersForDisplay())[0]?.authLabel ?? '';
+      expect(label).toContain('accounts:');
+      expect(label).toContain('varmez (selected, MISSING');
+      // The provider default must not be reported as active while a broken
+      // selection is what a launch would actually hit.
+      expect(label).not.toContain('(provider default) (active)');
+    });
+
     it('does not confuse a slot literally named default with the provider default', async () => {
       // `default` is a valid slot name. Labelling the provider's own
       // credential "default" too would render two identical entries and mark
