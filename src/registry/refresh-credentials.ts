@@ -8,6 +8,7 @@ import {
 } from '../env.js';
 import { OAUTH_ACCOUNT_ENV } from '../oauth-account-selection.js';
 import type { RegistryProvider } from './types.js';
+import { effectiveProviderCachedModels } from '../data/opencode-go-models.js';
 
 export interface RefreshCredentialSnapshot {
   /** Provider generation and routing fields that this credential was resolved for. */
@@ -126,7 +127,7 @@ export function isLikelyPlaceholderKey(key: string | null | undefined): boolean 
 }
 
 export function cachedModelCount(provider: RegistryProvider): number {
-  return provider.modelsCache?.models.length ?? 0;
+  return effectiveProviderCachedModels(provider).length;
 }
 
 export function skipWithCachedModels(

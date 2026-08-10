@@ -98,7 +98,7 @@ export function describeModelAliasRejection(reason: ModelAliasRejectionReason): 
     case 'target-not-favorite':
       return 'target is not a saved favorite';
     case 'target-not-exposed':
-      return 'target is outside the active Claude Code catalog';
+      return 'saved favorite target is no longer exposed by its provider or is outside the active Claude Code catalog';
   }
 }
 
