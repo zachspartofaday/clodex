@@ -12,6 +12,7 @@ import {
 } from '../src/provider-catalog.js';
 import { emptyRegistry, saveRegistry } from '../src/registry/io.js';
 import { withRegistryWriteLockSync } from '../src/registry/lock.js';
+import { NATIVE_CLAUDE_CODE_OAUTH_BETA_PROVENANCE } from '../src/anthropic-beta-policy.js';
 
 const TEST_HELPER_REF = `helper:v1:${'a'.repeat(64)}:oauth:provider:openai-oauth`;
 
@@ -142,6 +143,39 @@ describe('provider-catalog-display', () => {
     }]);
 
     expect(models[0]?.authRef).toBe(TEST_HELPER_REF);
+  });
+
+  it('carries only proven native Claude Code beta provenance into server routes', () => {
+    const model = {
+      id: 'claude-sonnet-4-6',
+      name: 'Claude Sonnet 4.6',
+      family: 'claude',
+      brand: 'Anthropic',
+      modelFormat: 'anthropic' as const,
+      upstreamModelId: 'claude-sonnet-4-6',
+      baseUrl: 'https://api.anthropic.com',
+    };
+    const models = localProvidersToServerModels([
+      {
+        id: 'claude-code',
+        name: 'Claude Code',
+        apiKey: 'oauth-token',
+        authType: 'oauth',
+        models: [model],
+      },
+      {
+        id: 'generic-oauth',
+        name: 'Generic OAuth',
+        apiKey: 'oauth-token',
+        authType: 'oauth',
+        models: [{ ...model, id: 'generic-sonnet' }],
+      },
+    ]);
+
+    expect(models[0]?.anthropicBetaProvenance).toBe(
+      NATIVE_CLAUDE_CODE_OAUTH_BETA_PROVENANCE,
+    );
+    expect(models[1]?.anthropicBetaProvenance).toBeUndefined();
   });
 
   describe('formatRegistryAuthLabel', () => {
@@ -408,6 +442,50 @@ describe('provider-catalog-display', () => {
       const label = (await resolveProvidersForDisplay())[0]?.authLabel ?? '';
       expect(label).toContain('accounts: (provider default), default (active)');
       expect(label.match(/\(active\)/g)).toHaveLength(1);
+    });
+
+    it('counts only effective committed OpenCode Go cache membership', async () => {
+      const registry = emptyRegistry();
+      registry.providers.push({
+        id: 'opencode-go',
+        templateId: 'opencode-go',
+        name: 'OpenCode Go',
+        enabled: true,
+        authRef: 'keyring:provider:opencode-go',
+        api: { npm: '@ai-sdk/openai-compatible', url: 'https://opencode.ai/zen/go/v1' },
+        addedAt: new Date().toISOString(),
+        modelsCache: {
+          fetchedAt: new Date().toISOString(),
+          models: [
+            { id: 'qwen3.6-plus', name: 'Qwen', upstreamModelId: 'qwen3.6-plus', modelFormat: 'openai' },
+            { id: 'gpt-5.6-luna', name: 'Luna', upstreamModelId: 'gpt-5.6-luna', modelFormat: 'openai' },
+            { id: 'unknown', name: 'Unknown', upstreamModelId: 'unknown', modelFormat: 'openai' },
+          ],
+        },
+      }, {
+        id: 'custom-go',
+        templateId: 'custom-openai',
+        name: 'Custom Go',
+        enabled: true,
+        authRef: 'keyring:provider:custom-go',
+        api: { npm: '@ai-sdk/openai-compatible', url: 'https://example.test/v1' },
+        addedAt: new Date().toISOString(),
+        modelsCache: {
+          fetchedAt: new Date().toISOString(),
+          models: [
+            { id: 'qwen3.6-plus', name: 'Qwen', upstreamModelId: 'qwen3.6-plus', modelFormat: 'openai' },
+            { id: 'gpt-5.6-luna', name: 'Luna', upstreamModelId: 'gpt-5.6-luna', modelFormat: 'openai' },
+            { id: 'unknown', name: 'Unknown', upstreamModelId: 'unknown', modelFormat: 'openai' },
+          ],
+        },
+      });
+      withRegistryWriteLockSync(() => saveRegistry(registry));
+
+      const entries = await resolveProvidersForDisplay();
+      expect(entries.map(entry => [entry.id, entry.modelCount])).toEqual([
+        ['custom-go', 3],
+        ['opencode-go', 1],
+      ]);
     });
   });
 });

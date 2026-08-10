@@ -26,7 +26,11 @@ import { reconcilePendingCredentialDeletes } from './registry/credential-lifecyc
 import { loadRegistry } from './registry/io.js';
 import { withProviderMutationLock } from './registry/lock.js';
 import type { RegistryProvider } from './registry/types.js';
-import { refreshAllProviderModels, refreshProviderModelsWithCredential } from './registry/refresh-models.js';
+import {
+  providerModelRefreshBoundaryError,
+  refreshAllProviderModels,
+  refreshProviderModelsWithCredential,
+} from './registry/refresh-models.js';
 import { authenticateProvider, providerAuthHelpText, validateOAuthAccountName, type ProviderAuthMethod } from './registry/provider-auth.js';
 import { supportsNativeOAuth } from './oauth/types.js';
 import { browseAllModels } from './prompts.js';
@@ -35,6 +39,7 @@ import { OAUTH_ACCOUNT_ENV } from './oauth-account-selection.js';
 import { loadPreferences } from './config.js';
 import type { LocalProvider } from './types.js';
 import { readLiveServerRuntimeStates } from './server-runtime.js';
+import { effectiveProviderCachedModels } from './data/opencode-go-models.js';
 import {
   fmtEnabledStar,
   fmtProvider,
@@ -449,6 +454,11 @@ export async function runProvidersRefreshModels(
       p.log.error(`Provider not found: ${providerId}`);
       return 1;
     }
+    const boundaryError = providerModelRefreshBoundaryError(provider);
+    if (boundaryError) {
+      p.log.error(`${provider.name}: ${boundaryError}`);
+      return 1;
+    }
     const spinner = p.spinner();
     spinner.start(`Refreshing ${provider.name}...`);
     const accountOverride = options.accountOverride === undefined
@@ -711,6 +721,7 @@ async function runProviderDetail(id: string): Promise<'back' | 'removed'> {
   // The detail/browse surface must describe the same account a launch from
   // this process will use. If the selection is broken, fail closed to an
   // empty catalog while leaving the account controls available for repair.
+  // The committed OpenCode allowlist is then applied to that projected cache.
   let modelProvider: RegistryProvider;
   try {
     modelProvider = projectSelectedOAuthAccount(provider);
@@ -724,7 +735,8 @@ async function runProviderDetail(id: string): Promise<'back' | 'removed'> {
     delete modelProvider.modelsCache;
     delete modelProvider.refreshedAt;
   }
-  const modelCount = modelProvider.modelsCache?.models.length ?? 0;
+  const effectiveModels = effectiveProviderCachedModels(modelProvider);
+  const modelCount = effectiveModels.length;
   const authLabel = (await resolveProvidersForDisplay()).find(entry => entry.id === id)?.authLabel
     ?? formatRegistryAuthLabel(provider);
   printProviderDetailPanel(provider.name, modelCount, authLabel);
@@ -786,8 +798,7 @@ async function runProviderDetail(id: string): Promise<'back' | 'removed'> {
   if (p.isCancel(action) || action === 'back') return 'back';
 
   if (action === 'browse') {
-    const cachedModels = modelProvider.modelsCache?.models ?? [];
-    const localModels = cachedModels
+    const localModels = effectiveModels
       .map(m => cachedModelToLocal(m, modelProvider))
       .filter((m): m is NonNullable<typeof m> => m !== null);
     const localProvider: LocalProvider = {

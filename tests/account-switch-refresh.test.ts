@@ -8,7 +8,8 @@ import { emptyRegistry, loadRegistry, saveRegistry } from '../src/registry/io.js
 import { withRegistryWriteLockSync } from '../src/registry/lock.js';
 import { refreshProviderModelsWithCredential } from '../src/registry/refresh-models.js';
 
-vi.mock('../src/registry/fetch-template-models.js', () => ({
+vi.mock('../src/registry/fetch-template-models.js', async importOriginal => ({
+  ...(await importOriginal<typeof import('../src/registry/fetch-template-models.js')>()),
   fetchTemplateModels: vi.fn(),
 }));
 

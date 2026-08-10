@@ -12,6 +12,8 @@ import { OAUTH_ACCOUNT_ENV } from './oauth-account-selection.js';
 import { getTemplateById } from './provider-templates.js';
 import type { LocalProvider } from './types.js';
 import type { ServerModelInfo } from './server/models.js';
+import { effectiveProviderCachedModels } from './data/opencode-go-models.js';
+import { resolveAnthropicBetaProvenance } from './anthropic-beta-policy.js';
 
 export async function fetchProviderCatalog(
   opts?: { agent?: CompatibilityAgent },
@@ -350,13 +352,15 @@ export async function resolveProvidersForDisplay(): Promise<ProviderDisplayEntry
       name: provider.name,
       // Model counts describe the identity this process would launch, not the
       // persisted account hidden behind CLODEX_OAUTH_ACCOUNT. A broken
-      // selection has no safe catalog to advertise.
+      // selection has no safe catalog to advertise. Apply the committed
+      // OpenCode allowlist only after projecting that identity so a temporary
+      // account cannot inherit another account's catalog.
       modelCount: (() => {
         // A process-only provider credential has no account-owned discovery
         // cache. Runtime materialization fails closed for the same reason.
         if (credentialOverrideWins) return 0;
         try {
-          return projectSelectedOAuthAccount(provider).modelsCache?.models.length ?? 0;
+          return effectiveProviderCachedModels(projectSelectedOAuthAccount(provider)).length;
         } catch {
           return 0;
         }
@@ -391,10 +395,13 @@ export function localProvidersToServerModels(localProviders: LocalProvider[]): S
       apiKey: provider.apiKey,
       authRef: provider.authRef,
       authType: provider.authType,
+      anthropicAuthMode: provider.anthropicAuthMode,
+      anthropicBetaProvenance: resolveAnthropicBetaProvenance(model, provider),
       oauthAccountId: provider.oauthAccountId,
       contextWindow: model.contextWindow,
       supportedParameters: model.supportedParameters,
       reasoning: model.reasoning,
+      codingCapabilitiesAuthoritative: model.codingCapabilitiesAuthoritative,
       interleavedReasoningField: model.interleavedReasoningField,
       useResponsesLite: model.useResponsesLite,
       preferWebSockets: model.preferWebSockets,

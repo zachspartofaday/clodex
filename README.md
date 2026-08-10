@@ -25,6 +25,7 @@ clodex models                  # 3. pick favorite models and aliases
 clodex models --alias sol=clodex:openai-oauth:gpt-5.6-sol
 clodex models --alias luna=clodex:openai-oauth:gpt-5.6-luna
 clodex models --alias terra=clodex:openai-oauth:gpt-5.6-terra
+clodex models --effort-policy provider-default  # optional: unsupported worker effort policy
 clodex patch                   # 4. (optional) patch Claude Code so those models are first-class
 clodex claude                  # 5. launch Claude Code on an OpenAI model
 ```
@@ -34,6 +35,20 @@ clodex claude                  # 5. launch Claude Code on an OpenAI model
 3. **Pick models** — an interactive manager for favorites (up to 100) and short aliases like `sol` so you do not need to type the long names. Up to the first 20 favorites in saved order drive Claude-facing catalogs and the patcher; an endpoint launch's selected model consumes one of those 20 slots. Clodex names every later saved favorite it leaves inactive.
 4. **Patch** *(optional but recommended for proxy mode)* — bakes your favorites and aliases into the Claude Code binary so they pass model validation, appear in `/model`, and report their real context windows. Re-run after each `claude` update; `clodex patch --restore` undoes it. This step is required if you want to use clodex-routed models as subagents via the Agent tool.
 5. **Launch** — starts Claude Code bridged to the model you choose.
+
+## Supported providers
+
+| Provider | Auth | Support |
+|---|---|---|
+| OpenAI | API key | Fully supported by the clodex maintainer |
+| OpenAI (ChatGPT / Codex plan) | OAuth | Fully supported by the clodex maintainer |
+| OpenCode Go | API key | Community-supported — maintained by its contributor |
+
+**Community-supported** means the maintainer holds no account for that service,
+so it cannot be exercised against the live API here or debugged when the vendor
+changes something. Such an integration is reviewed and tested like everything
+else and shipped gladly — it just depends on its contributor when upstream
+moves. New providers land under this tier by default.
 
 ## Difference between Clodex and other solutions
 
@@ -214,7 +229,18 @@ Manage up to 100 favorite models and short aliases. Up to the first 20 favorites
 | `--list` | Print the exact `clodex:<provider-id>:<model-id>` names (and aliases) without opening the manager |
 | `--alias <name=target>` | Save a short name for a favorite, e.g. `--alias sol=clodex:openai-oauth:gpt-5.6-sol` (the `clodex:` prefix is optional in the target) |
 | `--unalias <name>` | Remove a saved short name |
+| `--effort-policy <provider-default\|up\|down\|exact>` | Save the global rule for an explicit worker effort the target does not support |
 | `--help`, `--version` | Help / version |
+
+The default effort policy is `provider-default`: an unsupported explicit level
+is omitted and the target provider chooses. `up` and `down` round to the nearest
+level in the target model's exact ladder (saturating at an edge); `exact`
+rejects the request with HTTP 400. Aliases always inherit their target's ladder.
+Changing the policy affects new clodex processes, so restart running Claude or
+server sessions. `clodex patch` also writes exact sparse ladders into Claude's
+picker—for example DeepSeek V4 Flash exposes `low/high/max`, DeepSeek V4 Pro
+exposes `high/max`, and the OpenCode Qwen 3.6–3.8 Messages models expose
+`high/max`. An omitted effort remains omitted.
 
 ### `clodex providers [subcommand]`
 

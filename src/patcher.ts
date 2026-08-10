@@ -75,6 +75,13 @@ import { httpProxyDisplayName, httpProxyModelId } from './http-proxy/routes.js';
 import { stripOneMContextSuffix } from './context-model-id.js';
 import { getPatchReasoningCapabilities } from './provider-factory.js';
 import {
+  effectiveProviderCachedModels,
+  ignoresModelsDevForOpenCodeGoProvider,
+  isFailClosedOpenCodeGoBoundaryProvider,
+  isOfficialBuiltInOpenCodeGoProvider,
+  quarantinedOpenCodeGoModelTargets,
+} from './data/opencode-go-models.js';
+import {
   describeModelAliasRejection,
   normalizeModelAliases,
   type ModelAliasRejection,
@@ -150,6 +157,8 @@ export interface DesiredPatchConfig {
   /** Saved aliases excluded from the patch while remaining in configuration. */
   rejectedAliases: StoredModelAlias[];
   rejectedAliasRejections: ModelAliasRejection[];
+  /** Exact clodex ids saved as favorites but no longer exposed by their provider. */
+  droppedFavoriteIds: string[];
 }
 
 /** Model metadata the patch bakes in, resolved from the registry models cache. */
@@ -159,7 +168,7 @@ export interface PatchModelMeta {
   displayName?: string;
   effort?: {
     levels: string[];
-    defaultLevel: string;
+    defaultLevel: string | null;
   };
 }
 
@@ -173,10 +182,26 @@ export function buildPatchModelConfig(
   favorites: Array<{ providerId: string; modelId: string }>,
   aliases: unknown,
   modelMetaFor: (providerId: string, modelId: string) => PatchModelMeta | undefined,
-  max = MAX_MODEL_CATALOG,
+  opts: number | {
+    max?: number;
+    droppedFavoriteTargets?: ReadonlySet<string>;
+  } = {},
 ): DesiredPatchConfig {
+  // Preserve the historical numeric fourth argument while allowing the
+  // provider allowlist to report favorites that disappeared before catalog
+  // capacity is projected.
+  const max = typeof opts === 'number' ? opts : opts.max ?? MAX_MODEL_CATALOG;
+  const droppedFavoriteTargets = typeof opts === 'number'
+    ? undefined
+    : opts.droppedFavoriteTargets;
+  // Capacity is a persisted-order window, not a count of currently usable
+  // rows. Project it before provider allowlists/quarantine so an unavailable
+  // favorite inside the first window keeps its saved position and a later
+  // favorite never jumps the queue silently.
   const projection = projectFavoriteExposure(favorites, { max });
-  const exposedFavorites = projection.exposedFavorites;
+  const exposedFavorites = projection.exposedFavorites.filter(favorite => (
+    !droppedFavoriteTargets?.has(`${favorite.providerId}:${favorite.modelId}`)
+  ));
   const config: PatchScriptModelConfig = {};
   const unknownWindows: string[] = [];
   const normalizedAliases = normalizeModelAliases(aliases);
@@ -193,6 +218,7 @@ export function buildPatchModelConfig(
     .flatMap(({ sources }) => sources.map(source => ({
       alias: source,
       reason: savedFavoriteTargets.has(`${String(source.providerId)}:${String(source.modelId)}`)
+        || droppedFavoriteTargets?.has(`${source.providerId}:${source.modelId}`)
         ? 'target-not-exposed'
         : 'target-not-favorite',
     })));
@@ -233,6 +259,8 @@ export function buildPatchModelConfig(
       ...normalizedAliases.rejections,
       ...targetRejections,
     ],
+    droppedFavoriteIds: [...(droppedFavoriteTargets ?? [])]
+      .map(target => `clodex:${target}`),
   };
 }
 
@@ -245,6 +273,25 @@ export function reportRejectedModelAliases(
       + `${describeModelAliasRejection(rejection.reason)}. The saved entry was preserved.`,
     );
   }
+}
+
+export function reportDroppedPatchFavorites(ids: string[]): void {
+  for (const id of ids) {
+    p.log.warn(`Saved favorite ${id} was not patched — it is no longer exposed by its provider.`);
+  }
+}
+
+function describeCapacitySkippedPatchFavorites(
+  favorites: DesiredPatchConfig['capacitySkippedFavorites'],
+): string | undefined {
+  if (favorites.length === 0) return undefined;
+  return `${favorites.length} saved favorite${favorites.length === 1 ? '' : 's'} `
+    + `not patched because clodex limits the Claude-facing patch catalog to ${MAX_MODEL_CATALOG} models. `
+    + `The first ${MAX_MODEL_CATALOG} saved positions retain priority even when a provider stops exposing one; `
+    + 'skipped entries were preserved:\n'
+    + favorites
+      .map(favorite => `  ${httpProxyModelId(favorite.providerId, favorite.modelId)}`)
+      .join('\n');
 }
 
 /** Canonical (key-sorted) hash of the transform-set version and patch model config. */
@@ -279,18 +326,44 @@ export function buildDesiredPatchConfig(): DesiredPatchConfig {
   const registry = loadRegistry();
 
   const meta = new Map<string, PatchModelMeta>();
+  const bundledAllowlistedTargets = new Set<string>();
+  const bundledAllowlistedProviders = new Set<string>();
+  const disabledProviders = new Set<string>();
+  const failClosedOpenCodeProviders = new Set<string>();
+  const quarantinedTargets = new Set<string>();
   for (const provider of registry.providers) {
-    for (const model of provider.modelsCache?.models ?? []) {
+    if (!provider.enabled) {
+      disabledProviders.add(provider.id);
+      continue;
+    }
+    const effectiveModels = effectiveProviderCachedModels(provider);
+    if (isOfficialBuiltInOpenCodeGoProvider(provider)) bundledAllowlistedProviders.add(provider.id);
+    if (isFailClosedOpenCodeGoBoundaryProvider(provider)) {
+      failClosedOpenCodeProviders.add(provider.id);
+    }
+    for (const target of quarantinedOpenCodeGoModelTargets(provider)) {
+      quarantinedTargets.add(target);
+    }
+    const ignoreModelsDevCapabilities = ignoresModelsDevForOpenCodeGoProvider(provider);
+    for (const model of effectiveModels) {
+      const target = `${provider.id}:${model.id}`;
+      bundledAllowlistedTargets.add(target);
       const npm = model.npm ?? provider.api.npm ?? '';
       const upstreamModelId = model.upstreamModelId ?? model.id;
-      const modelsDev = findModelsDevModel(provider.id, model.id);
+      const modelsDev = ignoreModelsDevCapabilities
+        ? null
+        : findModelsDevModel(provider.id, model.id);
       const effort = getPatchReasoningCapabilities(npm, upstreamModelId, {
         providerId: provider.id,
         apiBaseUrl: model.apiUrl ?? provider.api.url,
         supportedParameters: model.supportedParameters,
-        reasoning: model.reasoning ?? modelsDev?.reasoning,
+        reasoning: model.codingCapabilitiesAuthoritative
+          ? model.reasoning
+          : model.reasoning ?? modelsDev?.reasoning,
         interleavedReasoningField:
-          model.interleavedReasoningField ?? modelsDev?.interleaved?.field,
+          model.codingCapabilitiesAuthoritative
+            ? model.interleavedReasoningField
+            : model.interleavedReasoningField ?? modelsDev?.interleaved?.field,
         compatibility: model.compatibility,
         upstreamModelId,
       });
@@ -299,16 +372,37 @@ export function buildDesiredPatchConfig(): DesiredPatchConfig {
         // Same label `clodex server` prints at startup and `models --list` shows.
         displayName: httpProxyDisplayName(model, provider.name),
         effort: effort.mode === 'controllable'
-          ? { levels: effort.levels, defaultLevel: effort.defaultLevel }
+          ? { levels: effort.levels, defaultLevel: effort.defaultLevel || null }
           : undefined,
       });
     }
   }
 
+  const droppedFavoriteTargets = new Set<string>();
+  for (const favorite of favorites) {
+    const target = `${favorite.providerId}:${favorite.modelId}`;
+    // A stale official row and a current neutral custom row can share an id.
+    // Quarantine only when the effective custom projection does not expose
+    // that target.
+    const hiddenByQuarantine = quarantinedTargets.has(target)
+      && !bundledAllowlistedTargets.has(target);
+    if (
+      disabledProviders.has(favorite.providerId) ||
+      failClosedOpenCodeProviders.has(favorite.providerId) ||
+      hiddenByQuarantine ||
+      (
+        bundledAllowlistedProviders.has(favorite.providerId)
+        && !bundledAllowlistedTargets.has(target)
+      )
+    ) {
+      droppedFavoriteTargets.add(target);
+    }
+  }
   return buildPatchModelConfig(
     favorites,
     aliases,
     (providerId, modelId) => meta.get(`${providerId}:${modelId}`),
+    { droppedFavoriteTargets },
   );
 }
 
@@ -546,6 +640,9 @@ function requiredEffortPatchFailures(results: PatchSiteResult[]): PatchSiteResul
       result.name.startsWith('PATCH 8a:')
       || result.name.startsWith('PATCH 8b:')
       || result.name.startsWith('PATCH 8c:')
+      || result.name.startsWith('PATCH 8d:')
+      || result.name.startsWith('PATCH 8e:')
+      || result.name.startsWith('PATCH 8f:')
       || result.name.startsWith('PATCH 9:')
     ),
   );
@@ -919,24 +1016,27 @@ export async function runPatchCommand(opts: {
   }
 
   const desired = buildDesiredPatchConfig();
+  reportRejectedModelAliases(desired.rejectedAliasRejections);
+  const capacityWarning = describeCapacitySkippedPatchFavorites(
+    desired.capacitySkippedFavorites,
+  );
+  if (capacityWarning) p.log.warn(capacityWarning);
   if (Object.keys(desired.config).length === 0) {
-    p.log.error('No favorite models to patch. Save favorites with `clodex models` first.');
+    reportDroppedPatchFavorites(desired.droppedFavoriteIds);
+    if (desired.droppedFavoriteIds.length > 0) {
+      p.log.error(
+        'No exposed favorite models remain to patch. If Claude Code still has an older clodex patch, '
+        + 'restore it with `clodex patch --restore`.',
+      );
+    } else {
+      p.log.error('No favorite models to patch. Save favorites with `clodex models` first.');
+    }
     return 1;
-  }
-  if (desired.capacitySkippedFavorites.length > 0) {
-    p.log.warn(
-      `${desired.capacitySkippedFavorites.length} saved favorite${desired.capacitySkippedFavorites.length === 1 ? '' : 's'} `
-      + `not patched because clodex limits the Claude-facing patch catalog to ${MAX_MODEL_CATALOG} models. `
-      + 'The first saved favorites remain active; skipped entries were preserved:\n'
-      + desired.capacitySkippedFavorites
-        .map(favorite => `  ${httpProxyModelId(favorite.providerId, favorite.modelId)}`)
-        .join('\n'),
-    );
   }
   for (const id of desired.unknownWindows) {
     p.log.warn(`No context window metadata for ${id} — Claude Code will assume the 200k default.`);
   }
-  reportRejectedModelAliases(desired.rejectedAliasRejections);
+  reportDroppedPatchFavorites(desired.droppedFavoriteIds);
 
   const localPatches = inspectLocalPatchSource(
     loadPreferences().localPatchesEnabled === true,
@@ -1001,7 +1101,23 @@ export async function runPatchCommand(opts: {
 export async function runLaunchPatchCheck(opts: { agentStdout?: boolean; dryRun?: boolean } = {}): Promise<void> {
   try {
     const desired = buildDesiredPatchConfig();
-    if (Object.keys(desired.config).length === 0) return; // nothing to patch
+    if (Object.keys(desired.config).length === 0) {
+      if (!opts.agentStdout) {
+        const capacityWarning = describeCapacitySkippedPatchFavorites(
+          desired.capacitySkippedFavorites,
+        );
+        if (capacityWarning) console.error(pc.dim(`clodex: ${capacityWarning}`));
+        if (desired.droppedFavoriteIds.length > 0 && readPatchManifest()) {
+          for (const id of desired.droppedFavoriteIds) {
+            console.error(pc.dim(`clodex: saved favorite ${id} is no longer exposed; a previous clodex patch is recorded.`));
+          }
+          console.error(pc.dim(
+            'clodex: if Claude Code still shows an old removed entry, run `clodex patch --restore`.',
+          ));
+        }
+      }
+      return;
+    }
 
     const target = resolveClaudeBinaryForPatch();
     if (!target.ok) {
@@ -1030,6 +1146,12 @@ export async function runLaunchPatchCheck(opts: { agentStdout?: boolean; dryRun?
       configHash,
       binarySize: statSync(resolved.binaryPath).size,
     });
+
+    if (desired.droppedFavoriteIds.length > 0 && !opts.agentStdout) {
+      for (const id of desired.droppedFavoriteIds) {
+        console.error(pc.dim(`clodex: saved favorite ${id} is no longer exposed and is not included in the current patch configuration.`));
+      }
+    }
     if (state === 'current') return;
 
     const interactive = !opts.dryRun && !opts.agentStdout
