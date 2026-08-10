@@ -17,6 +17,7 @@ import {
 import { resolveActiveAccount } from '../src/provider-catalog.js';
 import { emptyRegistry, loadRegistry, loadRegistryStrict, saveRegistry } from '../src/registry/io.js';
 import { credentialIsReferenced } from '../src/registry/credential-lifecycle.js';
+import { clearActiveOAuthAccount } from '../src/registry/oauth-account-storage.js';
 import { withRegistryWriteLockSync } from '../src/registry/lock.js';
 import { oauthProviderIdFromAccount } from '../src/env.js';
 import type { RegistryModelsCache, RegistryProvider } from '../src/registry/types.js';
@@ -491,6 +492,100 @@ describe('authAccounts registry persistence', () => {
       /invalid OAuth account selection storage.*Repair it or restore.*providers\.json\.bak/s,
     );
     expect(readFileSync(path, 'utf8')).toBe(legacy);
+  });
+
+  it('names the offending provider when one legacy selector blocks a mixed migration', () => {
+    // Two providers, one migratable and one not: the diagnostic has to say
+    // WHICH provider to repair, or the only actionable step is bisecting the
+    // file by hand.
+    const legacy = `${JSON.stringify({
+      schemaVersion: 3,
+      providers: [
+        { ...withSlots, activeAuthAccount: 'alt' },
+        { ...withSlots, id: 'broken-selector', activeAuthAccount: 'ghost' },
+        { ...base, id: 'openai', authType: 'api' },
+      ],
+    }, null, 2)}\n`;
+    writeFileSync(path, legacy);
+
+    let message = '';
+    try {
+      loadRegistry(path);
+    } catch (error) {
+      message = (error as Error).message;
+    }
+
+    expect(message).toMatch(
+      /invalid OAuth account selection storage for provider "broken-selector": .+\. Repair it or restore .*providers\.json\.bak/s,
+    );
+    expect(message).not.toContain('openai-oauth"');
+    // Provider ids and slot names are the registry's existing non-secret
+    // identifiers; credential references never belong in a diagnostic.
+    expect(message).not.toMatch(/keyring:/);
+    expect(readFileSync(path, 'utf8')).toBe(legacy);
+  });
+
+  it('accepts the explicit selector clear that the mixed-migration diagnostic asks for', () => {
+    const legacy = `${JSON.stringify({
+      schemaVersion: 3,
+      providers: [
+        { ...withSlots, activeAuthAccount: 'alt' },
+        { ...withSlots, id: 'broken-selector', activeAuthAccount: 'ghost' },
+      ],
+    }, null, 2)}\n`;
+    writeFileSync(path, legacy);
+    expect(() => loadRegistry(path)).toThrow(/invalid OAuth account selection storage/);
+
+    // The repair `clodex providers` performs: clear the unrepairable selector
+    // and keep everything else, including the broken provider's credential.
+    const registry = loadRegistryStrict(path);
+    const broken = registry.providers.find(provider => provider.id === 'broken-selector')!;
+    expect(clearActiveOAuthAccount(broken)).toBe(true);
+    withRegistryWriteLockSync(() => saveRegistry(registry, path), { lockPath: `${path}.lock` });
+
+    const persisted = JSON.parse(readFileSync(path, 'utf8'));
+    expect(persisted.schemaVersion).toBe(5);
+    expect(persisted.providers[1]).toMatchObject({
+      id: 'broken-selector',
+      authRef: base.authRef,
+    });
+    expect(persisted.providers[1].activeAuthAccount).toBeUndefined();
+    expect(persisted.providers[1].defaultAuthRef).toBeUndefined();
+    expect(loadRegistry(path).providers[0]).toMatchObject({
+      activeAuthAccount: 'alt',
+      authRef: withSlots.authAccounts!.alt!.authRef,
+      defaultAuthRef: base.authRef,
+    });
+  });
+
+  it.each([3, 4])(
+    'fails closed on a parked provider default that schema v%s cannot own',
+    schemaVersion => {
+      // Materialized-selection storage in pre-v5 bytes is partial or
+      // downgraded corruption. Dropping the record leniently removed the
+      // provider from every read surface while every mutating path threw.
+      const corrupt = registryWith(
+        { ...withSlots, activeAuthAccount: 'alt', defaultAuthRef: base.authRef },
+        schemaVersion,
+      );
+      writeFileSync(path, corrupt);
+
+      expect(() => loadRegistry(path)).toThrow(
+        /invalid OAuth account selection storage for provider "openai-oauth": .*Repair it or restore .*providers\.json\.bak/s,
+      );
+      expect(() => loadRegistryStrict(path)).toThrow(/invalid provider entry/);
+      expect(readFileSync(path, 'utf8')).toBe(corrupt);
+    },
+  );
+
+  it('fails closed on a parked provider default with no selector in legacy bytes', () => {
+    const corrupt = registryWith({ ...withSlots, defaultAuthRef: base.authRef }, 4);
+    writeFileSync(path, corrupt);
+
+    expect(() => loadRegistry(path)).toThrow(
+      /invalid OAuth account selection storage for provider "openai-oauth": .*Repair it or restore .*providers\.json\.bak/s,
+    );
+    expect(readFileSync(path, 'utf8')).toBe(corrupt);
   });
 
   it('fails closed when a strict-invalid locked winner still contains a selected identity', async () => {

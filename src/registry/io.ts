@@ -244,6 +244,14 @@ function hasPresentInvalidAuthType(raw: unknown): boolean {
     && provider.authType !== 'none';
 }
 
+/** Single home for the registry-repair sentence every diagnostic ends with. */
+function registryRepairGuidance(path: string): string {
+  return `Repair it or restore ${path}.bak, then retry.`;
+}
+
+const SELECTOR_BEFORE_SELECTOR_SCHEMA =
+  'a selected account appears before the selector schema version';
+
 /**
  * Explain the cross-field credential-storage violation for the schema that
  * supplied it. Versions 1-4 are valid migration input only when the parked
@@ -263,7 +271,7 @@ function selectionStorageError(
     return 'an account cache appears before the schema version that establishes its ownership';
   }
   if (name && schemaVersion < REGISTRY_SCHEMA_VERSION_WITH_ACTIVE_ACCOUNT) {
-    return 'a selected account appears before the selector schema version';
+    return SELECTOR_BEFORE_SELECTOR_SCHEMA;
   }
   if (schemaVersion <= REGISTRY_SCHEMA_VERSION_WITH_ACCOUNT_MODEL_CACHES && hasDefault) {
     return 'a parked provider default appears before materialized selection storage';
@@ -312,8 +320,9 @@ class RegistrySelectionStorageError extends Error {
   constructor(
     readonly providerId: string,
     readonly detail: string,
+    options?: ErrorOptions,
   ) {
-    super(detail);
+    super(detail, options);
     this.name = 'RegistrySelectionStorageError';
   }
 }
@@ -335,7 +344,15 @@ function parseRegistry(raw: unknown): ProviderRegistry {
       const selectionError = parsed
         ? selectionStorageError(parsed, schemaVersion)
         : undefined;
-      if (parsed && selectionError && schemaVersion >= REGISTRY_SCHEMA_VERSION_WITH_MATERIALIZED_ACTIVE_ACCOUNT) {
+      // A parked provider default IS materialized-selection storage, so finding
+      // one below v5 is partial or downgraded corruption rather than a legacy
+      // state this build can repair. Dropping such a record leniently would
+      // erase the provider from the very screens that could fix it while every
+      // mutating path already fails loud. A legacy `activeAuthAccount` with no
+      // parked default stays loadable and repairable (see types.ts).
+      const failClosed = schemaVersion >= REGISTRY_SCHEMA_VERSION_WITH_MATERIALIZED_ACTIVE_ACCOUNT
+        || parsed?.defaultAuthRef !== undefined;
+      if (parsed && selectionError && failClosed) {
         throw new RegistrySelectionStorageError(parsed.id, selectionError);
       }
       if (parsed && !invalidKnownSelectionAuthType && !selectionError) providers.push(parsed);
@@ -410,6 +427,27 @@ class RegistrySaveValidationError extends Error {
   }
 }
 
+/**
+ * A save refused because one provider's selection storage is invalid. Carries
+ * the offending provider id and the same non-secret reason the load-side
+ * diagnostic prints, so a mixed legacy registry says which provider to repair
+ * instead of only that some provider is broken.
+ */
+class RegistrySelectionStorageSaveError extends RegistrySaveValidationError {
+  constructor(
+    path: string,
+    readonly providerId: string,
+    readonly detail: string,
+  ) {
+    super(
+      'Provider registry contains invalid OAuth account selection storage '
+      + `for provider "${providerId}": ${detail}. `
+      + registryRepairGuidance(path),
+    );
+    this.name = 'RegistrySelectionStorageSaveError';
+  }
+}
+
 class RegistryPersistenceError extends Error {
   constructor(
     readonly registryPath: string,
@@ -440,7 +478,7 @@ function selectionStorageDiagnostic(
     'Could not safely persist the selected OAuth account before launch. '
     + `The provider registry at ${path} contains an invalid provider entry: `
     + `invalid OAuth account selection storage for provider "${cause.providerId}": ${cause.detail}. `
-    + `Repair it or restore ${path}.bak, then retry.`,
+    + registryRepairGuidance(path),
     { cause },
   );
 }
@@ -538,6 +576,16 @@ export function loadRegistry(path = getProvidersPath()): ProviderRegistry {
         try {
           saveRegistry(current, path);
         } catch (error) {
+          // A refused selection-storage publication is the same corruption the
+          // parser reports, so it takes the same per-provider diagnostic rather
+          // than a second, vaguer wrapper around it.
+          if (error instanceof RegistrySelectionStorageSaveError) {
+            throw new RegistrySelectionStorageError(
+              error.providerId,
+              error.detail,
+              { cause: error },
+            );
+          }
           if (error instanceof RegistrySaveValidationError) {
             throw new RegistryMigrationValidationError(path, error);
           }
@@ -579,7 +627,7 @@ export function loadRegistry(path = getProvidersPath()): ProviderRegistry {
         throw new Error(
           'Could not safely persist the selected OAuth account before launch. '
           + `The provider registry at ${error.registryPath} is invalid: ${error.message} `
-          + `Repair it or restore ${error.registryPath}.bak, then retry.`,
+          + registryRepairGuidance(error.registryPath),
           { cause: error },
         );
       }
@@ -659,11 +707,15 @@ export function saveRegistry(registry: ProviderRegistry, path = getProvidersPath
   // provenance, so the writer cannot know whether authRef is the default or a
   // selected slot. V3/v4 inputs do define authRef as the default and remain
   // safe migration/repair sources, including when the selected slot is missing.
-  if (registry.schemaVersion < REGISTRY_SCHEMA_VERSION_WITH_ACTIVE_ACCOUNT
-    && registry.providers.some(provider => provider.activeAuthAccount !== undefined
-      && provider.defaultAuthRef === undefined)) {
-    throw new RegistrySaveValidationError(
-      'Provider registry contains invalid OAuth account selection storage.',
+  const unmaterializedSelector = registry.schemaVersion < REGISTRY_SCHEMA_VERSION_WITH_ACTIVE_ACCOUNT
+    ? registry.providers.find(provider => provider.activeAuthAccount !== undefined
+      && provider.defaultAuthRef === undefined)
+    : undefined;
+  if (unmaterializedSelector) {
+    throw new RegistrySelectionStorageSaveError(
+      path,
+      unmaterializedSelector.id,
+      SELECTOR_BEFORE_SELECTOR_SCHEMA,
     );
   }
   // Programmatic callers and strict legacy loads may hand this function a
@@ -681,10 +733,9 @@ export function saveRegistry(registry: ProviderRegistry, path = getProvidersPath
   // lenient launchers already read.
   const schemaVersion = registrySchemaVersion(registry);
   for (const provider of registry.providers) {
-    if (!hasValidSelectionStorage(provider, schemaVersion)) {
-      throw new RegistrySaveValidationError(
-        'Provider registry contains invalid OAuth account selection storage.',
-      );
+    const selectionError = selectionStorageError(provider, schemaVersion);
+    if (selectionError) {
+      throw new RegistrySelectionStorageSaveError(path, provider.id, selectionError);
     }
   }
   const serializedRegistry = { ...registry, schemaVersion };
