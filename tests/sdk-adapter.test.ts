@@ -847,6 +847,45 @@ describe('generateAnthropicResponse', () => {
     vi.resetModules();
   });
 
+  it('lets productive forceStream generation outlive the former fixed total deadline', async () => {
+    vi.useFakeTimers();
+    vi.resetModules();
+    async function* stream() {
+      yield { type: 'start' };
+      for (let i = 0; i < 7; i++) {
+        await new Promise(resolve => setTimeout(resolve, 100_000));
+        yield { type: 'text-delta', text: 'x' };
+      }
+      yield { type: 'finish', finishReason: 'stop', totalUsage: { inputTokens: 1, outputTokens: 7 } };
+    }
+    const streamText = vi.fn(() => ({ stream: stream() }));
+    vi.doMock('ai', () => ({
+      generateText: vi.fn(),
+      streamText,
+      tool: vi.fn((spec: unknown) => spec),
+      jsonSchema: vi.fn((schema: unknown) => schema),
+    }));
+
+    try {
+      const { generateAnthropicResponse } = await import('../src/sdk-adapter.js');
+      const settled = generateAnthropicResponse(
+        {} as never,
+        { messages: [] },
+        'gpt-5.6-sol',
+        { forceStream: true },
+      );
+
+      await vi.advanceTimersByTimeAsync(700_000);
+      const body = await settled;
+      expect((body.content as any[])[0]).toEqual({ type: 'text', text: 'xxxxxxx' });
+      expect(streamText.mock.calls[0]![0].abortSignal.aborted).toBe(true);
+    } finally {
+      vi.useRealTimers();
+      vi.doUnmock('ai');
+      vi.resetModules();
+    }
+  });
+
   it('forceStream propagates an SDK error part with its upstream status', async () => {
     vi.resetModules();
     const upstreamError = { statusCode: 401, message: 'Unauthorized' };
