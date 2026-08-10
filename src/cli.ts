@@ -782,6 +782,50 @@ interface FavoritesCommandOptions {
   effortPolicy?: UnsupportedEffortPolicy;
 }
 
+const effortPolicyOptions: Array<{
+  value: UnsupportedEffortPolicy;
+  label: string;
+  hint: string;
+}> = [
+  {
+    value: 'provider-default',
+    label: 'Provider default',
+    hint: 'omit an unsupported effort and let the provider choose',
+  },
+  {
+    value: 'up',
+    label: 'Round up',
+    hint: 'use the nearest supported effort above the request',
+  },
+  {
+    value: 'down',
+    label: 'Round down',
+    hint: 'use the nearest supported effort below the request',
+  },
+  {
+    value: 'exact',
+    label: 'Exact only',
+    hint: 'reject requests whose effort is unsupported',
+  },
+];
+
+function effortPolicyLabel(policy: UnsupportedEffortPolicy): string {
+  return effortPolicyOptions.find(option => option.value === policy)?.label ?? policy;
+}
+
+async function runEffortPolicyConfigurator(): Promise<void> {
+  const current = loadPreferences().effortPolicy ?? DEFAULT_UNSUPPORTED_EFFORT_POLICY;
+  const selected = await p.select<UnsupportedEffortPolicy>({
+    message: 'Unsupported worker effort policy',
+    options: effortPolicyOptions,
+    initialValue: current,
+  });
+  if (p.isCancel(selected) || selected === current) return;
+  savePreferences({ effortPolicy: selected });
+  p.log.success(`Global unsupported-effort policy changed to ${effortPolicyLabel(selected)}.`);
+  p.log.info('Running clodex processes keep their startup policy snapshot; restart them to apply this change.');
+}
+
 /**
  * Interactive alias configurator inside `clodex models`: list saved aliases,
  * re-point one at a different favorite, add, or remove — the picker
@@ -1067,20 +1111,6 @@ export async function runModelsCommand(opts: FavoritesCommandOptions = {}): Prom
   if (favoriteProviders.length === 0) {
     p.log.warn('No providers found.');
     p.log.info(`${pc.dim('Add a provider with ')}${pc.cyan('clodex providers')}${pc.dim('.')}`);
-    // The alias configurator must stay reachable with zero providers: it is
-    // the only interactive home of the "Native default" reset, and a saved
-    // built-in remap would otherwise be stuck until a provider is repaired.
-    const savedAliases = (loadPreferences().modelAliases ?? []).length;
-    const savedRemaps = Object.keys(loadPreferences().builtinModelOverrides ?? {}).length;
-    if (savedAliases > 0 || savedRemaps > 0) {
-      const open = await p.confirm({
-        message: `Configure saved aliases/remaps anyway? (${savedAliases} alias${savedAliases === 1 ? '' : 'es'}, ${savedRemaps} built-in remap${savedRemaps === 1 ? '' : 's'})`,
-        initialValue: savedRemaps > 0,
-      });
-      if (!p.isCancel(open) && open) await runAliasConfigurator(new Map());
-    }
-    relayOutro('Done');
-    return 0;
   }
 
   // Build a flat name lookup: "providerId:modelId" → display label
@@ -1118,6 +1148,12 @@ export async function runModelsCommand(opts: FavoritesCommandOptions = {}): Prom
         ? 'Remove a favorite first to make room'
         : `${allProviders.length} provider${allProviders.length !== 1 ? 's' : ''} available`,
     });
+    const currentEffortPolicy = loadPreferences().effortPolicy ?? DEFAULT_UNSUPPORTED_EFFORT_POLICY;
+    options.push({
+      value: '__effort_policy__',
+      label: `Unsupported effort policy: ${effortPolicyLabel(currentEffortPolicy)}`,
+      hint: 'global policy for unsupported worker-assigned effort',
+    });
     const aliasCount = (loadPreferences().modelAliases ?? []).length;
     options.push({
       value: '__aliases__',
@@ -1138,6 +1174,11 @@ export async function runModelsCommand(opts: FavoritesCommandOptions = {}): Prom
 
     if (p.isCancel(choice) || choice === '__done__') break;
 
+    if (choice === '__effort_policy__') {
+      await runEffortPolicyConfigurator();
+      continue;
+    }
+
     if (choice === '__aliases__') {
       if (favoritesDirty) {
         savePreferences({ favoriteModels: favorites });
@@ -1150,6 +1191,10 @@ export async function runModelsCommand(opts: FavoritesCommandOptions = {}): Prom
     if (choice === '__add__') {
       if (atCap) {
         p.log.warn(`Limit of ${maxFavorites} favorites reached — remove one first.`);
+        continue;
+      }
+      if (favoriteProviders.length === 0) {
+        p.log.warn('No providers found — add one with `clodex providers` first.');
         continue;
       }
 
