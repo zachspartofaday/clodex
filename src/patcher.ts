@@ -90,6 +90,7 @@ import {
 import {
   applyClodexPatches,
   formatPatchSiteLine,
+  patchEntryAliases,
   PatchApplyError,
   projectNativeEffort,
   PATCH_TRANSFORMS_VERSION,
@@ -175,8 +176,8 @@ export interface PatchModelMeta {
 /**
  * Build the patch model config from favorites + aliases.
  * Keys are the bare `clodex:<provider>:<model>` ids (no [1m] suffix — the
- * context patch and the suffix are mutually exclusive). When an entry has an
- * alias, that alias becomes the model's identity inside the patched binary.
+ * context patch and the suffix are mutually exclusive). When an entry has
+ * aliases, every alias becomes a model identity inside the patched binary.
  */
 export function buildPatchModelConfig(
   favorites: Array<{ providerId: string; modelId: string }>,
@@ -222,23 +223,23 @@ export function buildPatchModelConfig(
         ? 'target-not-exposed'
         : 'target-not-favorite',
     })));
-  const aliasByFavorite = new Map(
-    normalizedAliases.aliases
-      .filter(alias => exposedFavoriteTargets.has(`${alias.providerId}:${alias.modelId}`))
-      .map(alias => [
-        `${alias.providerId}:${alias.modelId}`,
-        alias.name,
-      ]),
-  );
+  const aliasesByFavorite = new Map<string, string[]>();
+  for (const alias of normalizedAliases.aliases) {
+    const target = `${alias.providerId}:${alias.modelId}`;
+    if (!exposedFavoriteTargets.has(target)) continue;
+    const targetAliases = aliasesByFavorite.get(target) ?? [];
+    targetAliases.push(alias.name);
+    aliasesByFavorite.set(target, targetAliases);
+  }
 
   for (const favorite of exposedFavorites) {
     const id = stripOneMContextSuffix(httpProxyModelId(favorite.providerId, favorite.modelId));
     if (config[id]) continue;
     const meta = modelMetaFor(favorite.providerId, favorite.modelId);
     const context = meta?.contextWindow;
-    const alias = aliasByFavorite.get(`${favorite.providerId}:${favorite.modelId}`);
+    const modelAliases = aliasesByFavorite.get(`${favorite.providerId}:${favorite.modelId}`);
     const entry: PatchScriptModelConfig[string] = {};
-    if (alias) entry.alias = alias;
+    if (modelAliases?.length) entry.aliases = modelAliases;
     if (context === undefined || context <= 0) unknownWindows.push(id);
     else if (context !== 200_000) entry.context = context;
     const display = meta?.displayName?.trim();
@@ -304,7 +305,7 @@ export function computePatchConfigHash(
     const entry = config[key]!;
     return [
       key,
-      entry.alias ?? null,
+      patchEntryAliases(entry),
       entry.context ?? null,
       entry.display ?? null,
       entry.effort?.levels ?? null,
@@ -923,7 +924,8 @@ export async function applyPatch(
   writePatchManifest(manifest);
 
   const modelCount = Object.keys(desired.config).length;
-  const aliasCount = Object.values(desired.config).filter(entry => entry.alias).length;
+  const aliasCount = Object.values(desired.config)
+    .reduce((count, entry) => count + patchEntryAliases(entry).length, 0);
   const windowCount = Object.values(desired.config).filter(entry => entry.context).length;
   return {
     ok: true,
