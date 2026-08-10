@@ -79,7 +79,11 @@ export function getInferenceRequestLogPath(): string {
   return join(ensureLogsDir(), INFERENCE_REQUEST_LOG);
 }
 
-/** Create a collision-resistant log path for one short-lived process. */
+/**
+ * Create a collision-resistant log path below a forced mode-0700 directory.
+ * The child writer owns its file mode (Claude Code currently creates debug logs
+ * as 0644), so the private parent is the confidentiality boundary.
+ */
 export function getSessionLogPath(label = 'session', extension = 'log'): string {
   const dir = join(ensureLogsDir(), INFERENCE_SESSION_DIR);
   mkdirSync(dir, { recursive: true, mode: DIR_MODE });
@@ -254,6 +258,15 @@ export type InferenceTerminationSource =
   | 'local_shutdown'
   | 'upstream_failure';
 
+export type InferenceTerminalOutcome = 'error';
+
+export type InferenceTerminalCategory =
+  | 'idle_timeout'
+  | 'total_timeout'
+  | 'local_adapter_exception'
+  | 'upstream_error'
+  | 'error_sse';
+
 export interface InferenceResponseLifecycleLogEntry {
   event: InferenceResponseLifecycleEvent;
   requestId: string;
@@ -284,6 +297,11 @@ export interface InferenceResponseLifecycleLogEntry {
   errorSignature?: string;
   failureSource?: InferenceFailureSource;
   terminationSource?: InferenceTerminationSource;
+  terminalOutcome?: InferenceTerminalOutcome;
+  terminalCategory?: InferenceTerminalCategory;
+  elapsedMs?: number;
+  limitMs?: number;
+  outputBegan?: boolean;
 }
 
 export type ProxyLifecycleEvent =
@@ -311,6 +329,22 @@ export interface WebSocketDiagnosticRequestLogEntry {
   route?: 'passthrough' | 'translated';
   headers: Record<string, string | string[] | undefined>;
   body: Record<string, unknown>;
+}
+
+export interface InferenceWebSocketDiagnosticLogEntry extends Record<string, unknown> {
+  event: string;
+}
+
+const SAFE_UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
+const SAFE_REQUEST_TOKEN_RE = /^(?:req|request)[_-][a-zA-Z0-9][a-zA-Z0-9_-]{7,95}$/;
+
+/** Accept only request identifiers whose complete shape is bounded and non-secret-like. */
+export function safeDiagnosticRequestId(value: unknown): string | undefined {
+  if (typeof value !== 'string') return undefined;
+  const normalized = value.trim();
+  return SAFE_UUID_RE.test(normalized) || SAFE_REQUEST_TOKEN_RE.test(normalized)
+    ? normalized
+    : undefined;
 }
 
 const REDACTED_DIAGNOSTIC_HEADER = '[REDACTED]';
@@ -456,6 +490,8 @@ export function writeInferenceResponseLifecycleLog(
   const outputTokens = nonNegativeInteger(entry.outputTokens);
   const cacheCreationInputTokens = nonNegativeInteger(entry.cacheCreationInputTokens);
   const cacheReadInputTokens = nonNegativeInteger(entry.cacheReadInputTokens);
+  const elapsedMs = nonNegativeInteger(entry.elapsedMs);
+  const limitMs = nonNegativeInteger(entry.limitMs);
   writeSecureLogLine(path, JSON.stringify({
     timestamp: new Date().toISOString(),
     event: entry.event,
@@ -487,6 +523,11 @@ export function writeInferenceResponseLifecycleLog(
     ...(entry.errorSignature ? { errorSignature: compactLogValue(entry.errorSignature, 100) } : {}),
     ...(entry.failureSource ? { failureSource: entry.failureSource } : {}),
     ...(entry.terminationSource ? { terminationSource: entry.terminationSource } : {}),
+    ...(entry.terminalOutcome ? { terminalOutcome: entry.terminalOutcome } : {}),
+    ...(entry.terminalCategory ? { terminalCategory: entry.terminalCategory } : {}),
+    ...(elapsedMs !== undefined ? { elapsedMs } : {}),
+    ...(limitMs !== undefined ? { limitMs } : {}),
+    ...(entry.outputBegan !== undefined ? { outputBegan: entry.outputBegan } : {}),
   }));
 }
 
@@ -532,6 +573,74 @@ export function writeWebSocketDiagnosticLog(
   writeSecureLogLine(path, JSON.stringify({
     timestamp: new Date().toISOString(),
     ...entry,
+  }));
+}
+
+const INFERENCE_WS_EVENTS = new Set(['ws_response_error', 'ws_transport_retry']);
+const INFERENCE_WS_SOURCES = new Set([
+  'empty_failure_terminal',
+  'error_frame',
+  'response_event',
+  'socket_close',
+  'socket_error',
+  'socket_send',
+  'unexpected_response',
+]);
+const INFERENCE_WS_OUTCOMES = new Set([
+  'cancelled',
+  'exhausted',
+  'recovered',
+  'started',
+  'terminal',
+]);
+
+function boundedInteger(value: unknown, minimum: number, maximum: number): number | undefined {
+  return typeof value === 'number' && Number.isInteger(value) && value >= minimum && value <= maximum
+    ? value
+    : undefined;
+}
+
+/**
+ * Append the content-free WebSocket facts needed in every inference session.
+ * This is an allowlist serializer: unknown fields and non-terminal response
+ * events are discarded rather than passed through from the raw diagnostic.
+ */
+export function writeInferenceWebSocketDiagnosticLog(
+  path: string,
+  entry: InferenceWebSocketDiagnosticLogEntry,
+): void {
+  if (!INFERENCE_WS_EVENTS.has(entry.event)) return;
+  if (entry.event === 'ws_response_error' && entry.willRetry === true) return;
+
+  const requestId = safeDiagnosticRequestId(entry.requestId);
+  const upstreamRequestId = safeDiagnosticRequestId(entry.upstreamRequestId);
+  const source = typeof entry.source === 'string' && INFERENCE_WS_SOURCES.has(entry.source)
+    ? entry.source
+    : undefined;
+  const rawOutcome = entry.event === 'ws_response_error' ? 'terminal' : entry.outcome;
+  const outcome = typeof rawOutcome === 'string' && INFERENCE_WS_OUTCOMES.has(rawOutcome)
+    ? rawOutcome
+    : undefined;
+  const statusCode = boundedInteger(entry.httpStatusCode, 400, 599)
+    ?? boundedInteger(entry.mappedStatusCode, 400, 599);
+  const closeCode = boundedInteger(entry.closeCode, 0, 4999);
+  const attemptCount = boundedInteger(entry.attemptCount, 1, 2);
+  const replayCount = boundedInteger(entry.replayCount, 0, 1);
+
+  writeSecureLogLine(path, JSON.stringify({
+    timestamp: new Date().toISOString(),
+    event: entry.event,
+    transport: 'openai_responses_websocket',
+    ...(requestId ? { requestId } : {}),
+    ...(source ? { source } : {}),
+    ...(statusCode !== undefined ? { statusCode } : {}),
+    ...(closeCode !== undefined ? { closeCode } : {}),
+    ...(typeof entry.replaySafe === 'boolean' ? { replaySafe: entry.replaySafe } : {}),
+    ...(outcome ? { outcome } : {}),
+    ...(typeof entry.outputBegan === 'boolean' ? { outputBegan: entry.outputBegan } : {}),
+    ...(attemptCount !== undefined ? { attemptCount } : {}),
+    ...(replayCount !== undefined ? { replayCount } : {}),
+    ...(upstreamRequestId ? { upstreamRequestId } : {}),
   }));
 }
 

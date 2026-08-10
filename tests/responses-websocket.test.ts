@@ -304,6 +304,10 @@ describe('createResponsesWebSocketFetch', () => {
       socketErrorCode: 'ECONNRESET',
       frameCount: 0,
       emittedModelData: false,
+      replaySafe: true,
+      outputBegan: false,
+      attemptCount: 2,
+      replayCount: 1,
       errorMessageBytes: 21,
       errorMessageHash: expect.stringMatching(/^[a-f0-9]{16}$/),
     }));
@@ -312,8 +316,13 @@ describe('createResponsesWebSocketFetch', () => {
       outcome: 'recovered',
       requestId: 'req-socket-error',
       connectionId: 2,
+      source: 'socket_error',
       frameCount: 1,
       emittedModelData: false,
+      replaySafe: true,
+      outputBegan: false,
+      attemptCount: 2,
+      replayCount: 1,
     }));
     expect(JSON.stringify(diagnostics)).not.toContain('secret socket failure');
   });
@@ -526,7 +535,10 @@ describe('createResponsesWebSocketFetch', () => {
   });
 
   it('does not retry after model output has reached the downstream stream', async () => {
-    const wsFetch = createResponsesWebSocketFetch(WS_URL);
+    const diagnostics: ResponsesWebSocketDiagnosticEvent[] = [];
+    const wsFetch = createResponsesWebSocketFetch(WS_URL, undefined, {
+      onDiagnostic: event => diagnostics.push(event),
+    });
     const res = await wsFetch('https://x', {
       method: 'POST',
       headers: {},
@@ -547,6 +559,54 @@ describe('createResponsesWebSocketFetch', () => {
     const body = await readAll(res);
     expect(body).toContain('partial output');
     expect(body).toContain('websocket_transport_error');
+    expect(diagnostics).toContainEqual(expect.objectContaining({
+      event: 'ws_response_error',
+      outcome: 'terminal',
+      source: 'socket_error',
+      replaySafe: false,
+      outputBegan: true,
+      attemptCount: 1,
+      replayCount: 0,
+    }));
+    expect(diagnostics).not.toContainEqual(expect.objectContaining({
+      event: 'ws_transport_retry',
+    }));
+  });
+
+  it('records close 1006 after output as terminal and never replays it', async () => {
+    const diagnostics: ResponsesWebSocketDiagnosticEvent[] = [];
+    const wsFetch = createResponsesWebSocketFetch(WS_URL, undefined, {
+      onDiagnostic: event => diagnostics.push(event),
+    });
+    const res = await wsFetch('https://x', {
+      method: 'POST',
+      headers: {},
+      body: JSON.stringify(sessionPayload([])),
+    });
+    const socket = lastSocket();
+    socket.emit('open');
+    socket.emit('message', Buffer.from(JSON.stringify({
+      type: 'response.output_text.delta',
+      delta: 'partial output',
+    })));
+    socket.emit('close', 1006, Buffer.from('SENTINEL-PRIVATE-CLOSE-REASON'));
+
+    expect(fakeSockets).toHaveLength(1);
+    expect(await readAll(res)).toContain('websocket_transport_error');
+    expect(diagnostics).toContainEqual(expect.objectContaining({
+      event: 'ws_response_error',
+      outcome: 'terminal',
+      source: 'socket_close',
+      closeCode: 1006,
+      replaySafe: false,
+      outputBegan: true,
+      attemptCount: 1,
+      replayCount: 0,
+    }));
+    expect(diagnostics).not.toContainEqual(expect.objectContaining({
+      event: 'ws_transport_retry',
+    }));
+    expect(JSON.stringify(diagnostics)).not.toContain('SENTINEL-PRIVATE-CLOSE-REASON');
   });
 
   it('retries a failed incremental continuation with the complete original context', async () => {
@@ -989,6 +1049,55 @@ describe('createResponsesWebSocketFetch', () => {
     // suppressed so a diagnostics consumer does not read one failed request as
     // two distinct failures under disjoint field sets.
     expect(diagnostics.filter(event => event.event === 'ws_response_error')).toHaveLength(1);
+  });
+
+  it('keeps only a tightly shaped upstream request id from an in-band HTTP 500', async () => {
+    const diagnostics: ResponsesWebSocketDiagnosticEvent[] = [];
+    const wsFetch = createResponsesWebSocketFetch(WS_URL, undefined, {
+      onDiagnostic: event => diagnostics.push(event),
+    });
+    const safeId = '123e4567-e89b-42d3-a456-426614174000';
+    const safe = await wsFetch('https://x', {
+      method: 'POST', headers: {}, body: JSON.stringify(sessionPayload([])),
+    });
+    lastSocket().emit('message', Buffer.from(JSON.stringify({
+      type: 'error',
+      status: 500,
+      request_id: safeId,
+      error: { type: 'server_error', message: 'SENTINEL-UPSTREAM-BODY' },
+    })));
+    await readAll(safe);
+
+    expect(diagnostics).toContainEqual(expect.objectContaining({
+      event: 'ws_response_error',
+      outcome: 'terminal',
+      source: 'error_frame',
+      mappedStatusCode: 500,
+      upstreamRequestId: safeId,
+      replaySafe: true,
+      outputBegan: false,
+      attemptCount: 1,
+      replayCount: 0,
+    }));
+
+    const malformed = await wsFetch('https://x', {
+      method: 'POST', headers: {}, body: JSON.stringify(sessionPayload([])),
+    });
+    lastSocket().emit('message', Buffer.from(JSON.stringify({
+      type: 'error',
+      status: 500,
+      request_id: 'sk-secret-like-request-id',
+      error: { type: 'server_error', message: 'SENTINEL-SECOND-BODY' },
+    })));
+    await readAll(malformed);
+
+    const errors = diagnostics.filter(event => event.event === 'ws_response_error');
+    expect(errors).toHaveLength(2);
+    expect(errors[1]).not.toHaveProperty('upstreamRequestId');
+    const serialized = JSON.stringify(errors);
+    expect(serialized).not.toContain('sk-secret-like-request-id');
+    expect(serialized).not.toContain('SENTINEL-UPSTREAM-BODY');
+    expect(serialized).not.toContain('SENTINEL-SECOND-BODY');
   });
 
   it('bounds an upstream-controlled error code in the rejection diagnostic', async () => {
@@ -3511,29 +3620,45 @@ describe('createResponsesWebSocketFetch', () => {
     expect(sent.input).toEqual(full);
   });
 
-  it('starts and resumes TTL clocks only after each response stream finishes', async () => {
+  it('lets active work finish past hard TTL, then retires the socket before reuse', async () => {
     let now = 1_000;
+    const diagnostics: ResponsesWebSocketDiagnosticEvent[] = [];
     const wsFetch = createResponsesWebSocketFetch(WS_URL, undefined, {
-      accountId: 'acct-paused-ttl',
-      nurseryIdleTtlMs: 100,
-      idleTtlMs: 100,
+      accountId: 'acct-physical-hard-ttl',
+      nurseryIdleTtlMs: 10_000,
+      idleTtlMs: 10_000,
       hardTtlMs: 100,
       now: () => now,
+      onDiagnostic: event => diagnostics.push(event),
     });
     const firstInput = [{ role: 'user', content: [{ type: 'input_text', text: 'one' }] }];
     const first = await wsFetch('https://x', {
       method: 'POST', headers: {}, body: JSON.stringify(sessionPayload(firstInput)),
     });
-    const socket = lastSocket();
-    socket.emit('open');
+    const firstSocket = lastSocket();
+    firstSocket.emit('open');
 
-    // The initial stream lasts far longer than every TTL, but none of that
-    // in-flight time should age the retained head.
-    now = 2_000;
-    emitTextResponse(socket, 'resp_pause_1', 'answer one');
+    // cleanupExpiredConnections skips active entries, so another lookup after
+    // the physical hard TTL cannot interrupt this productive response.
+    now = 1_101;
+    const cleanupProbe = await wsFetch('https://x', {
+      method: 'POST',
+      headers: {},
+      body: JSON.stringify(sessionPayload(
+        [{ role: 'user', content: [{ type: 'input_text', text: 'probe' }] }],
+        { prompt_cache_key: 'hard-ttl-cleanup-probe' },
+      )),
+    });
+    expect(firstSocket.close).not.toHaveBeenCalled();
+    const probeSocket = lastSocket();
+    probeSocket.emit('open');
+    emitTextResponse(probeSocket, 'resp_hard_ttl_probe', 'probe answer');
+    await readAll(cleanupProbe);
+
+    emitTextResponse(firstSocket, 'resp_hard_ttl', 'answer one');
     await readAll(first);
+    expect(firstSocket.close).not.toHaveBeenCalled();
 
-    now = 2_050;
     const secondInput = [
       ...firstInput,
       { role: 'assistant', content: [{ type: 'output_text', text: 'answer one' }] },
@@ -3542,26 +3667,22 @@ describe('createResponsesWebSocketFetch', () => {
     const second = await wsFetch('https://x', {
       method: 'POST', headers: {}, body: JSON.stringify(sessionPayload(secondInput)),
     });
-    expect(fakeSockets).toHaveLength(1);
 
-    // Suspend the already-running clocks during another long response.
-    now = 3_050;
-    emitTextResponse(socket, 'resp_pause_2', 'answer two');
-    await readAll(second);
-
-    now = 3_099;
-    const thirdInput = [
-      ...secondInput,
-      { role: 'assistant', content: [{ type: 'output_text', text: 'answer two' }] },
-      { role: 'user', content: [{ type: 'input_text', text: 'three' }] },
-    ];
-    await wsFetch('https://x', {
-      method: 'POST', headers: {}, body: JSON.stringify(sessionPayload(thirdInput)),
+    expect(firstSocket.close).toHaveBeenCalled();
+    expect(fakeSockets).toHaveLength(3);
+    const replacement = lastSocket();
+    replacement.emit('open');
+    const sent = JSON.parse(replacement.send.mock.calls[0]![0] as string);
+    expect(sent.previous_response_id).toBeUndefined();
+    expect(sent.input).toEqual(secondInput);
+    expect(diagnostics.at(-1)).toMatchObject({
+      event: 'ws_head_decision',
+      decision: 'new_partition_head',
+      evictions: [expect.objectContaining({ reason: 'hard_ttl' })],
     });
 
-    expect(fakeSockets).toHaveLength(1);
-    const sent = JSON.parse(socket.send.mock.calls[2]![0] as string);
-    expect(sent.previous_response_id).toBe('resp_pause_2');
+    emitTextResponse(replacement, 'resp_hard_ttl_replacement', 'answer two');
+    await readAll(second);
   });
 
   it('promotes a continued nursery head and preserves it past the nursery TTL at capacity', async () => {

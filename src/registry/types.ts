@@ -86,7 +86,7 @@ export interface CachedModel {
   interleavedReasoningField?: string;
   /** Backend capability: model requires the Responses-Lite request shape (x-openai-internal-codex-responses-lite). */
   useResponsesLite?: boolean;
-  /** Backend capability: model must use the WebSocket Responses transport instead of HTTP. */
+  /** Backend preference metadata for the WebSocket Responses transport; not a capability gate. */
   preferWebSockets?: boolean;
   /** Supported input modalities preserved from curated provider metadata. */
   modalities?: ('text' | 'image')[];

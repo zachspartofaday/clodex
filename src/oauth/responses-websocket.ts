@@ -14,6 +14,7 @@ import { CODEX_RESPONSES_WEBSOCKETS_BETA } from '../constants.js';
 import { outboundWsProxyAgent } from '../outbound-proxy.js';
 import { anthropicErrorType, clampRetryAfterSeconds, frameStatusCode } from '../upstream-error.js';
 import { sanitizeToolInput } from '../tool-input-sanitize.js';
+import { safeDiagnosticRequestId } from '../trace-log.js';
 
 const RESPONSES_LITE_HEADER = 'x-openai-internal-codex-responses-lite';
 const TERMINAL_EVENT_TYPES = new Set(['response.completed', 'response.failed', 'response.incomplete']);
@@ -85,6 +86,7 @@ interface RequestContext {
   emittedModelData: boolean;
   emittedDownstreamData: boolean;
   transportRetryPending: boolean;
+  transportRetrySource?: string;
   outputByIndex: Map<number, OutputAccumulator>;
   outputIndexByItemId: Map<string, number>;
   reasoningPartsByItemId: Map<string, Map<number, ReasoningPartState>>;
@@ -106,7 +108,6 @@ interface ConnectionEntry {
   generation: 'nursery' | 'established' | 'isolated';
   open: boolean;
   createdAt: number;
-  ttlPausedMs: number;
   inFlightStartedAt?: number;
   lastUsedAt: number;
   inFlight: boolean;
@@ -897,6 +898,26 @@ function diagnosticTextFingerprint(
   };
 }
 
+function responseRequestId(event: unknown): string | undefined {
+  if (!event || typeof event !== 'object') return undefined;
+  const record = event as JsonObject;
+  const response = record.response && typeof record.response === 'object'
+    ? record.response as JsonObject
+    : undefined;
+  const error = record.error && typeof record.error === 'object'
+    ? record.error as JsonObject
+    : undefined;
+  const responseError = response?.error && typeof response.error === 'object'
+    ? response.error as JsonObject
+    : undefined;
+  for (const candidate of [record, error, response, responseError]) {
+    if (!candidate) continue;
+    const requestId = safeDiagnosticRequestId(candidate.request_id ?? candidate.requestId);
+    if (requestId) return requestId;
+  }
+  return undefined;
+}
+
 function responseFailureDetails(event: unknown): Record<string, unknown> {
   if (!event || typeof event !== 'object') return {};
   const record = event as JsonObject;
@@ -914,7 +935,9 @@ function responseFailureDetails(event: unknown): Record<string, unknown> {
   const message = typeof error?.message === 'string'
     ? error.message
     : typeof record.message === 'string' ? record.message : undefined;
+  const upstreamRequestId = responseRequestId(event);
   return {
+    ...(upstreamRequestId ? { upstreamRequestId } : {}),
     errorType: boundedDiagnosticIdentifier(error?.type ?? record.type),
     errorCode: boundedDiagnosticIdentifier(error?.code ?? record.code),
     responseStatus: boundedDiagnosticIdentifier(response?.status),
@@ -928,6 +951,7 @@ function emitContextDiagnostic(
   ctx: RequestContext,
   details: { event: string } & Record<string, unknown>,
 ): void {
+  const source = typeof details.source === 'string' ? details.source : ctx.transportRetrySource;
   ctx.emitDiagnostic?.({
     connectionId: entry.debugId,
     generation: entry.generation,
@@ -936,11 +960,16 @@ function emitContextDiagnostic(
     frameCount: ctx.frameCount,
     emittedModelData: ctx.emittedModelData,
     emittedDownstreamData: ctx.emittedDownstreamData,
+    replaySafe: transportReplaySafe(ctx),
+    outputBegan: ctx.emittedModelData || ctx.emittedDownstreamData || ctx.outputByIndex.size > 0,
+    attemptCount: ctx.retried ? 2 : 1,
+    replayCount: ctx.retried ? 1 : 0,
     responseIdReceived: Boolean(ctx.responseId),
     inFlightMs: entry.inFlightStartedAt === undefined
       ? undefined
       : Math.max(0, entry.options.now() - entry.inFlightStartedAt),
     ...details,
+    ...(source ? { source } : {}),
   });
 }
 
@@ -949,7 +978,11 @@ function emitResponseErrorDiagnostic(
   ctx: RequestContext,
   details: Record<string, unknown>,
 ): void {
-  emitContextDiagnostic(entry, ctx, { event: 'ws_response_error', ...details });
+  emitContextDiagnostic(entry, ctx, {
+    event: 'ws_response_error',
+    outcome: details.willRetry === true ? 'retrying' : 'terminal',
+    ...details,
+  });
 }
 
 function diagnosticItemIdHash(value: unknown): string | undefined {
@@ -1351,6 +1384,9 @@ function retryTransportFailure(
 
   ctx.retried = true;
   ctx.transportRetryPending = true;
+  ctx.transportRetrySource = typeof diagnosticDetails.source === 'string'
+    ? diagnosticDetails.source
+    : undefined;
   entry.debug('transport failed before downstream output; retrying once with full context');
   emitContextDiagnostic(entry, ctx, {
     event: 'ws_transport_retry',
@@ -1410,14 +1446,14 @@ function cleanupExpiredConnections(now: number): Array<Record<string, unknown>> 
     const idleTtlMs = entry.generation === 'nursery'
       ? entry.options.nurseryIdleTtlMs
       : entry.options.idleTtlMs;
-    const ttlAgeMs = Math.max(0, now - entry.createdAt - entry.ttlPausedMs);
-    if (ttlAgeMs >= entry.options.hardTtlMs || now - entry.lastUsedAt >= idleTtlMs) {
+    const physicalAgeMs = Math.max(0, now - entry.createdAt);
+    if (physicalAgeMs >= entry.options.hardTtlMs || now - entry.lastUsedAt >= idleTtlMs) {
       entry.debug('evicting expired idle connection');
       evictions.push({
         connectionId: entry.debugId,
         partitionKey: entry.key,
         generation: entry.generation,
-        reason: ttlAgeMs >= entry.options.hardTtlMs
+        reason: physicalAgeMs >= entry.options.hardTtlMs
           ? 'hard_ttl'
           : entry.generation === 'nursery' ? 'nursery_idle_ttl' : 'idle_ttl',
       });
@@ -1506,11 +1542,8 @@ function dispatchContext(entry: ConnectionEntry, ctx: RequestContext): void {
   if (entry.open) sendContext(entry, ctx);
 }
 
-function finishInFlightPeriod(entry: ConnectionEntry, now: number): void {
-  if (entry.inFlightStartedAt !== undefined) {
-    entry.ttlPausedMs += Math.max(0, now - entry.inFlightStartedAt);
-    entry.inFlightStartedAt = undefined;
-  }
+function finishInFlightPeriod(entry: ConnectionEntry): void {
+  entry.inFlightStartedAt = undefined;
 }
 
 function resetContextForRetry(ctx: RequestContext): void {
@@ -1584,6 +1617,7 @@ function handleSocketMessage(entry: ConnectionEntry, data: RawData): void {
       `OpenAI reported the Responses WebSocket connection limit was reached; retry after ${retryAfterSeconds}s`,
       {
         source: 'error_frame',
+        ...(responseRequestId(event) ? { upstreamRequestId: responseRequestId(event) } : {}),
         errorCode,
         mappedStatusCode: 429,
         retryAfterSeconds,
@@ -1670,6 +1704,7 @@ function handleSocketMessage(entry: ConnectionEntry, data: RawData): void {
       retryAfterSeconds === undefined ? reason : `${reason}; retry after ${retryAfterSeconds}s`,
       {
         source: 'error_frame',
+        ...(responseRequestId(event) ? { upstreamRequestId: responseRequestId(event) } : {}),
         // Names the failure. Without it this record — now the ONLY one for a
         // rejection — can carry no indication of what failed, since a bare
         // error frame often has no `code` at all.
@@ -1783,7 +1818,7 @@ function handleSocketMessage(entry: ConnectionEntry, data: RawData): void {
     const failed = FAILURE_EVENT_TYPES.has(type ?? '');
     if (!failed && ctx.responseId && entry.persistent) {
       const now = entry.options.now();
-      finishInFlightPeriod(entry, now);
+      finishInFlightPeriod(entry);
       entry.responseId = ctx.responseId;
       entry.requestInput = inputArray(ctx.originalPayload);
       entry.expectedAssistant = expectedAssistantItems(ctx);
@@ -1835,7 +1870,6 @@ function createConnection(
     generation: persistent ? 'nursery' : 'isolated',
     open: false,
     createdAt: now,
-    ttlPausedMs: 0,
     lastUsedAt: now,
     inFlight: false,
     options,
@@ -2149,9 +2183,7 @@ export function createResponsesWebSocketFetch(
         connectionId: entry.debugId,
         generation: entry.generation,
         inFlight: entry.inFlight,
-        ageMs: Math.max(0, now - entry.createdAt - entry.ttlPausedMs),
-        physicalAgeMs: Math.max(0, now - entry.createdAt),
-        ttlPausedMs: entry.ttlPausedMs,
+        ageMs: Math.max(0, now - entry.createdAt),
         idleMs: Math.max(0, now - entry.lastUsedAt),
         promptChanges: changedPromptFields(entry.promptFieldHashes, promptFieldHashes),
         mismatch: candidateMismatchDetails?.get(entry)

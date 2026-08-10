@@ -533,7 +533,7 @@ describe('effortProviderOptions + deepMergeProviderOptions', () => {
 });
 
 describe('createLanguageModel', () => {
-  it('prefers the current OpenAI OAuth token account claim over stored metadata', async () => {
+  it('prefers the current OAuth account claim and uses WebSocket when preference metadata is omitted', async () => {
     vi.resetModules();
     const responses = vi.fn((modelId: string) => ({ modelId, provider: 'openai-responses' }));
     const chat = vi.fn((modelId: string) => ({ modelId, provider: 'openai-chat' }));
@@ -551,6 +551,40 @@ describe('createLanguageModel', () => {
       apiKey: accessToken,
       authType: 'oauth',
       oauthAccountId: 'stored-acct-456',
+    });
+
+    expect(createOpenAI).toHaveBeenCalledWith({
+      apiKey: accessToken,
+      baseURL: 'https://chatgpt.com/backend-api/codex',
+      fetch: expect.any(Function),
+      headers: {
+        'ChatGPT-Account-Id': 'acct-123',
+        originator: 'clodex',
+      },
+    });
+    expect(responses).toHaveBeenCalledWith('gpt-5.5');
+    vi.doUnmock('@ai-sdk/openai');
+  });
+
+  it('also uses the custom WebSocket fetch when OAuth Responses metadata prefers it', async () => {
+    vi.resetModules();
+    const responses = vi.fn((modelId: string) => ({ modelId, provider: 'openai-responses' }));
+    const chat = vi.fn((modelId: string) => ({ modelId, provider: 'openai-chat' }));
+    const createOpenAI = vi.fn(() => ({ responses, chat }));
+    vi.doMock('@ai-sdk/openai', () => ({ createOpenAI }));
+
+    const header = Buffer.from('{}').toString('base64url');
+    const payload = Buffer.from(JSON.stringify({ chatgpt_account_id: 'acct-123' })).toString('base64url');
+    const accessToken = `${header}.${payload}.sig`;
+
+    const { createLanguageModel: create } = await import('../src/provider-factory.js');
+    await create({
+      npm: '@ai-sdk/openai',
+      modelId: 'gpt-5.5',
+      apiKey: accessToken,
+      authType: 'oauth',
+      oauthAccountId: 'stored-acct-456',
+      preferWebSockets: true,
     });
 
     expect(createOpenAI).toHaveBeenCalledWith({
