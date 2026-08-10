@@ -133,7 +133,7 @@ function observeResponseSse(
   contentEncoding: string | string[] | undefined,
   onUsage?: (usage: ResponseUsage) => void,
   onTerminal?: (terminal: ResponseTerminal) => void,
-): void {
+): Promise<void> | undefined {
   const encoding = (Array.isArray(contentEncoding) ? contentEncoding[0] : contentEncoding)
     ?.trim()
     .toLowerCase();
@@ -153,23 +153,26 @@ function observeResponseSse(
         : undefined;
   if (!decoder) return;
 
-  const onCompressedData = (chunk: Buffer) => {
-    if (!decoder.destroyed) decoder.write(chunk);
-  };
-  const onCompressedEnd = () => {
-    if (!decoder.destroyed) decoder.end();
-  };
-  const cleanup = () => {
-    upstream.off('data', onCompressedData);
-    upstream.off('end', onCompressedEnd);
-    decoder.destroy();
-  };
-  const capture = createResponseSseCapture(onUsage, onTerminal);
-  decoder.on('data', capture);
-  decoder.once('error', cleanup);
-  decoder.once('end', cleanup);
-  upstream.on('data', onCompressedData);
-  upstream.once('end', onCompressedEnd);
+  return new Promise(resolve => {
+    const onCompressedData = (chunk: Buffer) => {
+      if (!decoder.destroyed) decoder.write(chunk);
+    };
+    const onCompressedEnd = () => {
+      if (!decoder.destroyed) decoder.end();
+    };
+    const cleanup = () => {
+      upstream.off('data', onCompressedData);
+      upstream.off('end', onCompressedEnd);
+      decoder.destroy();
+      resolve();
+    };
+    const capture = createResponseSseCapture(onUsage, onTerminal);
+    decoder.on('data', capture);
+    decoder.once('error', cleanup);
+    decoder.once('end', cleanup);
+    upstream.on('data', onCompressedData);
+    upstream.once('end', onCompressedEnd);
+  });
 }
 
 export interface HttpProxyOptions {
@@ -249,16 +252,17 @@ function copyResponse(
   onErrorResponse?: (statusCode: number, body: string) => void,
   onResponseUsage?: (usage: ResponseUsage) => void,
   onResponseTerminal?: (terminal: ResponseTerminal) => void,
-): void {
+): Promise<void> | undefined {
   const statusCode = upstream.statusCode ?? 502;
   const contentType = upstream.headers['content-type'];
+  let responseInspection: Promise<void> | undefined;
   if (
     statusCode < 400
     && (onResponseUsage || onResponseTerminal)
     && typeof contentType === 'string'
     && contentType.includes('text/event-stream')
   ) {
-    observeResponseSse(
+    responseInspection = observeResponseSse(
       upstream,
       upstream.headers['content-encoding'],
       onResponseUsage,
@@ -295,6 +299,7 @@ function copyResponse(
     res.destroy();
   });
   upstream.pipe(res);
+  return responseInspection;
 }
 
 function requestHeadersWithoutProxyHeaders(req: http.IncomingMessage): string[] {
@@ -523,6 +528,7 @@ function forwardToAdapter(
     let failed = false;
     let clientDisconnected = false;
     let responseTerminal: ResponseTerminal | undefined;
+    let responseInspection: Promise<void> | undefined;
     let adapterResponse: http.IncomingMessage | undefined;
     let upstream: http.ClientRequest | undefined;
 
@@ -567,28 +573,35 @@ function forwardToAdapter(
 
     res.once('finish', () => {
       stopProgress();
-      if (failed || clientDisconnected) return;
-      const now = Date.now();
-      if (responseTerminal) {
-        failed = true;
-        writeLifecycle('response_failed', {
+      const classifyResponse = () => {
+        if (failed || clientDisconnected) return;
+        const now = Date.now();
+        if (responseTerminal) {
+          failed = true;
+          writeLifecycle('response_failed', {
+            statusCode,
+            durationMs: now - startedAt,
+            ...(firstByteAt !== undefined ? { timeToFirstByteMs: firstByteAt - startedAt } : {}),
+            bytes,
+            chunks,
+            ...responseTerminal,
+            terminationSource: 'upstream_failure',
+          });
+          return;
+        }
+        writeLifecycle('response_completed', {
           statusCode,
           durationMs: now - startedAt,
           ...(firstByteAt !== undefined ? { timeToFirstByteMs: firstByteAt - startedAt } : {}),
           bytes,
           chunks,
-          ...responseTerminal,
-          terminationSource: 'upstream_failure',
         });
+      };
+      if (responseInspection) {
+        void responseInspection.then(classifyResponse);
         return;
       }
-      writeLifecycle('response_completed', {
-        statusCode,
-        durationMs: now - startedAt,
-        ...(firstByteAt !== undefined ? { timeToFirstByteMs: firstByteAt - startedAt } : {}),
-        bytes,
-        chunks,
-      });
+      classifyResponse();
     });
     res.once('close', () => {
       stopProgress();
@@ -674,7 +687,7 @@ function forwardToAdapter(
         bytes += chunk.length;
         chunks += 1;
       });
-      copyResponse(
+      responseInspection = copyResponse(
         upstreamRes,
         res,
         undefined,
