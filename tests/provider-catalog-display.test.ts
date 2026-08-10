@@ -1,5 +1,5 @@
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
-import { mkdtempSync, rmSync } from 'node:fs';
+import { mkdtempSync, rmSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { tmpdir } from 'node:os';
 import * as env from '../src/env.js';
@@ -13,6 +13,7 @@ import {
 import { emptyRegistry, saveRegistry } from '../src/registry/io.js';
 import { withRegistryWriteLockSync } from '../src/registry/lock.js';
 import { NATIVE_CLAUDE_CODE_OAUTH_BETA_PROVENANCE } from '../src/anthropic-beta-policy.js';
+import { getProvidersPath } from '../src/paths.js';
 
 const TEST_HELPER_REF = `helper:v1:${'a'.repeat(64)}:oauth:provider:openai-oauth`;
 
@@ -246,6 +247,14 @@ describe('provider-catalog-display', () => {
         api: { npm: '@ai-sdk/openai' },
         addedAt: new Date().toISOString(),
       });
+      if (activeAuthAccount) registry.schemaVersion = 3;
+      if (activeAuthAccount && activeAuthAccount !== 'zachspartofaday'
+        && (overrides.authType ?? 'oauth') === 'oauth') {
+        // A current writer refuses to publish a broken v5 selector. Persist
+        // genuine legacy v3 repair input to exercise the display path.
+        writeFileSync(getProvidersPath(), `${JSON.stringify(registry, null, 2)}\n`);
+        return;
+      }
       withRegistryWriteLockSync(() => saveRegistry(registry));
     }
 
@@ -288,6 +297,11 @@ describe('provider-catalog-display', () => {
         modelFormat: 'openai' as const,
       });
       const registry = emptyRegistry();
+      registry.schemaVersion = 4;
+      const workCache = {
+        fetchedAt: '2026-08-09T00:00:00.000Z',
+        models: [model('work-a'), model('work-b')],
+      };
       registry.providers.push({
         id: 'openai-oauth',
         templateId: 'openai',
@@ -300,6 +314,7 @@ describe('provider-catalog-display', () => {
           work: {
             authRef: 'keyring:oauth:provider:openai-oauth:account:work::credential::v1:w',
             addedAt: '2026-08-09T00:00:00.000Z',
+            modelsCache: workCache,
           },
           alt: {
             authRef: 'keyring:oauth:provider:openai-oauth:account:alt::credential::v1:a',
@@ -312,10 +327,7 @@ describe('provider-catalog-display', () => {
         },
         api: { npm: '@ai-sdk/openai' },
         addedAt: '2026-08-09T00:00:00.000Z',
-        modelsCache: {
-          fetchedAt: '2026-08-09T00:00:00.000Z',
-          models: [model('work-a'), model('work-b')],
-        },
+        modelsCache: workCache,
       });
       withRegistryWriteLockSync(() => saveRegistry(registry));
       process.env.CLODEX_OAUTH_ACCOUNT = 'alt';
@@ -326,6 +338,16 @@ describe('provider-catalog-display', () => {
 
     it('does not count an OAuth account cache for a provider-key credential', async () => {
       const registry = emptyRegistry();
+      registry.schemaVersion = 4;
+      const workCache = {
+        fetchedAt: '2026-08-09T00:00:00.000Z',
+        models: [{
+          id: 'work-only',
+          name: 'Work only',
+          upstreamModelId: 'work-only',
+          modelFormat: 'openai' as const,
+        }],
+      };
       registry.providers.push({
         id: 'openai-oauth',
         templateId: 'openai',
@@ -338,19 +360,12 @@ describe('provider-catalog-display', () => {
           work: {
             authRef: 'keyring:oauth:provider:openai-oauth:account:work::credential::v1:w',
             addedAt: '2026-08-09T00:00:00.000Z',
+            modelsCache: workCache,
           },
         },
         api: { npm: '@ai-sdk/openai' },
         addedAt: '2026-08-09T00:00:00.000Z',
-        modelsCache: {
-          fetchedAt: '2026-08-09T00:00:00.000Z',
-          models: [{
-            id: 'work-only',
-            name: 'Work only',
-            upstreamModelId: 'work-only',
-            modelFormat: 'openai',
-          }],
-        },
+        modelsCache: workCache,
       });
       withRegistryWriteLockSync(() => saveRegistry(registry));
       process.env.CLODEX_KEY_OPENAI_OAUTH = 'provider-override-token';
@@ -423,6 +438,7 @@ describe('provider-catalog-display', () => {
       // credential "default" too would render two identical entries and mark
       // both active, leaving the listing unable to answer its only question.
       const registry = emptyRegistry();
+      registry.schemaVersion = 3;
       registry.providers.push({
         id: 'openai-oauth',
         templateId: 'openai',

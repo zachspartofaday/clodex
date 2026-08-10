@@ -346,6 +346,227 @@ describe('authenticateProvider', () => {
     );
   });
 
+  it('updates the selected top ref with an active named-slot reauthentication', async () => {
+    const defaultRef = 'keyring:oauth:provider:openai-oauth::credential::v1:default-old';
+    const oldSelectedRef = 'keyring:oauth:provider:openai-oauth:account:work::credential::v1:old';
+    const newSelectedRef = credentialInstanceAuthRef('oauth:provider:openai-oauth:account:work');
+    const cache = {
+      fetchedAt: '2026-08-09T00:00:00.000Z',
+      models: [{
+        id: 'old-work-model',
+        name: 'Old work model',
+        upstreamModelId: 'old-work-model',
+        modelFormat: 'openai' as const,
+      }],
+    };
+    registryState.current = {
+      schemaVersion: 5,
+      providers: [{
+        id: 'openai-oauth',
+        templateId: 'openai',
+        name: 'OpenAI (ChatGPT)',
+        enabled: true,
+        authType: 'oauth',
+        authRef: oldSelectedRef,
+        defaultAuthRef: defaultRef,
+        activeAuthAccount: 'work',
+        authAccounts: {
+          work: {
+            authRef: oldSelectedRef,
+            addedAt: '2026-08-09T00:00:00.000Z',
+            modelsCache: structuredClone(cache),
+          },
+        },
+        modelsCache: structuredClone(cache),
+        refreshedAt: cache.fetchedAt,
+        api: { npm: '@ai-sdk/openai', url: 'https://api.openai.com/v1' },
+        addedAt: '2026-08-09T00:00:00.000Z',
+      }],
+    };
+
+    await authenticateProvider('openai', { account: 'work' });
+
+    expect(registryState.current.providers[0]).toMatchObject({
+      authRef: newSelectedRef,
+      defaultAuthRef: defaultRef,
+      activeAuthAccount: 'work',
+      authAccounts: { work: { authRef: newSelectedRef } },
+    });
+    expect(registryState.current.providers[0]?.modelsCache).toBeUndefined();
+    expect(registryState.current.providers[0]?.authAccounts?.work?.modelsCache).toBeUndefined();
+    expect(deleteProviderCredential).toHaveBeenCalledWith(oldSelectedRef);
+    expect(deleteProviderCredential).not.toHaveBeenCalledWith(defaultRef);
+  });
+
+  it('replaces only the parked provider default while a named slot is selected', async () => {
+    const oldDefaultRef = 'keyring:oauth:provider:openai-oauth::credential::v1:default-old';
+    const selectedRef = credentialInstanceAuthRef('oauth:provider:openai-oauth:account:work');
+    const cache = {
+      fetchedAt: '2026-08-09T00:00:00.000Z',
+      models: [{
+        id: 'work-model',
+        name: 'Work model',
+        upstreamModelId: 'work-model',
+        modelFormat: 'openai' as const,
+      }],
+    };
+    registryState.current = {
+      schemaVersion: 5,
+      providers: [{
+        id: 'openai-oauth',
+        templateId: 'openai',
+        name: 'OpenAI (ChatGPT)',
+        enabled: true,
+        authType: 'oauth',
+        authRef: selectedRef,
+        defaultAuthRef: oldDefaultRef,
+        activeAuthAccount: 'work',
+        authAccounts: {
+          work: {
+            authRef: selectedRef,
+            addedAt: '2026-08-09T00:00:00.000Z',
+            modelsCache: structuredClone(cache),
+          },
+        },
+        modelsCache: structuredClone(cache),
+        refreshedAt: cache.fetchedAt,
+        api: { npm: '@ai-sdk/openai', url: 'https://api.openai.com/v1' },
+        addedAt: '2026-08-09T00:00:00.000Z',
+      }],
+    };
+
+    const result = await authenticateProvider('openai');
+
+    expect(result.registryProvider).toMatchObject({
+      authRef: selectedRef,
+      defaultAuthRef: credentialRef,
+      activeAuthAccount: 'work',
+    });
+    expect(result.registryProvider.modelsCache).toEqual(cache);
+    expect(result.registryProvider.authAccounts?.work?.modelsCache).toEqual(cache);
+    expect(deleteProviderCredential).toHaveBeenCalledWith(oldDefaultRef);
+    expect(deleteProviderCredential).not.toHaveBeenCalledWith(selectedRef);
+  });
+
+  it('reauthenticates an inactive named slot without changing selected or default routing', async () => {
+    const defaultRef = 'keyring:oauth:provider:openai-oauth::credential::v1:default-old';
+    const selectedRef = credentialInstanceAuthRef('oauth:provider:openai-oauth:account:alt');
+    const oldWorkRef = 'keyring:oauth:provider:openai-oauth:account:work::credential::v1:old';
+    const newWorkRef = credentialInstanceAuthRef('oauth:provider:openai-oauth:account:work');
+    registryState.current = {
+      schemaVersion: 5,
+      providers: [{
+        id: 'openai-oauth',
+        templateId: 'openai',
+        name: 'OpenAI (ChatGPT)',
+        enabled: true,
+        authType: 'oauth',
+        authRef: selectedRef,
+        defaultAuthRef: defaultRef,
+        activeAuthAccount: 'alt',
+        authAccounts: {
+          alt: { authRef: selectedRef, addedAt: '2026-08-09T00:00:00.000Z' },
+          work: { authRef: oldWorkRef, addedAt: '2026-08-09T00:00:00.000Z' },
+        },
+        api: { npm: '@ai-sdk/openai', url: 'https://api.openai.com/v1' },
+        addedAt: '2026-08-09T00:00:00.000Z',
+      }],
+    };
+
+    await authenticateProvider('openai', { account: 'work' });
+
+    expect(registryState.current.providers[0]).toMatchObject({
+      authRef: selectedRef,
+      defaultAuthRef: defaultRef,
+      activeAuthAccount: 'alt',
+      authAccounts: {
+        alt: { authRef: selectedRef },
+        work: { authRef: newWorkRef },
+      },
+    });
+    expect(deleteProviderCredential).toHaveBeenCalledWith(oldWorkRef);
+    expect(deleteProviderCredential).not.toHaveBeenCalledWith(selectedRef);
+    expect(deleteProviderCredential).not.toHaveBeenCalledWith(defaultRef);
+  });
+
+  it.each(['ghost', 'constructor'])(
+    'repairs a legacy selected %s slot that disappeared by reauthenticating that exact name',
+    async account => {
+      const defaultRef = 'keyring:oauth:provider:openai-oauth::credential::v1:default-old';
+      const repairedRef = credentialInstanceAuthRef(`oauth:provider:openai-oauth:account:${account}`);
+      registryState.current = {
+        schemaVersion: 3,
+        providers: [{
+          id: 'openai-oauth',
+          templateId: 'openai',
+          name: 'OpenAI (ChatGPT)',
+          enabled: true,
+          authType: 'oauth',
+          authRef: defaultRef,
+          activeAuthAccount: account,
+          authAccounts: {
+            work: { authRef: 'keyring:oauth:work', addedAt: '2026-08-09T00:00:00.000Z' },
+          },
+          api: { npm: '@ai-sdk/openai', url: 'https://api.openai.com/v1' },
+          addedAt: '2026-08-09T00:00:00.000Z',
+        }],
+      };
+
+      await authenticateProvider('openai', { account });
+
+      expect(registryState.current.providers[0]).toMatchObject({
+        authRef: repairedRef,
+        defaultAuthRef: defaultRef,
+        activeAuthAccount: account,
+        authAccounts: { [account]: { authRef: repairedRef } },
+      });
+      expect(Object.prototype.hasOwnProperty.call(
+        registryState.current.providers[0]?.authAccounts,
+        account,
+      )).toBe(true);
+    },
+  );
+
+  it.each(['ghost', 'constructor'])(
+    'does not fall back to the default when default reauth sees broken %s selector',
+    async account => {
+      const oldDefaultRef = 'keyring:oauth:provider:openai-oauth::credential::v1:default-old';
+      registryState.current = {
+        schemaVersion: 3,
+        providers: [{
+          id: 'openai-oauth',
+          templateId: 'openai',
+          name: 'OpenAI (ChatGPT)',
+          enabled: true,
+          authType: 'oauth',
+          authRef: oldDefaultRef,
+          activeAuthAccount: account,
+          authAccounts: {
+            work: { authRef: 'keyring:oauth:work', addedAt: '2026-08-09T00:00:00.000Z' },
+          },
+          api: { npm: '@ai-sdk/openai', url: 'https://api.openai.com/v1' },
+          addedAt: '2026-08-09T00:00:00.000Z',
+        }],
+      };
+
+      await expect(authenticateProvider('openai')).rejects.toThrow(
+        new RegExp(`account "${account}".*no longer exists`),
+      );
+
+      expect(registryState.current.providers[0]).toMatchObject({
+        authRef: oldDefaultRef,
+        activeAuthAccount: account,
+      });
+      expect(registryState.current.providers[0]?.defaultAuthRef).toBeUndefined();
+      expect(Object.prototype.hasOwnProperty.call(
+        registryState.current.providers[0]?.authAccounts,
+        account,
+      )).toBe(false);
+      expect(refreshProviderModels).not.toHaveBeenCalled();
+      expect(journalState.pending).toContain(credentialRef);
+    },
+  );
+
   it('reports a returned model-refresh failure instead of claiming success', async () => {
     const stop = vi.fn();
     vi.mocked(prompts.spinner)

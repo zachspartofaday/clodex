@@ -339,34 +339,46 @@ describe('interactive OAuth account switching', () => {
   const prevAccountOverride = process.env.CLODEX_OAUTH_ACCOUNT;
 
   function slottedProvider(activeAuthAccount?: string, enabled = true): RegistryProvider {
+    const defaultAuthRef = 'keyring:oauth:provider:openai-oauth::credential::v1:default';
+    const modelsCache = {
+      fetchedAt: '2026-08-09T00:00:00.000Z',
+      models: [{
+        id: 'default-only-model',
+        name: 'Default-only model',
+        upstreamModelId: 'default-only-model',
+        modelFormat: 'openai' as const,
+      }],
+    };
+    const authAccounts: NonNullable<RegistryProvider['authAccounts']> = {
+      work: {
+        authRef: 'keyring:oauth:provider:openai-oauth:account:work::credential::v1:w',
+        addedAt: '2026-08-09T00:00:00.000Z',
+      },
+      alt: {
+        authRef: 'keyring:oauth:provider:openai-oauth:account:alt::credential::v1:a',
+        addedAt: '2026-08-09T00:00:00.000Z',
+      },
+    };
+    if (activeAuthAccount && authAccounts[activeAuthAccount]) {
+      authAccounts[activeAuthAccount] = {
+        ...authAccounts[activeAuthAccount],
+        modelsCache: structuredClone(modelsCache),
+      };
+    }
     return {
       id: 'openai-oauth',
       templateId: 'openai',
       name: 'OpenAI (ChatGPT)',
       enabled,
-      authRef: 'keyring:oauth:provider:openai-oauth::credential::v1:default',
+      authRef: activeAuthAccount
+        ? authAccounts[activeAuthAccount]!.authRef
+        : defaultAuthRef,
+      ...(activeAuthAccount ? { defaultAuthRef } : {}),
       authType: 'oauth',
-      authAccounts: {
-        work: {
-          authRef: 'keyring:oauth:provider:openai-oauth:account:work::credential::v1:w',
-          addedAt: '2026-08-09T00:00:00.000Z',
-        },
-        alt: {
-          authRef: 'keyring:oauth:provider:openai-oauth:account:alt::credential::v1:a',
-          addedAt: '2026-08-09T00:00:00.000Z',
-        },
-      },
+      authAccounts,
       ...(activeAuthAccount ? { activeAuthAccount } : {}),
       api: { npm: '@ai-sdk/openai', url: 'https://api.openai.com/v1' },
-      modelsCache: {
-        fetchedAt: '2026-08-09T00:00:00.000Z',
-        models: [{
-          id: 'default-only-model',
-          name: 'Default-only model',
-          upstreamModelId: 'default-only-model',
-          modelFormat: 'openai',
-        }],
-      },
+      modelsCache,
       addedAt: '2026-08-09T00:00:00.000Z',
     };
   }

@@ -7,6 +7,7 @@ import {
   type ResolvedProviderCredential,
 } from '../env.js';
 import { OAUTH_ACCOUNT_ENV } from '../oauth-account-selection.js';
+import { getOAuthAccountSlot } from './oauth-account-storage.js';
 import type { RegistryProvider } from './types.js';
 import { effectiveProviderCachedModels } from '../data/opencode-go-models.js';
 
@@ -56,7 +57,7 @@ export function refreshCredentialSnapshot(
   const activeAuthAccount = provider.activeAuthAccount?.trim() || undefined;
   const selectedName = environmentAccount || activeAuthAccount;
   const selectedAccount = provider.authType === 'oauth' && selectedName
-    ? provider.authAccounts?.[selectedName]
+    ? getOAuthAccountSlot(provider, selectedName)
     : undefined;
   const credentialOverride = effective.authType !== 'none'
     && effective.authRef !== 'none:anonymous'

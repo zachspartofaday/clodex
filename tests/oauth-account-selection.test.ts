@@ -1,4 +1,5 @@
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
+import { spawn } from 'node:child_process';
 import { mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
@@ -16,6 +17,7 @@ import {
 import { resolveActiveAccount } from '../src/provider-catalog.js';
 import { emptyRegistry, loadRegistry, loadRegistryStrict, saveRegistry } from '../src/registry/io.js';
 import { credentialIsReferenced } from '../src/registry/credential-lifecycle.js';
+import { clearActiveOAuthAccount } from '../src/registry/oauth-account-storage.js';
 import { withRegistryWriteLockSync } from '../src/registry/lock.js';
 import { oauthProviderIdFromAccount } from '../src/env.js';
 import type { RegistryModelsCache, RegistryProvider } from '../src/registry/types.js';
@@ -258,8 +260,60 @@ describe('authAccounts registry persistence', () => {
     rmSync(home, { recursive: true, force: true });
   });
 
-  function registryWith(provider: unknown): string {
-    return `${JSON.stringify({ schemaVersion: 1, providers: [provider] }, null, 2)}\n`;
+  function registryWith(provider: unknown, schemaVersion = 1): string {
+    return `${JSON.stringify({ schemaVersion, providers: [provider] }, null, 2)}\n`;
+  }
+
+  async function replaceRegistryWhileMigrationWaits<T>(
+    replacement: string,
+    operation: () => T,
+  ): Promise<T> {
+    const childScript = `
+      const fs = require('node:fs');
+      const [target, lock, encoded] = process.argv.slice(1);
+      fs.writeFileSync(lock, JSON.stringify({
+        pid: process.pid,
+        startedAt: Date.now(),
+        token: 'migration-race',
+      }), { mode: 0o600 });
+      process.stdout.write('ready\\n');
+      setTimeout(() => {
+        try {
+          fs.writeFileSync(target, Buffer.from(encoded, 'base64'));
+        } finally {
+          try { fs.unlinkSync(lock); } catch {}
+        }
+      }, 100);
+    `;
+    const child = spawn(process.execPath, [
+      '-e',
+      childScript,
+      path,
+      `${path}.lock`,
+      Buffer.from(replacement).toString('base64'),
+    ], { stdio: ['ignore', 'pipe', 'pipe'] });
+    await new Promise<void>((resolve, reject) => {
+      let ready = false;
+      child.once('error', reject);
+      child.once('exit', code => {
+        if (!ready) reject(new Error(`migration race helper exited early (${code ?? 'signal'})`));
+      });
+      child.stdout!.once('data', () => {
+        ready = true;
+        resolve();
+      });
+    });
+
+    try {
+      return operation();
+    } finally {
+      if (child.exitCode === null) {
+        await new Promise<void>((resolve, reject) => {
+          child.once('error', reject);
+          child.once('exit', () => resolve());
+        });
+      }
+    }
   }
 
   it('named slots survive load → save-back → load', () => {
@@ -274,11 +328,9 @@ describe('authAccounts registry persistence', () => {
     expect(loadRegistryStrict(path).providers[0]!.authAccounts).toEqual(withSlots.authAccounts);
   });
 
-  it('persists account-specific caches behind the v4 writer fence', () => {
+  it('persists account-specific caches behind the v4 writer fence without a selector', () => {
     const cachedProvider: RegistryProvider = {
       ...withSlots,
-      activeAuthAccount: 'work',
-      modelsCache: modelsCache('work-only'),
       authAccounts: {
         ...withSlots.authAccounts,
         work: { ...withSlots.authAccounts!.work!, modelsCache: modelsCache('work-only') },
@@ -348,43 +400,454 @@ describe('authAccounts registry persistence', () => {
     expect(() => loadRegistryStrict(path)).toThrow(/unsupported schema version/);
   });
 
-  it('the stored selection survives load → save-back → load', () => {
-    writeFileSync(path, registryWith({ ...withSlots, activeAuthAccount: 'alt' }));
+  it('migrates a v3 selection, round-trips v5, and gives an old launch the selected identity', () => {
+    writeFileSync(path, registryWith({ ...withSlots, activeAuthAccount: 'alt' }, 3));
     const loaded = loadRegistry(path);
-    expect(loaded.providers[0]!.activeAuthAccount).toBe('alt');
+    expect(loaded.providers[0]).toMatchObject({
+      activeAuthAccount: 'alt',
+      authRef: withSlots.authAccounts!.alt!.authRef,
+      defaultAuthRef: base.authRef,
+    });
     withRegistryWriteLockSync(() => saveRegistry(loaded, path), { lockPath: `${path}.lock` });
-    expect(loadRegistryStrict(path).providers[0]!.activeAuthAccount).toBe('alt');
+    const persisted = JSON.parse(readFileSync(path, 'utf8'));
+    expect(persisted.schemaVersion).toBe(5);
+    expect(persisted.providers[0]).toMatchObject({
+      activeAuthAccount: 'alt',
+      authRef: withSlots.authAccounts!.alt!.authRef,
+      defaultAuthRef: base.authRef,
+    });
+    expect(loadRegistryStrict(path).providers[0]).toEqual(loaded.providers[0]);
+
+    // Model the pre-selector lenient parser: it ignores schemaVersion and the
+    // two selector fields, but retains authRef. The downgraded launch therefore
+    // uses the selected identity instead of silently reverting to the default.
+    expect({ authRef: persisted.providers[0].authRef }).toEqual({
+      authRef: withSlots.authAccounts!.alt!.authRef,
+    });
+
+    const loadedAgain = loadRegistry(path);
+    expect(loadedAgain.providers[0]).toEqual(loadRegistryStrict(path).providers[0]);
+    expect(JSON.parse(readFileSync(path, 'utf8'))).toEqual(persisted);
   });
+
+  it('fails closed when selected-identity migration cannot persist beside a malformed sibling', () => {
+    const legacy = `${JSON.stringify({
+      schemaVersion: 3,
+      providers: [
+        { ...withSlots, activeAuthAccount: 'alt' },
+        {
+          id: 'malformed-sibling',
+          templateId: 'openai',
+          name: 'Malformed sibling',
+          enabled: true,
+          // Missing authRef: the lenient parser drops this sibling, while the
+          // authoritative strict reread under the migration lock rejects it.
+          authType: 'api',
+          api: { npm: '@ai-sdk/openai', url: 'https://api.example.test/v1' },
+          addedAt: '2026-08-09T00:00:00.000Z',
+        },
+      ],
+    }, null, 2)}\n`;
+    writeFileSync(path, legacy);
+
+    expect(() => loadRegistry(path)).toThrow(
+      new RegExp(
+        `Could not safely persist the selected OAuth account before launch.*${path.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}`
+        + `.*invalid provider entry.*Repair it or restore ${`${path}.bak`.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}`,
+        's',
+      ),
+    );
+    expect(readFileSync(path, 'utf8')).toBe(legacy);
+  });
+
+  it('classifies migration durability from the locked winner, not the stale pre-lock registry', async () => {
+    const renameOnly = registryWith({ ...base, id: 'openai' });
+    const selectedWinner = `${JSON.stringify({
+      schemaVersion: 3,
+      providers: [
+        { ...withSlots, activeAuthAccount: 'alt' },
+        { ...withSlots, id: 'broken-selector', activeAuthAccount: 'ghost' },
+      ],
+    }, null, 2)}\n`;
+    writeFileSync(path, renameOnly);
+
+    await expect(replaceRegistryWhileMigrationWaits(
+      selectedWinner,
+      () => loadRegistry(path),
+    )).rejects.toThrow(/invalid OAuth account selection storage.*Repair it or restore.*providers\.json\.bak/s);
+    expect(readFileSync(path, 'utf8')).toBe(selectedWinner);
+  });
+
+  it('gives registry-repair guidance for deterministic v5 publication validation failures', () => {
+    const legacy = `${JSON.stringify({
+      schemaVersion: 3,
+      providers: [
+        { ...withSlots, activeAuthAccount: 'alt' },
+        { ...withSlots, id: 'broken-selector', activeAuthAccount: 'ghost' },
+      ],
+    }, null, 2)}\n`;
+    writeFileSync(path, legacy);
+
+    expect(() => loadRegistry(path)).toThrow(
+      /invalid OAuth account selection storage.*Repair it or restore.*providers\.json\.bak/s,
+    );
+    expect(readFileSync(path, 'utf8')).toBe(legacy);
+  });
+
+  it('names the offending provider when one legacy selector blocks a mixed migration', () => {
+    // Two providers, one migratable and one not: the diagnostic has to say
+    // WHICH provider to repair, or the only actionable step is bisecting the
+    // file by hand.
+    const legacy = `${JSON.stringify({
+      schemaVersion: 3,
+      providers: [
+        { ...withSlots, activeAuthAccount: 'alt' },
+        { ...withSlots, id: 'broken-selector', activeAuthAccount: 'ghost' },
+        { ...base, id: 'openai', authType: 'api' },
+      ],
+    }, null, 2)}\n`;
+    writeFileSync(path, legacy);
+
+    let message = '';
+    try {
+      loadRegistry(path);
+    } catch (error) {
+      message = (error as Error).message;
+    }
+
+    expect(message).toMatch(
+      /invalid OAuth account selection storage for provider "broken-selector": .+\. Repair it or restore .*providers\.json\.bak/s,
+    );
+    expect(message).not.toContain('openai-oauth"');
+    // Provider ids and slot names are the registry's existing non-secret
+    // identifiers; credential references never belong in a diagnostic.
+    expect(message).not.toMatch(/keyring:/);
+    expect(readFileSync(path, 'utf8')).toBe(legacy);
+  });
+
+  it('accepts the explicit selector clear that the mixed-migration diagnostic asks for', () => {
+    const legacy = `${JSON.stringify({
+      schemaVersion: 3,
+      providers: [
+        { ...withSlots, activeAuthAccount: 'alt' },
+        { ...withSlots, id: 'broken-selector', activeAuthAccount: 'ghost' },
+      ],
+    }, null, 2)}\n`;
+    writeFileSync(path, legacy);
+    expect(() => loadRegistry(path)).toThrow(/invalid OAuth account selection storage/);
+
+    // The repair `clodex providers` performs: clear the unrepairable selector
+    // and keep everything else, including the broken provider's credential.
+    const registry = loadRegistryStrict(path);
+    const broken = registry.providers.find(provider => provider.id === 'broken-selector')!;
+    expect(clearActiveOAuthAccount(broken)).toBe(true);
+    withRegistryWriteLockSync(() => saveRegistry(registry, path), { lockPath: `${path}.lock` });
+
+    const persisted = JSON.parse(readFileSync(path, 'utf8'));
+    expect(persisted.schemaVersion).toBe(5);
+    expect(persisted.providers[1]).toMatchObject({
+      id: 'broken-selector',
+      authRef: base.authRef,
+    });
+    expect(persisted.providers[1].activeAuthAccount).toBeUndefined();
+    expect(persisted.providers[1].defaultAuthRef).toBeUndefined();
+    expect(loadRegistry(path).providers[0]).toMatchObject({
+      activeAuthAccount: 'alt',
+      authRef: withSlots.authAccounts!.alt!.authRef,
+      defaultAuthRef: base.authRef,
+    });
+  });
+
+  it.each([3, 4])(
+    'fails closed on a parked provider default that schema v%s cannot own',
+    schemaVersion => {
+      // Materialized-selection storage in pre-v5 bytes is partial or
+      // downgraded corruption. Dropping the record leniently removed the
+      // provider from every read surface while every mutating path threw.
+      const corrupt = registryWith(
+        { ...withSlots, activeAuthAccount: 'alt', defaultAuthRef: base.authRef },
+        schemaVersion,
+      );
+      writeFileSync(path, corrupt);
+
+      expect(() => loadRegistry(path)).toThrow(
+        /invalid OAuth account selection storage for provider "openai-oauth": .*Repair it or restore .*providers\.json\.bak/s,
+      );
+      expect(() => loadRegistryStrict(path)).toThrow(/invalid provider entry/);
+      expect(readFileSync(path, 'utf8')).toBe(corrupt);
+    },
+  );
+
+  it('fails closed on a parked provider default with no selector in legacy bytes', () => {
+    const corrupt = registryWith({ ...withSlots, defaultAuthRef: base.authRef }, 4);
+    writeFileSync(path, corrupt);
+
+    expect(() => loadRegistry(path)).toThrow(
+      /invalid OAuth account selection storage for provider "openai-oauth": .*Repair it or restore .*providers\.json\.bak/s,
+    );
+    expect(readFileSync(path, 'utf8')).toBe(corrupt);
+  });
+
+  it('fails closed when a strict-invalid locked winner still contains a selected identity', async () => {
+    const renameOnly = registryWith({ ...base, id: 'openai' });
+    const selectedWinner = `${JSON.stringify({
+      schemaVersion: 3,
+      providers: [
+        { ...withSlots, activeAuthAccount: 'alt' },
+        {
+          id: 'malformed-sibling',
+          templateId: 'openai',
+          name: 'Malformed sibling',
+          enabled: true,
+          authType: 'api',
+          api: { npm: '@ai-sdk/openai', url: 'https://api.example.test/v1' },
+          addedAt: '2026-08-09T00:00:00.000Z',
+        },
+      ],
+    }, null, 2)}\n`;
+    writeFileSync(path, renameOnly);
+
+    await expect(replaceRegistryWhileMigrationWaits(
+      selectedWinner,
+      () => loadRegistry(path),
+    )).rejects.toThrow(/Could not safely persist the selected OAuth account before launch/);
+    expect(readFileSync(path, 'utf8')).toBe(selectedWinner);
+  });
+
+  it('fails closed when a strict-invalid v5 winner already materializes a selected identity', async () => {
+    const renameOnly = registryWith({ ...base, id: 'openai' });
+    const selectedWinner = `${JSON.stringify({
+      schemaVersion: 5,
+      providers: [
+        {
+          ...withSlots,
+          activeAuthAccount: 'alt',
+          authRef: withSlots.authAccounts!.alt!.authRef,
+          defaultAuthRef: base.authRef,
+        },
+        {
+          id: 'malformed-sibling',
+          templateId: 'openai',
+          name: 'Malformed sibling',
+          enabled: true,
+          authType: 'api',
+          api: { npm: '@ai-sdk/openai', url: 'https://api.example.test/v1' },
+          addedAt: '2026-08-09T00:00:00.000Z',
+        },
+      ],
+    }, null, 2)}\n`;
+    writeFileSync(path, renameOnly);
+
+    await expect(replaceRegistryWhileMigrationWaits(
+      selectedWinner,
+      () => loadRegistry(path),
+    )).rejects.toThrow(
+      /Could not safely persist the selected OAuth account before launch.*invalid provider entry/s,
+    );
+    expect(readFileSync(path, 'utf8')).toBe(selectedWinner);
+  });
+
+  it('persists a presentation migration without destroying a repairable legacy selector', async () => {
+    const selectedInitial = registryWith({ ...withSlots, activeAuthAccount: 'alt' }, 3);
+    const renameOnlyWinner = `${JSON.stringify({
+      schemaVersion: 3,
+      providers: [
+        { ...base, id: 'openai' },
+        { ...withSlots, id: 'broken-selector', activeAuthAccount: 'ghost' },
+      ],
+    }, null, 2)}\n`;
+    writeFileSync(path, selectedInitial);
+
+    const loaded = await replaceRegistryWhileMigrationWaits(
+      renameOnlyWinner,
+      () => loadRegistry(path),
+    );
+
+    expect(loaded.providers.map(provider => provider.id)).toEqual([
+      'openai-oauth',
+      'broken-selector',
+    ]);
+    expect(loaded.providers[0]?.defaultAuthRef).toBeUndefined();
+    const persisted = JSON.parse(readFileSync(path, 'utf8'));
+    expect(persisted.schemaVersion).toBe(3);
+    expect(persisted.providers.map((provider: RegistryProvider) => provider.id)).toEqual([
+      'openai-oauth',
+      'broken-selector',
+    ]);
+    expect(persisted.providers[1]).toMatchObject({
+      activeAuthAccount: 'ghost',
+      authRef: base.authRef,
+    });
+    expect(persisted.providers[1].defaultAuthRef).toBeUndefined();
+  });
+
+  it('migrates v4 using only the selected slot cache and never claims an ambiguous top cache', () => {
+    const selectedCache = modelsCache('selected-proven');
+    const legacy = {
+      ...withSlots,
+      activeAuthAccount: 'work',
+      modelsCache: modelsCache('ambiguous-top'),
+      refreshedAt: '2026-08-09T01:00:00.000Z',
+      authAccounts: {
+        ...withSlots.authAccounts,
+        work: { ...withSlots.authAccounts!.work!, modelsCache: selectedCache },
+      },
+    };
+    writeFileSync(path, registryWith(legacy, 4));
+
+    const loaded = loadRegistry(path).providers[0]!;
+    expect(loaded.authRef).toBe(withSlots.authAccounts!.work!.authRef);
+    expect(loaded.defaultAuthRef).toBe(base.authRef);
+    expect(loaded.modelsCache).toEqual(selectedCache);
+    expect(loaded.refreshedAt).toBe(selectedCache.fetchedAt);
+    expect(loaded.authAccounts?.work?.modelsCache).toEqual(selectedCache);
+    expect(JSON.parse(readFileSync(path, 'utf8')).schemaVersion).toBe(5);
+  });
+
+  it('clears an unproven v3/v4 top cache when the selected slot has no owned cache', () => {
+    for (const schemaVersion of [3, 4]) {
+      writeFileSync(path, registryWith({
+        ...withSlots,
+        activeAuthAccount: 'work',
+        modelsCache: modelsCache(`ambiguous-v${schemaVersion}`),
+        refreshedAt: '2026-08-09T01:00:00.000Z',
+      }, schemaVersion));
+
+      const loaded = loadRegistry(path).providers[0]!;
+      expect(loaded.defaultAuthRef).toBe(base.authRef);
+      expect(loaded.authRef).toBe(withSlots.authAccounts!.work!.authRef);
+      expect(loaded.modelsCache).toBeUndefined();
+      expect(loaded.refreshedAt).toBeUndefined();
+      expect(loaded.authAccounts?.work?.modelsCache).toBeUndefined();
+    }
+  });
+
+  it('rejects a slot cache that appears before the v4 ownership fence', () => {
+    const premature = {
+      ...withSlots,
+      activeAuthAccount: 'work',
+      authAccounts: {
+        ...withSlots.authAccounts,
+        work: { ...withSlots.authAccounts!.work!, modelsCache: modelsCache('unfenced') },
+      },
+    };
+    writeFileSync(path, registryWith(premature, 3));
+
+    expect(loadRegistry(path).providers).toEqual([]);
+    expect(() => loadRegistryStrict(path)).toThrow(/invalid provider entry/);
+  });
+
+  it.each([3, 4])(
+    'never treats a present-invalid authType as a dormant selector in schema v%s',
+    schemaVersion => {
+      writeFileSync(path, registryWith({
+        ...withSlots,
+        authType: 'oath',
+        activeAuthAccount: 'alt',
+      }, schemaVersion));
+
+      expect(loadRegistry(path).providers).toEqual([]);
+      expect(() => loadRegistryStrict(path)).toThrow(/invalid provider entry/);
+    },
+  );
 
   it('keeps a stale-but-well-formed selection loadable so the provider can be repaired', () => {
     // Rejecting it at load would drop the provider record entirely, so the
     // account would vanish from `clodex providers` — the one screen that can
     // fix it. It has to survive the load and fail when a launch applies it.
-    writeFileSync(path, registryWith({ ...withSlots, activeAuthAccount: 'ghost' }));
+    writeFileSync(path, registryWith({ ...withSlots, activeAuthAccount: 'ghost' }, 3));
     const loaded = loadRegistry(path);
     expect(loaded.providers).toHaveLength(1);
     expect(loaded.providers[0]!.activeAuthAccount).toBe('ghost');
+    expect(loaded.providers[0]!.defaultAuthRef).toBeUndefined();
+    expect(loaded.providers[0]!.authRef).toBe(base.authRef);
+    // No v5 bytes are published without a selected slot to project.
+    expect(JSON.parse(readFileSync(path, 'utf8')).schemaVersion).toBe(3);
     expect(() => applySelectedOAuthAccount(loaded.providers[0]!, undefined)).toThrow(/no longer exists/);
   });
 
+  it('keeps a stale v3 selector writable for unrelated repair-safe mutations', () => {
+    writeFileSync(path, registryWith({ ...withSlots, activeAuthAccount: 'ghost' }, 3));
+    const registry = loadRegistryStrict(path);
+    registry.providers[0]!.enabled = false;
+
+    withRegistryWriteLockSync(() => saveRegistry(registry, path), { lockPath: `${path}.lock` });
+
+    const persisted = JSON.parse(readFileSync(path, 'utf8'));
+    expect(persisted.schemaVersion).toBe(3);
+    expect(persisted.providers[0]).toMatchObject({
+      id: 'openai-oauth',
+      enabled: false,
+      activeAuthAccount: 'ghost',
+      authRef: base.authRef,
+    });
+    expect(persisted.providers[0].defaultAuthRef).toBeUndefined();
+    const repairable = loadRegistry(path).providers[0]!;
+    repairable.enabled = true;
+    expect(() => applySelectedOAuthAccount(repairable, undefined)).toThrow(/no longer exists/);
+  });
+
+  it('does not migrate or auto-write a missing prototype-named legacy slot', () => {
+    const legacy = registryWith({ ...withSlots, activeAuthAccount: 'constructor' }, 3);
+    writeFileSync(path, legacy);
+
+    const loaded = loadRegistry(path);
+
+    expect(readFileSync(path, 'utf8')).toBe(legacy);
+    expect(loaded.providers[0]).toMatchObject({
+      activeAuthAccount: 'constructor',
+      authRef: base.authRef,
+    });
+    expect(loaded.providers[0]?.defaultAuthRef).toBeUndefined();
+    expect(() => applySelectedOAuthAccount(loaded.providers[0]!, undefined))
+      .toThrow(/no longer exists/);
+  });
+
+  it('migrates a legitimate own prototype-named slot', () => {
+    const constructorSlot = {
+      authRef: 'keyring:oauth:provider:openai-oauth:account:constructor::credential::v1:c',
+      addedAt: '2026-08-09T00:00:00.000Z',
+    };
+    writeFileSync(path, registryWith({
+      ...withSlots,
+      activeAuthAccount: 'constructor',
+      authAccounts: { ...withSlots.authAccounts, constructor: constructorSlot },
+    }, 3));
+
+    const loaded = loadRegistry(path).providers[0]!;
+
+    expect(loaded).toMatchObject({
+      activeAuthAccount: 'constructor',
+      authRef: constructorSlot.authRef,
+      defaultAuthRef: base.authRef,
+    });
+    expect(JSON.parse(readFileSync(path, 'utf8')).schemaVersion).toBe(5);
+  });
+
   it('fails closed on a selection the picker could never have written', () => {
-    writeFileSync(path, registryWith({ ...withSlots, activeAuthAccount: 'Bad Name!' }));
+    writeFileSync(path, registryWith({ ...withSlots, activeAuthAccount: 'Bad Name!' }, 3));
     expect(loadRegistry(path).providers).toHaveLength(0);
     expect(() => loadRegistryStrict(path)).toThrow();
   });
 
-  it('fences a selection behind its OWN schema version, not the slot version', () => {
+  it('fences materialized selection storage behind schema v5', () => {
     // Version 2 is not a fence for this: a build from before the selector
     // existed ACCEPTS 2, parses the slots, drops the unknown
     // `activeAuthAccount`, and saves back without it — after which every
     // launch quietly reverts to the provider default. Only a version that
     // build rejects actually protects the selection.
     const registry = {
-      ...emptyRegistry(),
+      schemaVersion: 3,
       providers: [{ ...withSlots, activeAuthAccount: 'alt' } as RegistryProvider],
     };
     withRegistryWriteLockSync(() => saveRegistry(registry, path), { lockPath: `${path}.lock` });
-    expect(JSON.parse(readFileSync(path, 'utf8')).schemaVersion).toBe(3);
+    const selected = JSON.parse(readFileSync(path, 'utf8'));
+    expect(selected.schemaVersion).toBe(5);
+    expect(selected.providers[0]).toMatchObject({
+      activeAuthAccount: 'alt',
+      authRef: withSlots.authAccounts!.alt!.authRef,
+      defaultAuthRef: base.authRef,
+    });
     expect(loadRegistryStrict(path).providers[0]!.activeAuthAccount).toBe('alt');
 
     // Clearing the selection returns to the slot version, so older builds
@@ -394,29 +857,116 @@ describe('authAccounts registry persistence', () => {
     expect(JSON.parse(readFileSync(path, 'utf8')).schemaVersion).toBe(2);
   });
 
-  it('fences MUTATION but not older launches, which no version number can', () => {
-    // The honest boundary. parseRegistryStrict throws on v3, so a pre-selector
-    // build cannot load-and-save the selector away. Its LENIENT loader never
-    // reads schemaVersion at all, so it still launches as the provider default
-    // — and that loader has already shipped, so no version can change it.
-    // Pinned so the limitation is a stated contract rather than a surprise.
-    writeFileSync(path, registryWith({ ...withSlots, activeAuthAccount: 'alt' })
-      .replace('"schemaVersion": 1', '"schemaVersion": 3'));
-    expect(loadRegistry(path).providers[0]!.activeAuthAccount).toBe('alt');
-    // A build that does not know v3 rejects it in every mutating path.
-    writeFileSync(path, `${JSON.stringify({ schemaVersion: 99, providers: [] })}\n`);
+  it('rejects a schema version newer than this build understands', () => {
+    writeFileSync(path, `${JSON.stringify({ schemaVersion: 6, providers: [] })}\n`);
     expect(() => loadRegistryStrict(path)).toThrow(/unsupported schema version/);
-    // ...while the lenient path shrugs, which is exactly the gap.
-    expect(loadRegistry(path).providers).toEqual([]);
   });
 
-  it('rejects a schema version newer than this build understands', () => {
-    writeFileSync(path, `${JSON.stringify({ schemaVersion: 5, providers: [] })}\n`);
+  it.each([
+    ['missing parked default', {
+      ...withSlots,
+      activeAuthAccount: 'alt',
+      authRef: withSlots.authAccounts!.alt!.authRef,
+    }],
+    ['parked default without selector', { ...withSlots, defaultAuthRef: base.authRef }],
+    ['missing selected slot', {
+      ...withSlots,
+      activeAuthAccount: 'ghost',
+      authRef: withSlots.authAccounts!.alt!.authRef,
+      defaultAuthRef: base.authRef,
+    }],
+    ['missing own prototype-named slot', {
+      ...withSlots,
+      activeAuthAccount: 'constructor',
+      authRef: withSlots.authAccounts!.alt!.authRef,
+      defaultAuthRef: base.authRef,
+    }],
+    ['top ref does not match selected slot', {
+      ...withSlots,
+      activeAuthAccount: 'alt',
+      authRef: withSlots.authAccounts!.work!.authRef,
+      defaultAuthRef: base.authRef,
+    }],
+    ['top cache is not owned by selected slot', {
+      ...withSlots,
+      activeAuthAccount: 'alt',
+      authRef: withSlots.authAccounts!.alt!.authRef,
+      defaultAuthRef: base.authRef,
+      modelsCache: modelsCache('wrong-owner'),
+    }],
+  ])('fails closed with repair guidance on malformed v5 selection storage: %s', (_name, provider) => {
+    writeFileSync(path, registryWith(provider, 5));
+    expect(() => loadRegistry(path)).toThrow(
+      /invalid OAuth account selection storage.*provider "openai-oauth".*Repair it or restore .*providers\.json\.bak/s,
+    );
+    expect(() => loadRegistryStrict(path)).toThrow(/invalid provider entry/);
+  });
+
+  it('diagnoses a parked default without a selector in a future lenient schema', () => {
+    writeFileSync(path, registryWith({ ...withSlots, defaultAuthRef: base.authRef }, 6));
+
+    expect(() => loadRegistry(path)).toThrow(
+      /invalid OAuth account selection storage.*provider "openai-oauth".*Repair it or restore .*providers\.json\.bak/s,
+    );
     expect(() => loadRegistryStrict(path)).toThrow(/unsupported schema version/);
+  });
+
+  it('refuses to serialize an unmaterialized selector instead of guessing its default', () => {
+    const ambiguous = {
+      schemaVersion: 2,
+      providers: [{ ...withSlots, activeAuthAccount: 'alt' } as RegistryProvider],
+    };
+    expect(() => withRegistryWriteLockSync(
+      () => saveRegistry(ambiguous, path),
+      { lockPath: `${path}.lock` },
+    )).toThrow(/invalid OAuth account selection storage/);
+    expect(() => readFileSync(path, 'utf8')).toThrow();
+  });
+
+  it('validates the exact serialized provider shape before publication', () => {
+    const missingAuthRef = { ...base, authRef: undefined } as unknown as RegistryProvider;
+    expect(() => withRegistryWriteLockSync(
+      () => saveRegistry({ schemaVersion: 1, providers: [missingAuthRef] }, path),
+      { lockPath: `${path}.lock` },
+    )).toThrow(/invalid provider entry/);
+    expect(() => readFileSync(path, 'utf8')).toThrow();
+  });
+
+  it('allows a dormant non-OAuth selector alongside a materialized OAuth provider', () => {
+    const selected: RegistryProvider = {
+      ...withSlots,
+      activeAuthAccount: 'alt',
+      authRef: withSlots.authAccounts!.alt!.authRef,
+      defaultAuthRef: base.authRef,
+    };
+    const dormant: RegistryProvider = {
+      ...withSlots,
+      id: 'dormant-api',
+      authType: 'api',
+      activeAuthAccount: 'ghost',
+    };
+    const registry = { schemaVersion: 5, providers: [selected, dormant] };
+
+    withRegistryWriteLockSync(() => saveRegistry(registry, path), { lockPath: `${path}.lock` });
+
+    const loaded = loadRegistryStrict(path);
+    expect(loaded.schemaVersion).toBe(5);
+    expect(loaded.providers[1]).toMatchObject({
+      id: 'dormant-api',
+      activeAuthAccount: 'ghost',
+      authRef: base.authRef,
+    });
+    expect(loaded.providers[1]?.defaultAuthRef).toBeUndefined();
   });
 
   it('slot credentials count as live references for reconciliation', () => {
-    const registry = { ...emptyRegistry(), providers: [structuredClone(withSlots)] };
+    const selected: RegistryProvider = {
+      ...withSlots,
+      activeAuthAccount: 'alt',
+      authRef: withSlots.authAccounts!.alt!.authRef,
+      defaultAuthRef: base.authRef,
+    };
+    const registry = { schemaVersion: 5, providers: [selected] };
     expect(credentialIsReferenced(registry, withSlots.authAccounts!.work!.authRef)).toBe(true);
     expect(credentialIsReferenced(registry, withSlots.authAccounts!.alt!.authRef)).toBe(true);
     expect(credentialIsReferenced(registry, base.authRef)).toBe(true);

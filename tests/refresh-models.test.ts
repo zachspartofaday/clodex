@@ -417,7 +417,8 @@ describe('refreshProviderModels', () => {
       templateId: 'groq',
       name: 'Groq',
       enabled: true,
-      authRef: 'keyring:provider:default',
+      authRef: 'keyring:provider:work',
+      defaultAuthRef: 'keyring:provider:default',
       authType: 'oauth' as const,
       activeAuthAccount: 'work',
       authAccounts: {
@@ -431,7 +432,7 @@ describe('refreshProviderModels', () => {
       addedAt: '2026-01-01T00:00:00.000Z',
     };
     vi.mocked(loadRegistryStrict).mockReturnValue({
-      schemaVersion: 3,
+      schemaVersion: 5,
       providers: [{
         ...startedProvider,
         authAccounts: {
@@ -465,7 +466,8 @@ describe('refreshProviderModels', () => {
       templateId: 'groq',
       name: 'Groq',
       enabled: true,
-      authRef: 'keyring:provider:default',
+      authRef: 'keyring:provider:work',
+      defaultAuthRef: 'keyring:provider:default',
       authType: 'oauth' as const,
       activeAuthAccount: 'work',
       authAccounts: {
@@ -475,10 +477,10 @@ describe('refreshProviderModels', () => {
       api: { npm: '@ai-sdk/groq', url: 'https://api.groq.com/openai/v1' },
       addedAt: '2026-01-01T00:00:00.000Z',
     };
-    const initialRegistry: ProviderRegistry = { schemaVersion: 3, providers: [startedProvider] };
+    const initialRegistry: ProviderRegistry = { schemaVersion: 5, providers: [startedProvider] };
     const switchedRegistry: ProviderRegistry = {
-      schemaVersion: 3,
-      providers: [{ ...startedProvider, activeAuthAccount: 'alt' }],
+      schemaVersion: 5,
+      providers: [{ ...startedProvider, authRef: 'keyring:provider:alt', activeAuthAccount: 'alt' }],
     };
     vi.mocked(loadRegistryStrict).mockReturnValue(switchedRegistry);
     vi.mocked(fetchTemplateModels).mockResolvedValue({
@@ -506,7 +508,8 @@ describe('refreshProviderModels', () => {
       templateId: 'groq',
       name: 'Groq',
       enabled: true,
-      authRef: 'keyring:provider:default',
+      authRef: 'keyring:provider:work',
+      defaultAuthRef: 'keyring:provider:default',
       authType: 'oauth' as const,
       activeAuthAccount: 'work',
       authAccounts: {
@@ -515,7 +518,7 @@ describe('refreshProviderModels', () => {
       api: { npm: '@ai-sdk/groq', url: 'https://api.groq.com/openai/v1' },
       addedAt: '2026-01-01T00:00:00.000Z',
     };
-    const registry: ProviderRegistry = { schemaVersion: 3, providers: [provider] };
+    const registry: ProviderRegistry = { schemaVersion: 5, providers: [provider] };
     vi.mocked(loadRegistryStrict).mockReturnValue(registry);
     vi.mocked(fetchTemplateModels).mockResolvedValue({
       baseUrl: 'https://api.groq.com/openai/v1',
@@ -568,7 +571,8 @@ describe('refreshProviderModels', () => {
       templateId: 'groq',
       name: 'Groq',
       enabled: true,
-      authRef: 'keyring:provider:default',
+      authRef: 'keyring:provider:work',
+      defaultAuthRef: 'keyring:provider:default',
       authType: 'oauth' as const,
       activeAuthAccount: 'work',
       authAccounts: {
@@ -600,7 +604,7 @@ describe('refreshProviderModels', () => {
       },
       addedAt: '2026-01-01T00:00:00.000Z',
     };
-    const registry: ProviderRegistry = { schemaVersion: 4, providers: [provider] };
+    const registry: ProviderRegistry = { schemaVersion: 5, providers: [provider] };
     vi.mocked(loadRegistryStrict).mockReturnValue(registry);
     vi.mocked(fetchTemplateModels)
       .mockResolvedValueOnce({
@@ -654,7 +658,8 @@ describe('refreshProviderModels', () => {
       templateId: 'groq',
       name: 'Groq',
       enabled: true,
-      authRef: 'keyring:provider:default',
+      authRef: 'keyring:provider:work',
+      defaultAuthRef: 'keyring:provider:default',
       authType: 'oauth' as const,
       activeAuthAccount: 'work',
       authAccounts: {
@@ -663,7 +668,7 @@ describe('refreshProviderModels', () => {
       api: { npm: '@ai-sdk/groq', url: 'https://api.groq.com/openai/v1' },
       addedAt: '2026-01-01T00:00:00.000Z',
     };
-    const registry: ProviderRegistry = { schemaVersion: 3, providers: [provider] };
+    const registry: ProviderRegistry = { schemaVersion: 5, providers: [provider] };
     vi.mocked(loadRegistryStrict).mockReturnValue(registry);
     vi.mocked(fetchTemplateModels).mockResolvedValue({
       baseUrl: 'https://api.groq.com/openai/v1',

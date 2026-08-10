@@ -1,6 +1,7 @@
 // src/registry/refresh-models.ts — user-initiated model list refresh per modelSource
 
 import { isDeepStrictEqual } from 'node:util';
+import { getOAuthAccountSlot } from './oauth-account-storage.js';
 import { fetchAnthropicModels } from './custom-endpoint.js';
 import { dedupeCachedModels, fetchTemplateModels } from './fetch-template-models.js';
 import { loadRegistryStrict, saveRegistry } from './io.js';
@@ -323,11 +324,14 @@ function updateProviderCache(
   const modelsCache = { fetchedAt: now, models };
   const selectedAccount = credentialSnapshot?.selectedAccount;
   const temporaryAccount = isTemporaryAccountSelection(credentialSnapshot);
-  const authAccounts = selectedAccount && existing.authAccounts?.[selectedAccount.name]
+  const selectedSlot = selectedAccount
+    ? getOAuthAccountSlot(existing, selectedAccount.name)
+    : undefined;
+  const authAccounts = selectedAccount && selectedSlot
     ? {
         ...existing.authAccounts,
         [selectedAccount.name]: {
-          ...existing.authAccounts[selectedAccount.name]!,
+          ...selectedSlot,
           modelsCache,
         },
       }
@@ -356,7 +360,7 @@ function providerWithRefreshCache(
   const temporary = isTemporaryAccountSelection(snapshot);
   if (!temporary || !selected) return provider;
   const projected = { ...provider };
-  const cache = provider.authAccounts?.[selected.name]?.modelsCache;
+  const cache = getOAuthAccountSlot(provider, selected.name)?.modelsCache;
   if (cache) projected.modelsCache = cache;
   else delete projected.modelsCache;
   return projected;
@@ -605,14 +609,18 @@ export async function refreshProviderModels(
       const currentRegistry = loadRegistryStrict();
       const currentProvider = currentRegistry.providers.find(candidate => candidate.id === providerId);
       if (!currentProvider) throw new Error('Provider was removed while models were refreshing.');
+      // A v5 account switch necessarily changes top-level authRef too. Check
+      // the richer account/generation snapshot first so the fence reports the
+      // selection transition instead of collapsing it into a generic ref
+      // change; snapshotless callers retain the legacy ref guard below.
+      if (credentialSnapshot) {
+        assertRefreshCredentialStillCurrent(currentProvider, credentialSnapshot);
+      }
       if (currentProvider.authRef !== provider.authRef) {
         throw new Error('Provider credentials changed while models were refreshing.');
       }
       if (!providerDiscoveryInputsMatch(currentProvider, provider)) {
         throw new Error('Provider configuration changed while models were refreshing.');
-      }
-      if (credentialSnapshot) {
-        assertRefreshCredentialStillCurrent(currentProvider, credentialSnapshot);
       }
       updateProviderCache(currentRegistry, providerId, enriched, baseUrl, credentialSnapshot);
       saveRegistry(currentRegistry);

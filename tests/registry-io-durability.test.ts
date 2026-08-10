@@ -9,9 +9,16 @@ const fsState = vi.hoisted(() => ({
   events: [] as string[],
   failTempFsync: false,
   failParentFsync: false,
+  parentFsyncErrorCode: 'EIO',
   dropLockAfterTempFsync: false,
   maxWriteBytes: Number.POSITIVE_INFINITY,
   tempWriteSizes: [] as number[],
+  registryReadCount: 0,
+  failRegistryReadAt: 0,
+  registryReadErrorCode: 'EIO',
+  replaceRegistryAtRead: 0,
+  replacementRegistry: '',
+  failLockOpenCode: '',
 }));
 
 function ioError(message: string): NodeJS.ErrnoException {
@@ -27,7 +34,28 @@ vi.mock('node:fs', async importOriginal => {
 
   return {
     ...actual,
+    readFileSync: vi.fn((path: PathLike, encoding: BufferEncoding) => {
+      if (String(path) === fsState.registryPath) {
+        fsState.registryReadCount += 1;
+        if (fsState.registryReadCount === fsState.replaceRegistryAtRead) {
+          actual.writeFileSync(path, fsState.replacementRegistry);
+        }
+        if (fsState.registryReadCount === fsState.failRegistryReadAt) {
+          throw Object.assign(new Error('registry read failed'), {
+            code: fsState.registryReadErrorCode,
+          });
+        }
+      }
+      return actual.readFileSync(path, encoding);
+    }),
     openSync: vi.fn((path: PathLike, flags: string | number, mode?: string | number) => {
+      if (String(path).startsWith(`${fsState.registryPath}.lock.`)
+        && String(path).endsWith('.tmp')
+        && fsState.failLockOpenCode) {
+        throw Object.assign(new Error('lock open failed'), {
+          code: fsState.failLockOpenCode,
+        });
+      }
       const fd = actual.openSync(path, flags, mode);
       fsState.openPaths.set(fd, String(path));
       return fd;
@@ -64,7 +92,11 @@ vi.mock('node:fs', async importOriginal => {
       }
       if (path === dirname(fsState.registryPath)) {
         fsState.events.push('parent-fsync');
-        if (fsState.failParentFsync) throw ioError('parent fsync failed');
+        if (fsState.failParentFsync) {
+          throw Object.assign(new Error('parent fsync failed'), {
+            code: fsState.parentFsyncErrorCode,
+          });
+        }
       }
       actual.fsyncSync(fd);
     }),
@@ -82,12 +114,19 @@ import {
   mkdtempSync,
   readFileSync,
   rmSync,
+  writeFileSync,
 } from 'node:fs';
-import { emptyRegistry, saveRegistry } from '../src/registry/io.js';
+import {
+  emptyRegistry,
+  loadRegistry,
+  saveRegistry,
+  syncParentDirectory,
+} from '../src/registry/io.js';
 import {
   RegistryLockLostError,
   withRegistryWriteLockSync,
 } from '../src/registry/lock.js';
+import { clearActiveOAuthAccount } from '../src/registry/oauth-account-storage.js';
 
 describe('registry publication durability', () => {
   const previousHome = process.env.CLODEX_HOME;
@@ -101,9 +140,16 @@ describe('registry publication durability', () => {
     fsState.events = [];
     fsState.failTempFsync = false;
     fsState.failParentFsync = false;
+    fsState.parentFsyncErrorCode = 'EIO';
     fsState.dropLockAfterTempFsync = false;
     fsState.maxWriteBytes = Number.POSITIVE_INFINITY;
     fsState.tempWriteSizes = [];
+    fsState.registryReadCount = 0;
+    fsState.failRegistryReadAt = 0;
+    fsState.registryReadErrorCode = 'EIO';
+    fsState.replaceRegistryAtRead = 0;
+    fsState.replacementRegistry = '';
+    fsState.failLockOpenCode = '';
   });
 
   afterEach(() => {
@@ -139,6 +185,263 @@ describe('registry publication durability', () => {
 
     expect(fsState.events).toEqual(['temp-fsync']);
     expect(existsSync(fsState.registryPath)).toBe(false);
+  });
+
+  it('does not acquire a directory durability contract for an ordinary lenient read', () => {
+    writeFileSync(fsState.registryPath, `${JSON.stringify(emptyRegistry())}\n`);
+    fsState.failParentFsync = true;
+    fsState.parentFsyncErrorCode = 'EACCES';
+
+    expect(loadRegistry(fsState.registryPath)).toEqual(emptyRegistry());
+    expect(fsState.events).toEqual([]);
+    expect(() => syncParentDirectory(fsState.registryPath)).toThrow('parent fsync failed');
+  });
+
+  it.each(['EINVAL', 'ENOTSUP', 'EPERM'])(
+    'tolerates only the documented platform directory-fsync error %s',
+    code => {
+      fsState.failParentFsync = true;
+      fsState.parentFsyncErrorCode = code;
+
+      expect(() => syncParentDirectory(fsState.registryPath)).not.toThrow();
+      expect(fsState.events).toEqual(['parent-fsync']);
+    },
+  );
+
+  it('classifies selected-account migration write failures as filesystem recovery', () => {
+    writeFileSync(fsState.registryPath, `${JSON.stringify({
+      schemaVersion: 3,
+      providers: [{
+        id: 'openai-oauth',
+        templateId: 'openai',
+        name: 'OpenAI (ChatGPT)',
+        enabled: true,
+        authRef: 'keyring:oauth:provider:openai-oauth::credential::v1:default',
+        authType: 'oauth',
+        activeAuthAccount: 'work',
+        authAccounts: {
+          work: {
+            authRef: 'keyring:oauth:provider:openai-oauth:account:work::credential::v1:work',
+            addedAt: '2026-08-09T00:00:00.000Z',
+          },
+        },
+        api: { npm: '@ai-sdk/openai', url: 'https://api.openai.com/v1' },
+        addedAt: '2026-08-09T00:00:00.000Z',
+      }],
+    }, null, 2)}\n`);
+    fsState.failTempFsync = true;
+
+    expect(() => loadRegistry(fsState.registryPath)).toThrow(
+      /Could not durably write the provider registry.*temp fsync failed.*permissions.*storage health.*free disk space/s,
+    );
+    expect(readFileSync(fsState.registryPath, 'utf8')).toContain('"schemaVersion": 3');
+  });
+
+  it('classifies a locked migration reread failure as filesystem access, not corruption', () => {
+    writeFileSync(fsState.registryPath, `${JSON.stringify({
+      schemaVersion: 3,
+      providers: [{
+        id: 'openai-oauth',
+        templateId: 'openai',
+        name: 'OpenAI (ChatGPT)',
+        enabled: true,
+        authRef: 'keyring:oauth:provider:openai-oauth::credential::v1:default',
+        authType: 'oauth',
+        activeAuthAccount: 'work',
+        authAccounts: {
+          work: {
+            authRef: 'keyring:oauth:provider:openai-oauth:account:work::credential::v1:work',
+            addedAt: '2026-08-09T00:00:00.000Z',
+          },
+        },
+        api: { npm: '@ai-sdk/openai', url: 'https://api.openai.com/v1' },
+        addedAt: '2026-08-09T00:00:00.000Z',
+      }],
+    }, null, 2)}\n`);
+    fsState.failRegistryReadAt = 2;
+    fsState.registryReadErrorCode = 'EACCES';
+
+    let thrown: Error | undefined;
+    try {
+      loadRegistry(fsState.registryPath);
+    } catch (error) {
+      thrown = error as Error;
+    }
+    expect(thrown?.message).toMatch(
+      /Could not read the provider registry.*registry read failed.*permissions.*storage health/s,
+    );
+    expect(thrown?.message).not.toMatch(/registry .* is invalid|restore .*\.bak/s);
+  });
+
+  it('classifies migration-lock I/O failures as filesystem access, not contention', () => {
+    writeFileSync(fsState.registryPath, `${JSON.stringify({
+      schemaVersion: 3,
+      providers: [{
+        id: 'openai-oauth',
+        templateId: 'openai',
+        name: 'OpenAI (ChatGPT)',
+        enabled: true,
+        authRef: 'keyring:oauth:provider:openai-oauth::credential::v1:default',
+        authType: 'oauth',
+        activeAuthAccount: 'work',
+        authAccounts: {
+          work: {
+            authRef: 'keyring:oauth:provider:openai-oauth:account:work::credential::v1:work',
+            addedAt: '2026-08-09T00:00:00.000Z',
+          },
+        },
+        api: { npm: '@ai-sdk/openai', url: 'https://api.openai.com/v1' },
+        addedAt: '2026-08-09T00:00:00.000Z',
+      }],
+    }, null, 2)}\n`);
+    fsState.failLockOpenCode = 'EACCES';
+
+    let thrown: Error | undefined;
+    try {
+      loadRegistry(fsState.registryPath);
+    } catch (error) {
+      thrown = error as Error;
+    }
+    expect(thrown?.message).toMatch(
+      /Could not access the lock for the provider registry.*lock open failed.*permissions.*storage health/s,
+    );
+    expect(thrown?.message).not.toContain('Stop other Clodex processes');
+  });
+
+  it('repairs a post-rename parent sync failure at the next selected-account write boundary', () => {
+    writeFileSync(fsState.registryPath, `${JSON.stringify({
+      schemaVersion: 3,
+      providers: [{
+        id: 'openai-oauth',
+        templateId: 'openai',
+        name: 'OpenAI (ChatGPT)',
+        enabled: true,
+        authRef: 'keyring:oauth:provider:openai-oauth::credential::v1:default',
+        authType: 'oauth',
+        activeAuthAccount: 'work',
+        authAccounts: {
+          work: {
+            authRef: 'keyring:oauth:provider:openai-oauth:account:work::credential::v1:work',
+            addedAt: '2026-08-09T00:00:00.000Z',
+          },
+        },
+        api: { npm: '@ai-sdk/openai', url: 'https://api.openai.com/v1' },
+        addedAt: '2026-08-09T00:00:00.000Z',
+      }],
+    }, null, 2)}\n`);
+    fsState.failParentFsync = true;
+
+    expect(() => loadRegistry(fsState.registryPath)).toThrow('parent fsync failed');
+    expect(JSON.parse(readFileSync(fsState.registryPath, 'utf8')).schemaVersion).toBe(5);
+
+    fsState.failParentFsync = false;
+    fsState.events = [];
+    fsState.registryReadCount = 0;
+    const loaded = loadRegistry(fsState.registryPath);
+    expect(loaded.schemaVersion).toBe(5);
+    expect(fsState.events).toEqual([]);
+
+    withRegistryWriteLockSync(
+      () => saveRegistry(loaded, fsState.registryPath),
+      { lockPath: `${fsState.registryPath}.lock` },
+    );
+    expect(fsState.events).toEqual(['temp-fsync', 'rename', 'parent-fsync']);
+  });
+
+  it('syncs an already-migrated winner reread under the migration lock', () => {
+    const defaultRef = 'keyring:oauth:provider:openai-oauth::credential::v1:default';
+    const workRef =
+      'keyring:oauth:provider:openai-oauth:account:work::credential::v1:work';
+    const provider = {
+      id: 'openai-oauth',
+      templateId: 'openai',
+      name: 'OpenAI (ChatGPT)',
+      enabled: true,
+      authRef: defaultRef,
+      authType: 'oauth',
+      activeAuthAccount: 'work',
+      authAccounts: {
+        work: {
+          authRef: workRef,
+          addedAt: '2026-08-09T00:00:00.000Z',
+        },
+      },
+      api: { npm: '@ai-sdk/openai', url: 'https://api.openai.com/v1' },
+      addedAt: '2026-08-09T00:00:00.000Z',
+    };
+    writeFileSync(fsState.registryPath, `${JSON.stringify({
+      schemaVersion: 3,
+      providers: [provider],
+    }, null, 2)}\n`);
+    fsState.replaceRegistryAtRead = 2;
+    fsState.replacementRegistry = `${JSON.stringify({
+      schemaVersion: 5,
+      providers: [{
+        ...provider,
+        authRef: workRef,
+        defaultAuthRef: defaultRef,
+      }],
+    }, null, 2)}\n`;
+    fsState.failParentFsync = true;
+
+    expect(() => loadRegistry(fsState.registryPath)).toThrow(
+      /selected OAuth account.*durably sync.*parent fsync failed/s,
+    );
+    expect(fsState.events).toEqual(['parent-fsync']);
+
+    fsState.failParentFsync = false;
+    fsState.events = [];
+    fsState.registryReadCount = 0;
+    fsState.replaceRegistryAtRead = 0;
+    expect(loadRegistry(fsState.registryPath).schemaVersion).toBe(5);
+    expect(fsState.events).toEqual([]);
+  });
+
+  it('repairs a post-rename clear at the next registry write boundary', () => {
+    writeFileSync(fsState.registryPath, `${JSON.stringify({
+      schemaVersion: 5,
+      providers: [{
+        id: 'openai-oauth',
+        templateId: 'openai',
+        name: 'OpenAI (ChatGPT)',
+        enabled: true,
+        authRef: 'keyring:oauth:provider:openai-oauth:account:work::credential::v1:work',
+        defaultAuthRef: 'keyring:oauth:provider:openai-oauth::credential::v1:default',
+        authType: 'oauth',
+        activeAuthAccount: 'work',
+        authAccounts: {
+          work: {
+            authRef: 'keyring:oauth:provider:openai-oauth:account:work::credential::v1:work',
+            addedAt: '2026-08-09T00:00:00.000Z',
+          },
+        },
+        api: { npm: '@ai-sdk/openai', url: 'https://api.openai.com/v1' },
+        addedAt: '2026-08-09T00:00:00.000Z',
+      }],
+    }, null, 2)}\n`);
+    const cleared = loadRegistry(fsState.registryPath);
+    clearActiveOAuthAccount(cleared.providers[0]!);
+    fsState.events = [];
+    fsState.failParentFsync = true;
+
+    expect(() => withRegistryWriteLockSync(
+      () => saveRegistry(cleared, fsState.registryPath),
+      { lockPath: `${fsState.registryPath}.lock` },
+    )).toThrow('parent fsync failed');
+    expect(JSON.parse(readFileSync(fsState.registryPath, 'utf8')).schemaVersion).toBe(2);
+
+    fsState.failParentFsync = false;
+    fsState.events = [];
+    fsState.registryReadCount = 0;
+    const loaded = loadRegistry(fsState.registryPath);
+    expect(loaded.schemaVersion).toBe(2);
+    expect(fsState.events).toEqual([]);
+
+    withRegistryWriteLockSync(
+      () => saveRegistry(loaded, fsState.registryPath),
+      { lockPath: `${fsState.registryPath}.lock` },
+    );
+    expect(fsState.events).toEqual(['temp-fsync', 'rename', 'parent-fsync']);
   });
 
   it('reports a parent sync failure only after the rename has committed', () => {
