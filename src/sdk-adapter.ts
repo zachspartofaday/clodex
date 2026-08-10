@@ -758,7 +758,12 @@ export interface AnthropicStreamObserver {
 }
 
 const SDK_STREAM_IDLE_TIMEOUT_MS = 120_000;
-export const SDK_TOTAL_TIMEOUT_MS = 10 * 60_000;
+export const SDK_NON_STREAMING_TIMEOUT_MS = 10 * 60_000;
+/**
+ * Alias retained for openai-adapter.ts, whose non-streaming request deadlines
+ * share the same absolute ceiling.
+ */
+export const SDK_TOTAL_TIMEOUT_MS = SDK_NON_STREAMING_TIMEOUT_MS;
 
 function streamAbortError(signal?: AbortSignal): Error {
   if (signal?.reason instanceof Error) return signal.reason;
@@ -1041,16 +1046,6 @@ export async function streamAnthropicResponse(
     () => idleAbort.abort(idleTimeoutError()),
     idleTimeoutMs,
   );
-  const totalTimer = setTimeout(
-    () => idleAbort.abort(new SdkTimeoutError(
-      'total_timeout',
-      `provider stream exceeded ${Math.round(SDK_TOTAL_TIMEOUT_MS / 1000)}s`,
-      Math.max(0, Date.now() - startedAt),
-      SDK_TOTAL_TIMEOUT_MS,
-      outputBegan,
-    )),
-    SDK_TOTAL_TIMEOUT_MS,
-  );
   // Do not combine streamText's total/chunk timeout signals here. In AI SDK
   // 7.0.22 that composition retains completed StreamTextResult graphs. Relay
   // owns the timers and explicitly settles its controller after consumption.
@@ -1093,7 +1088,6 @@ export async function streamAnthropicResponse(
   } finally {
     stopForwardingAbort();
     clearTimeout(idleTimer);
-    clearTimeout(totalTimer);
     // Settle the direct Relay-owned signal only after stream consumption. Do not
     // replace this with AbortSignal.any(): source-driven abort leaves Node's
     // dependent composite rooted in gcPersistentSignals on Node 24.
@@ -1138,16 +1132,6 @@ export async function generateAnthropicResponse(
     let idleTimer = setTimeout(
       () => forceAbort.abort(idleTimeoutError()),
       idleTimeoutMs,
-    );
-    const totalTimer = setTimeout(
-      () => forceAbort.abort(new SdkTimeoutError(
-        'total_timeout',
-        `provider stream exceeded ${Math.round(SDK_TOTAL_TIMEOUT_MS / 1000)}s`,
-        Math.max(0, Date.now() - startedAt),
-        SDK_TOTAL_TIMEOUT_MS,
-        outputBegan,
-      )),
-      SDK_TOTAL_TIMEOUT_MS,
     );
     // See the streaming path above: Relay owns these timers and explicitly
     // settles its controller when the stream has been fully reduced.
@@ -1198,7 +1182,6 @@ export async function generateAnthropicResponse(
     } finally {
       stopForwardingAbort();
       clearTimeout(idleTimer);
-      clearTimeout(totalTimer);
       // See the streaming path above: settle the Relay-owned signal after the
       // result is fully reduced so Node can release AI SDK's listener graph.
       if (!forceAbort.signal.aborted) forceAbort.abort();
@@ -1214,12 +1197,12 @@ export async function generateAnthropicResponse(
     const totalTimer = setTimeout(
       () => generateAbort.abort(new SdkTimeoutError(
         'total_timeout',
-        `provider request exceeded ${Math.round(SDK_TOTAL_TIMEOUT_MS / 1000)}s`,
+        `provider request exceeded ${Math.round(SDK_NON_STREAMING_TIMEOUT_MS / 1000)}s`,
         Math.max(0, Date.now() - startedAt),
-        SDK_TOTAL_TIMEOUT_MS,
+        SDK_NON_STREAMING_TIMEOUT_MS,
         false,
       )),
-      SDK_TOTAL_TIMEOUT_MS,
+      SDK_NON_STREAMING_TIMEOUT_MS,
     );
     try {
       const r = await generateText({

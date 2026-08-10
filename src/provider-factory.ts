@@ -188,11 +188,10 @@ export async function createLanguageModel(spec: ProviderModelSpec): Promise<Lang
               ? { version: CODEX_RESPONSES_LITE_VERSION, 'x-openai-internal-codex-responses-lite': 'true' }
               : {}),
           },
-          // Keep every ChatGPT/Codex OAuth Responses conversation on the
-          // persistent WebSocket transport. Models flagged prefer_websockets
-          // require it; the remaining OAuth Responses models benefit from the
-          // same connection-local previous_response_id continuation cache.
-          ...(useResponsesEndpoint
+          // ChatGPT/Codex OAuth Responses models flagged preferWebSockets use
+          // the persistent WebSocket transport; ordinary OAuth Responses models
+          // use normal HTTP transport.
+          ...(useResponsesEndpoint && spec.preferWebSockets
             ? {
                 fetch: createResponsesWebSocketFetch(CODEX_RESPONSES_LITE_WS_URL, spec.onDebug, {
                   providerId: spec.providerId ?? 'openai',

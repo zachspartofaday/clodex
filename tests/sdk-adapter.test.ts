@@ -1009,17 +1009,20 @@ describe('streamAnthropicResponse idle timeout', () => {
     expect(sdkTimeoutDetails(error)?.elapsedMs).toBeGreaterThanOrEqual(40);
   }, 10_000);
 
-  it('classifies the fixed total timeout while SDK parts continue and output has begun', async () => {
+  it('lets a productive stream outlive the former fixed total deadline and complete', async () => {
     vi.useFakeTimers();
     vi.resetModules();
     async function* stream() {
       yield { type: 'start' };
-      for (;;) {
-        await new Promise(resolve => setTimeout(resolve, 1_000));
+      // Seven parts at 100s intervals span 700s — past the former 600s fixed
+      // total deadline — while each gap stays inside the 120s idle timeout.
+      for (let i = 0; i < 7; i++) {
+        await new Promise(resolve => setTimeout(resolve, 100_000));
         yield { type: 'text-delta', text: 'x' };
       }
     }
     const streamText = vi.fn(() => ({ stream: stream() }));
+    const write = vi.fn();
     vi.doMock('ai', () => ({
       generateText: vi.fn(),
       streamText,
@@ -1033,19 +1036,58 @@ describe('streamAnthropicResponse idle timeout', () => {
         {} as never,
         { messages: [] },
         'test-model',
-        () => {},
+        write,
       ).then(() => undefined, reason => reason);
 
-      await vi.advanceTimersByTimeAsync(adapter.SDK_TOTAL_TIMEOUT_MS);
+      await vi.advanceTimersByTimeAsync(700_000);
+      await expect(settled).resolves.toBeUndefined();
+      expect(write).toHaveBeenCalled();
+      // The Relay-owned controller is settled only after full consumption.
+      expect(streamText.mock.calls[0]![0].abortSignal.aborted).toBe(true);
+    } finally {
+      vi.useRealTimers();
+      vi.doUnmock('ai');
+      vi.resetModules();
+    }
+  });
+});
+
+describe('generateAnthropicResponse non-streaming timeout', () => {
+  it('keeps the absolute total timeout for genuine non-streaming generation', async () => {
+    vi.useFakeTimers();
+    vi.resetModules();
+    const generateText = vi.fn((options: { abortSignal?: AbortSignal }) =>
+      new Promise((_resolve, reject) => {
+        options.abortSignal?.addEventListener('abort', () => {
+          reject(options.abortSignal?.reason ?? new DOMException('Aborted', 'AbortError'));
+        });
+      }),
+    );
+    vi.doMock('ai', () => ({
+      generateText,
+      streamText: vi.fn(),
+      tool: vi.fn((spec: unknown) => spec),
+      jsonSchema: vi.fn((schema: unknown) => schema),
+    }));
+
+    try {
+      const adapter = await import('../src/sdk-adapter.js');
+      const settled = adapter.generateAnthropicResponse(
+        {} as never,
+        { messages: [] },
+        'test-model',
+      ).then(() => undefined, reason => reason);
+
+      await vi.advanceTimersByTimeAsync(adapter.SDK_NON_STREAMING_TIMEOUT_MS);
       const error = await settled;
-      expect((error as Error).message).toContain('provider stream exceeded 600s');
+      expect((error as Error).message).toContain('provider request exceeded 600s');
       expect(adapter.sdkTimeoutDetails(error)).toEqual({
         category: 'total_timeout',
-        elapsedMs: adapter.SDK_TOTAL_TIMEOUT_MS,
-        limitMs: adapter.SDK_TOTAL_TIMEOUT_MS,
-        outputBegan: true,
+        elapsedMs: adapter.SDK_NON_STREAMING_TIMEOUT_MS,
+        limitMs: adapter.SDK_NON_STREAMING_TIMEOUT_MS,
+        outputBegan: false,
       });
-      expect(streamText.mock.calls[0]![0].abortSignal.aborted).toBe(true);
+      expect(generateText.mock.calls[0]![0].abortSignal.aborted).toBe(true);
     } finally {
       vi.useRealTimers();
       vi.doUnmock('ai');

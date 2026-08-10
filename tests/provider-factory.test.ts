@@ -556,6 +556,40 @@ describe('createLanguageModel', () => {
     expect(createOpenAI).toHaveBeenCalledWith({
       apiKey: accessToken,
       baseURL: 'https://chatgpt.com/backend-api/codex',
+      headers: {
+        'ChatGPT-Account-Id': 'acct-123',
+        originator: 'clodex',
+      },
+    });
+    expect(createOpenAI.mock.calls[0]![0]).not.toHaveProperty('fetch');
+    expect(responses).toHaveBeenCalledWith('gpt-5.5');
+    vi.doUnmock('@ai-sdk/openai');
+  });
+
+  it('uses the custom WebSocket fetch only for OAuth Responses models flagged preferWebSockets', async () => {
+    vi.resetModules();
+    const responses = vi.fn((modelId: string) => ({ modelId, provider: 'openai-responses' }));
+    const chat = vi.fn((modelId: string) => ({ modelId, provider: 'openai-chat' }));
+    const createOpenAI = vi.fn(() => ({ responses, chat }));
+    vi.doMock('@ai-sdk/openai', () => ({ createOpenAI }));
+
+    const header = Buffer.from('{}').toString('base64url');
+    const payload = Buffer.from(JSON.stringify({ chatgpt_account_id: 'acct-123' })).toString('base64url');
+    const accessToken = `${header}.${payload}.sig`;
+
+    const { createLanguageModel: create } = await import('../src/provider-factory.js');
+    await create({
+      npm: '@ai-sdk/openai',
+      modelId: 'gpt-5.5',
+      apiKey: accessToken,
+      authType: 'oauth',
+      oauthAccountId: 'stored-acct-456',
+      preferWebSockets: true,
+    });
+
+    expect(createOpenAI).toHaveBeenCalledWith({
+      apiKey: accessToken,
+      baseURL: 'https://chatgpt.com/backend-api/codex',
       fetch: expect.any(Function),
       headers: {
         'ChatGPT-Account-Id': 'acct-123',
