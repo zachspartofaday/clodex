@@ -36,6 +36,11 @@ import {
 } from './lock.js';
 import { refreshProviderModelsWithCredential } from './refresh-models.js';
 import { OAUTH_ACCOUNT_NAME_RE, type RegistryProvider } from './types.js';
+import {
+  getOAuthAccountSlot,
+  providerDefaultAuthRef,
+  storeActiveOAuthAccount,
+} from './oauth-account-storage.js';
 
 export type { StoredOAuthCredential } from '../oauth/types.js';
 
@@ -113,7 +118,7 @@ async function upsertOAuthAccountSlot(
         `Provider "${registryId}" is not configured yet — run the default sign-in first: clodex providers auth openai`,
       );
     }
-    const previousAuthRef = entry.authAccounts?.[account]?.authRef;
+    const previousAuthRef = getOAuthAccountSlot(entry, account)?.authRef;
     if (previousAuthRef !== expectedAuthRef) {
       throw new Error(`Account "${account}" of "${registryId}" changed while its credential was being saved`);
     }
@@ -129,6 +134,10 @@ async function upsertOAuthAccountSlot(
       },
     };
     if (entry.activeAuthAccount === account) {
+      // The selected slot is also the downgrade-visible top-level reference.
+      // This additionally repairs a legacy broken selector when reauth creates
+      // its missing slot: the old top-level ref is still the proven default.
+      storeActiveOAuthAccount(updated, account, authRef);
       delete updated.modelsCache;
       delete updated.refreshedAt;
     }
@@ -177,7 +186,7 @@ async function upsertOAuthProvider(
     const registry = loadRegistryStrict();
     const template = getTemplateById(templateId);
     let entry: RegistryProvider | undefined = registry.providers.find(pr => pr.id === registryId);
-    if (entry?.authRef !== expectedAuthRef) {
+    if ((entry ? providerDefaultAuthRef(entry) : undefined) !== expectedAuthRef) {
       throw new Error(`Provider "${registryId}" changed while its credential was being saved`);
     }
 
@@ -187,7 +196,7 @@ async function upsertOAuthProvider(
       }
     }
 
-    const previousAuthRef = entry?.authRef;
+    const previousAuthRef = entry ? providerDefaultAuthRef(entry) : undefined;
     if (!entry) {
       if (!template) throw new Error(`Provider "${providerId}" has no template`);
       const displayName = oauthDisplayName(registryId, template.name);
@@ -205,12 +214,38 @@ async function upsertOAuthProvider(
         },
         addedAt: new Date().toISOString(),
       };
-    } else {
-      entry = { ...entry, authType: 'oauth', authRef, templateId };
-      if (!entry.activeAuthAccount) {
+    } else if (entry.activeAuthAccount) {
+      const selected = getOAuthAccountSlot(entry, entry.activeAuthAccount);
+      if (!selected) {
+        throw new Error(
+          `Provider "${registryId}" is set to use account "${entry.activeAuthAccount}", which no longer exists`,
+        );
+      }
+      // Reauthenticating the inactive provider default must not replace the
+      // selected slot published in authRef or invalidate its entitlement cache.
+      entry = {
+        ...entry,
+        authType: 'oauth',
+        authRef: selected.authRef,
+        defaultAuthRef: authRef,
+        templateId,
+      };
+      // A dormant non-OAuth selector may carry a top-level catalog owned by
+      // its prior API credential. Once OAuth is restored, the top-level cache
+      // must describe the selected slot for both current and downgraded
+      // readers. Never pair the selected credential with that prior cache.
+      if (selected.modelsCache) {
+        entry.modelsCache = selected.modelsCache;
+        entry.refreshedAt = selected.modelsCache.fetchedAt;
+      } else {
         delete entry.modelsCache;
         delete entry.refreshedAt;
       }
+    } else {
+      entry = { ...entry, authType: 'oauth', authRef, templateId };
+      delete entry.defaultAuthRef;
+      delete entry.modelsCache;
+      delete entry.refreshedAt;
     }
 
     const idx = registry.providers.findIndex(provider => provider.id === registryId);
@@ -252,7 +287,15 @@ async function persistNativeOAuthCredential(
             `Provider "${registryId}" is not configured yet — run the default sign-in first: clodex providers auth openai`,
           );
         }
-        return accountName ? existing?.authAccounts?.[accountName]?.authRef : existing?.authRef;
+        if (accountName && existing?.authType !== 'oauth') {
+          throw new Error(
+            `Provider "${registryId}" does not currently have a default OAuth sign-in — `
+            + 'run clodex providers auth openai without --account first.',
+          );
+        }
+        return accountName
+          ? existing ? getOAuthAccountSlot(existing, accountName)?.authRef : undefined
+          : existing ? providerDefaultAuthRef(existing) : undefined;
       },
     );
     const authRef = credentialInstanceAuthRef(account);
@@ -305,6 +348,25 @@ export async function authenticateProvider(
     throw new Error('OAuth sign-in is only available for openai (ChatGPT Plus/Pro).');
   }
 
+  if (accountName) {
+    // Fail before probing (which writes/deletes a disposable credential) or
+    // starting the interactive device-code ceremony. The locked check inside
+    // persistNativeOAuthCredential remains authoritative against concurrent
+    // provider replacements during the ceremony.
+    const existing = loadRegistryStrict().providers.find(provider => provider.id === registryId);
+    if (!existing) {
+      throw new Error(
+        `Provider "${registryId}" is not configured yet — run the default sign-in first: clodex providers auth openai`,
+      );
+    }
+    if (existing.authType !== 'oauth') {
+      throw new Error(
+        `Provider "${registryId}" does not currently have a default OAuth sign-in — `
+        + 'run clodex providers auth openai without --account first.',
+      );
+    }
+  }
+
   let storeDiagMsg = '';
   const storeReady = await probeProviderCredentialStore(oauthAuthRef(registryId), msg => {
     storeDiagMsg = msg;
@@ -314,19 +376,6 @@ export async function authenticateProvider(
       `Credential store is unavailable${storeDiagMsg ? `: ${storeDiagMsg}` : ''}. `
       + 'Set CLODEX_CREDENTIAL_HELPER to an absolute path to an external credential helper and try again.',
     );
-  }
-
-  if (accountName) {
-    // Fail before the interactive device-code ceremony, not after: authorizing
-    // an account only to learn the default sign-in is missing wastes the whole
-    // flow. The locked check inside persistNativeOAuthCredential remains
-    // authoritative against concurrent removals.
-    const existing = loadRegistryStrict().providers.find(provider => provider.id === registryId);
-    if (!existing) {
-      throw new Error(
-        `Provider "${registryId}" is not configured yet — run the default sign-in first: clodex providers auth openai`,
-      );
-    }
   }
 
   const cred = await runNativeDeviceCode(providerId);

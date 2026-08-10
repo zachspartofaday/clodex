@@ -77,6 +77,11 @@ describe('account-switch catalog lifecycle', () => {
 
   it('keeps the switched cache empty when a provider-key override later disappears', async () => {
     expect(await setActiveOAuthAccount('groq', 'work')).toMatchObject({ changed: true });
+    expect(loadRegistry().providers[0]).toMatchObject({
+      authRef: 'env:CLODEX_TEST_WORK_TOKEN',
+      defaultAuthRef: 'keyring:provider:default',
+      activeAuthAccount: 'work',
+    });
     expect(loadRegistry().providers[0]?.modelsCache).toBeUndefined();
     process.env.CLODEX_KEY_GROQ = 'transient-provider-token';
 
@@ -119,6 +124,8 @@ describe('account-switch catalog lifecycle', () => {
     expect(result).toMatchObject({ ok: true, modelCount: 1 });
     expect(fetchTemplateModels).toHaveBeenCalledOnce();
     const persisted = loadRegistry().providers[0]!;
+    expect(persisted.authRef).toBe('env:CLODEX_TEST_WORK_TOKEN');
+    expect(persisted.defaultAuthRef).toBe('keyring:provider:default');
     expect(persisted.modelsCache).toBeUndefined();
     expect(persisted.authAccounts?.alt?.modelsCache?.models[0]?.id).toBe('alt-model');
   });
@@ -156,9 +163,23 @@ describe('account-switch catalog lifecycle', () => {
     expect(result).toMatchObject({ ok: true, modelCount: 1 });
     expect(fetchTemplateModels).toHaveBeenCalledOnce();
     const persisted = loadRegistry().providers[0]!;
+    expect(persisted.authRef).toBe('env:CLODEX_TEST_WORK_TOKEN');
+    expect(persisted.defaultAuthRef).toBe('keyring:provider:default');
     expect(persisted.modelsCache?.models.map(model => model.id)).toEqual([
       'work-model',
     ]);
     expect(persisted.authAccounts?.work?.modelsCache?.models[0]?.id).toBe('work-model');
+  });
+
+  it('restores the exact parked default when the persisted selection is cleared', async () => {
+    expect(await setActiveOAuthAccount('groq', 'work')).toMatchObject({ changed: true });
+
+    expect(await setActiveOAuthAccount('groq', undefined)).toMatchObject({ changed: true });
+
+    const persisted = loadRegistry().providers[0]!;
+    expect(persisted.authRef).toBe('keyring:provider:default');
+    expect(persisted.defaultAuthRef).toBeUndefined();
+    expect(persisted.activeAuthAccount).toBeUndefined();
+    expect(persisted.modelsCache).toBeUndefined();
   });
 });

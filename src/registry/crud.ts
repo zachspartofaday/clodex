@@ -10,7 +10,15 @@ import {
   withRegistryWriteLock,
   withRegistryWriteLockSync,
 } from './lock.js';
-import type { RegistryProvider } from './types.js';
+import {
+  REGISTRY_SCHEMA_VERSION_WITH_MATERIALIZED_ACTIVE_ACCOUNT,
+  type RegistryProvider,
+} from './types.js';
+import {
+  clearActiveOAuthAccount,
+  getOAuthAccountSlot,
+  storeActiveOAuthAccount,
+} from './oauth-account-storage.js';
 
 export interface RemoveProviderResult {
   removed: boolean;
@@ -24,7 +32,7 @@ export interface RemoveProviderResult {
 
 interface PendingProviderRemoval {
   result: RemoveProviderResult;
-  /** Every credential ref queued for cleanup: the default plus each named slot. */
+  /** Every unique selected, parked-default, and named-slot ref queued for cleanup. */
   queuedRefs: string[];
 }
 
@@ -51,16 +59,16 @@ async function removeProviderWithinLifecycle(
     const [removedProvider] = registry.providers.splice(index, 1);
     const queuedRefs: string[] = [];
     if (opts?.deleteCredential !== false) {
-      if (await queueCredentialDelete(removedProvider.authRef)) {
-        queuedRefs.push(removedProvider.authRef);
-      }
-      // Named OAuth account slots own disjoint credential lineages; removing
-      // the provider must not orphan them in the credential store.
-      for (const slot of Object.values(removedProvider.authAccounts ?? {})) {
-        if (slot.authRef && slot.authRef !== removedProvider.authRef
-          && await queueCredentialDelete(slot.authRef)) {
-          queuedRefs.push(slot.authRef);
-        }
+      // `authRef` can equal the selected slot while `defaultAuthRef` parks the
+      // provider credential. Queue every UNIQUE lineage so neither one can be
+      // orphaned or spuriously counted twice during cleanup.
+      const credentialRefs = new Set<string>([
+        removedProvider.authRef,
+        ...(removedProvider.defaultAuthRef ? [removedProvider.defaultAuthRef] : []),
+        ...Object.values(removedProvider.authAccounts ?? {}).map(slot => slot.authRef),
+      ]);
+      for (const authRef of credentialRefs) {
+        if (await queueCredentialDelete(authRef)) queuedRefs.push(authRef);
       }
     }
     saveRegistry(registry);
@@ -125,32 +133,30 @@ export async function setActiveOAuthAccount(
     if (!provider) return { updated: false, error: `Provider not found: ${id}` };
     const name = account?.trim();
     const previous = provider.activeAuthAccount?.trim() || undefined;
-    if (name) {
+    const selectedSlot = name ? getOAuthAccountSlot(provider, name) : undefined;
+    let selectionChanged = previous !== name;
+    let storageChanged = false;
+    if (name && !selectedSlot) {
       const slots = provider.authAccounts ?? {};
-      if (!Object.prototype.hasOwnProperty.call(slots, name)) {
-        const available = Object.keys(slots).sort().join(', ') || 'none';
-        return {
-          updated: false,
-          error: `${provider.name} has no account named "${name}" (available: ${available}).`,
-        };
-      }
-      if (previous !== name) provider.activeAuthAccount = name;
-    } else if (previous !== undefined) {
-      delete provider.activeAuthAccount;
+      const available = Object.keys(slots).sort().join(', ') || 'none';
+      return {
+        updated: false,
+        error: `${provider.name} has no account named "${name}" (available: ${available}).`,
+      };
     }
-    const changed = previous !== name;
-    if (changed) {
+    if (selectionChanged && provider.authType === 'oauth') {
       // Model availability is credential/account-specific. Park a named
       // account's current cache, then expose only the selected account's known
       // cache under the same lock. A cache miss fails closed until the
       // interactive command's targeted refresh completes.
-      if (previous && provider.modelsCache && provider.authAccounts?.[previous]) {
+      const previousSlot = previous ? getOAuthAccountSlot(provider, previous) : undefined;
+      if (previous && previousSlot && provider.modelsCache && provider.authAccounts) {
         provider.authAccounts[previous] = {
-          ...provider.authAccounts[previous],
+          ...previousSlot,
           modelsCache: provider.modelsCache,
         };
       }
-      const selectedCache = name ? provider.authAccounts?.[name]?.modelsCache : undefined;
+      const selectedCache = selectedSlot?.modelsCache;
       if (selectedCache) {
         provider.modelsCache = selectedCache;
         provider.refreshedAt = selectedCache.fetchedAt;
@@ -158,12 +164,32 @@ export async function setActiveOAuthAccount(
         delete provider.modelsCache;
         delete provider.refreshedAt;
       }
-      saveRegistry(registry);
     }
+    if (name && provider.authType === 'oauth') {
+      storageChanged = storeActiveOAuthAccount(provider, name, selectedSlot!.authRef);
+    } else if (name) {
+      // Preserve PR #17's repairable dormant-selector state without routing a
+      // non-OAuth provider through an OAuth slot credential.
+      storageChanged = clearActiveOAuthAccount(provider) || storageChanged;
+      if (provider.activeAuthAccount !== name) {
+        provider.activeAuthAccount = name;
+        storageChanged = true;
+      }
+    } else if (previous !== undefined || provider.defaultAuthRef !== undefined) {
+      storageChanged = clearActiveOAuthAccount(provider);
+    } else {
+      selectionChanged = false;
+    }
+    // A strict legacy load migrates in memory without changing schemaVersion.
+    // Persist that storage upgrade even when the user selected the same slot.
+    const migrationNeedsPersistence = registry.schemaVersion
+      < REGISTRY_SCHEMA_VERSION_WITH_MATERIALIZED_ACTIVE_ACCOUNT
+      && provider.defaultAuthRef !== undefined;
+    if (selectionChanged || storageChanged || migrationNeedsPersistence) saveRegistry(registry);
     // Return the state that actually won the write lock. The provider may have
     // been disabled, retyped, or otherwise changed while the picker was open;
     // post-switch messages must not be derived from the stale pre-prompt copy.
-    return { updated: true, changed, ...(name ? { account: name } : {}), provider };
+    return { updated: true, changed: selectionChanged, ...(name ? { account: name } : {}), provider };
   }));
 }
 

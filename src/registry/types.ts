@@ -26,16 +26,10 @@ export const REGISTRY_SCHEMA_VERSION_WITH_ACCOUNT_SLOTS = 2;
  * does not know. A registry whose selector is cleared falls back to 2 (or 1),
  * so older builds interoperate again as soon as no selector state exists.
  *
- * KNOWN LIMITATION — this fences MUTATION, not launches. Older builds reach
- * the registry through the lenient `loadRegistry()`, which never reads
- * `schemaVersion` at all, so a pre-selector installation sharing this
- * CLODEX_HOME still parses the provider, discards the selector it does not
- * know, and launches as the provider default. No version number can fix that:
- * the loader that would have to reject it has already shipped. Closing it
- * needs the persisted bytes to carry the selection somewhere an old build
- * already reads — pointing `authRef` at the selected slot and parking the
- * original elsewhere — which changes credential storage and is tracked
- * separately rather than bolted on here.
+ * Versions 3 and 4 are also migration sources for downgrade-safe selection
+ * storage. They still carry the provider default in `authRef`; current builds
+ * project the selected slot into that field and park the default separately
+ * before writing version 5.
  */
 export const REGISTRY_SCHEMA_VERSION_WITH_ACTIVE_ACCOUNT = 3;
 
@@ -46,6 +40,15 @@ export const REGISTRY_SCHEMA_VERSION_WITH_ACTIVE_ACCOUNT = 3;
  * older mutating builds that know about slots but not their cache isolation.
  */
 export const REGISTRY_SCHEMA_VERSION_WITH_ACCOUNT_MODEL_CACHES = 4;
+
+/**
+ * Written whenever `defaultAuthRef` parks a provider's own OAuth credential
+ * while `authRef` points at the selected named slot. A pre-selector build's
+ * lenient loader ignores both the version and the new fields, but already
+ * reads `authRef`, so it launches as the selected identity. Its strict
+ * mutation paths reject version 5 and cannot discard the parked default.
+ */
+export const REGISTRY_SCHEMA_VERSION_WITH_MATERIALIZED_ACTIVE_ACCOUNT = 5;
 
 /**
  * Shape rule for a named OAuth account-slot name — the single home. Slot
@@ -110,24 +113,32 @@ export interface RegistryProvider {
   name: string;
   enabled: boolean;
   authRef: string;
+  /**
+   * The provider's own OAuth credential while a named slot is selected.
+   * During that time `authRef` deliberately points at the selected slot so a
+   * downgraded pre-selector build launches as the same identity. Clearing the
+   * selection restores this value to `authRef` and removes the field.
+   */
+  defaultAuthRef?: string;
   authType?: 'api' | 'oauth' | 'none';
   /**
    * Named OAuth account slots beyond the default credential
    * (`clodex providers auth openai --account <name>`). Each slot owns a
-   * disjoint credential-store lineage; CLODEX_OAUTH_ACCOUNT selects one at
-   * launch without touching the default `authRef`.
+   * disjoint credential-store lineage; CLODEX_OAUTH_ACCOUNT selects one for a
+   * launch without replacing the provider-owned default credential.
    */
   authAccounts?: Record<string, RegistryOAuthAccount>;
   /**
    * The `authAccounts` slot every launch uses, so the running identity does not
    * depend on remembering an environment variable. Absent means the provider's
    * own default credential. CLODEX_OAUTH_ACCOUNT still overrides it for a
-   * single run.
+   * single run. While present on an OAuth provider, persisted `authRef` is the
+   * selected slot and `defaultAuthRef` parks the provider default for rollback.
    *
-   * Only the NAME SHAPE is enforced when the registry loads. A name that no
-   * longer matches a slot is rejected at apply time instead: rejecting it at
-   * load would drop the entire provider record, so a stale selector would make
-   * the provider silently vanish from the CLI rather than say what is wrong.
+   * Legacy v3/v4 bytes enforce only the name shape so a missing slot remains
+   * loadable and repairable; applying it still fails loud. V5 additionally
+   * requires membership and exact authRef/cache projection, because a missing
+   * materialized slot is corruption rather than a legacy repair state.
    */
   activeAuthAccount?: string;
   subscriptionFilter?: RegistrySubscriptionFilter;

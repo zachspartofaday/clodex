@@ -38,6 +38,7 @@ export function credentialIsReferenced(
   // Named account slots are live references too: missing them here lets
   // reconciliation delete a just-saved slot credential as unreferenced.
   return registry.providers.some(provider => provider.authRef === authRef
+    || provider.defaultAuthRef === authRef
     || Object.values(provider.authAccounts ?? {}).some(slot => slot.authRef === authRef));
 }
 
