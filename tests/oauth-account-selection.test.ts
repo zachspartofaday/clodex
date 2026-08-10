@@ -552,7 +552,7 @@ describe('authAccounts registry persistence', () => {
     expect(readFileSync(path, 'utf8')).toBe(selectedWinner);
   });
 
-  it('returns the locked winner when only its presentation migration cannot persist', async () => {
+  it('persists a presentation migration without destroying a repairable legacy selector', async () => {
     const selectedInitial = registryWith({ ...withSlots, activeAuthAccount: 'alt' }, 3);
     const renameOnlyWinner = `${JSON.stringify({
       schemaVersion: 3,
@@ -573,7 +573,17 @@ describe('authAccounts registry persistence', () => {
       'broken-selector',
     ]);
     expect(loaded.providers[0]?.defaultAuthRef).toBeUndefined();
-    expect(readFileSync(path, 'utf8')).toBe(renameOnlyWinner);
+    const persisted = JSON.parse(readFileSync(path, 'utf8'));
+    expect(persisted.schemaVersion).toBe(3);
+    expect(persisted.providers.map((provider: RegistryProvider) => provider.id)).toEqual([
+      'openai-oauth',
+      'broken-selector',
+    ]);
+    expect(persisted.providers[1]).toMatchObject({
+      activeAuthAccount: 'ghost',
+      authRef: base.authRef,
+    });
+    expect(persisted.providers[1].defaultAuthRef).toBeUndefined();
   });
 
   it('migrates v4 using only the selected slot cache and never claims an ambiguous top cache', () => {
@@ -659,6 +669,27 @@ describe('authAccounts registry persistence', () => {
     // No v5 bytes are published without a selected slot to project.
     expect(JSON.parse(readFileSync(path, 'utf8')).schemaVersion).toBe(3);
     expect(() => applySelectedOAuthAccount(loaded.providers[0]!, undefined)).toThrow(/no longer exists/);
+  });
+
+  it('keeps a stale v3 selector writable for unrelated repair-safe mutations', () => {
+    writeFileSync(path, registryWith({ ...withSlots, activeAuthAccount: 'ghost' }, 3));
+    const registry = loadRegistryStrict(path);
+    registry.providers[0]!.enabled = false;
+
+    withRegistryWriteLockSync(() => saveRegistry(registry, path), { lockPath: `${path}.lock` });
+
+    const persisted = JSON.parse(readFileSync(path, 'utf8'));
+    expect(persisted.schemaVersion).toBe(3);
+    expect(persisted.providers[0]).toMatchObject({
+      id: 'openai-oauth',
+      enabled: false,
+      activeAuthAccount: 'ghost',
+      authRef: base.authRef,
+    });
+    expect(persisted.providers[0].defaultAuthRef).toBeUndefined();
+    const repairable = loadRegistry(path).providers[0]!;
+    repairable.enabled = true;
+    expect(() => applySelectedOAuthAccount(repairable, undefined)).toThrow(/no longer exists/);
   });
 
   it('does not migrate or auto-write a missing prototype-named legacy slot', () => {
@@ -768,10 +799,21 @@ describe('authAccounts registry persistence', () => {
       defaultAuthRef: base.authRef,
       modelsCache: modelsCache('wrong-owner'),
     }],
-  ])('fails closed on malformed v5 selection storage: %s', (_name, provider) => {
+  ])('fails closed with repair guidance on malformed v5 selection storage: %s', (_name, provider) => {
     writeFileSync(path, registryWith(provider, 5));
-    expect(loadRegistry(path).providers).toEqual([]);
+    expect(() => loadRegistry(path)).toThrow(
+      /invalid OAuth account selection storage.*provider "openai-oauth".*Repair it or restore .*providers\.json\.bak/s,
+    );
     expect(() => loadRegistryStrict(path)).toThrow(/invalid provider entry/);
+  });
+
+  it('diagnoses a parked default without a selector in a future lenient schema', () => {
+    writeFileSync(path, registryWith({ ...withSlots, defaultAuthRef: base.authRef }, 6));
+
+    expect(() => loadRegistry(path)).toThrow(
+      /invalid OAuth account selection storage.*provider "openai-oauth".*Repair it or restore .*providers\.json\.bak/s,
+    );
+    expect(() => loadRegistryStrict(path)).toThrow(/unsupported schema version/);
   });
 
   it('refuses to serialize an unmaterialized selector instead of guessing its default', () => {

@@ -245,49 +245,77 @@ function hasPresentInvalidAuthType(raw: unknown): boolean {
 }
 
 /**
- * Validate the cross-field credential-storage contract for the schema that
+ * Explain the cross-field credential-storage violation for the schema that
  * supplied it. Versions 1-4 are valid migration input only when the parked
  * field is absent. Version 5 requires every live OAuth selector to name a slot
  * and to materialize that exact slot in `authRef`; otherwise launch must fail
  * closed rather than falling back to the provider default.
  */
-function hasValidSelectionStorage(
+function selectionStorageError(
   provider: RegistryProvider,
   schemaVersion: number,
-): boolean {
+): string | undefined {
   const name = provider.activeAuthAccount?.trim();
   const hasDefault = provider.defaultAuthRef !== undefined;
 
   if (schemaVersion < REGISTRY_SCHEMA_VERSION_WITH_ACCOUNT_MODEL_CACHES
     && Object.values(provider.authAccounts ?? {}).some(account => account.modelsCache !== undefined)) {
-    return false;
+    return 'an account cache appears before the schema version that establishes its ownership';
   }
   if (name && schemaVersion < REGISTRY_SCHEMA_VERSION_WITH_ACTIVE_ACCOUNT) {
-    return false;
+    return 'a selected account appears before the selector schema version';
   }
   if (schemaVersion <= REGISTRY_SCHEMA_VERSION_WITH_ACCOUNT_MODEL_CACHES && hasDefault) {
-    return false;
+    return 'a parked provider default appears before materialized selection storage';
   }
-  if (!name) return !hasDefault;
-  if (provider.authType !== 'oauth') return !hasDefault;
+  if (!name) {
+    return hasDefault ? 'a provider default is parked without a selected account' : undefined;
+  }
+  if (provider.authType !== 'oauth') {
+    return hasDefault ? 'a non-OAuth selector parks a provider default' : undefined;
+  }
   if (schemaVersion <= REGISTRY_SCHEMA_VERSION_WITH_ACCOUNT_MODEL_CACHES) {
     // A well-formed but missing legacy slot remains repairable. Migration does
     // not materialize it, and current launch-time selection still throws.
-    return true;
+    return undefined;
   }
   if (schemaVersion !== REGISTRY_SCHEMA_VERSION_WITH_MATERIALIZED_ACTIVE_ACCOUNT) {
     // Preserve the lenient reader's forward-compatible behavior. Strict reads
-    // reject unsupported versions before reaching this branch.
-    return true;
+    // reject unsupported versions before reaching this branch. The parked-
+    // default-without-selector invariant above is version-independent, so that
+    // corruption remains visible even in a future lenient schema.
+    return undefined;
   }
+  if (!hasDefault) return 'the selected account has no parked provider default';
   const selected = getOAuthAccountSlot(provider, name);
-  return hasDefault
-    && selected !== undefined
-    && provider.authRef === selected.authRef
-    // A downgraded launch consumes top-level authRef AND modelsCache. Require
-    // the cache to be the selected slot's proven cache (or both absent), or it
-    // could launch the right credential with another account's entitlements.
-    && isDeepStrictEqual(provider.modelsCache, selected.modelsCache);
+  if (!selected) return `the selected account "${name}" has no matching account slot`;
+  if (provider.authRef !== selected.authRef) {
+    return 'the selected account does not match the downgrade-visible credential reference';
+  }
+  // A downgraded launch consumes top-level authRef AND modelsCache. Require
+  // the cache to be the selected slot's proven cache (or both absent), or it
+  // could launch the right credential with another account's entitlements.
+  if (!isDeepStrictEqual(provider.modelsCache, selected.modelsCache)) {
+    return 'the selected account does not own the downgrade-visible model cache';
+  }
+  return undefined;
+}
+
+function hasValidSelectionStorage(
+  provider: RegistryProvider,
+  schemaVersion: number,
+): boolean {
+  return selectionStorageError(provider, schemaVersion) === undefined;
+}
+
+class RegistrySelectionStorageError extends Error {
+  constructor(
+    readonly providerId: string,
+    readonly detail: string,
+  ) {
+    super(detail);
+    this.name = 'RegistrySelectionStorageError';
+  }
 }
 
 function parseRegistry(raw: unknown): ProviderRegistry {
@@ -304,10 +332,13 @@ function parseRegistry(raw: unknown): ProviderRegistry {
         && schemaVersion <= REGISTRY_SCHEMA_VERSION_WITH_MATERIALIZED_ACTIVE_ACCOUNT
         && parsed?.activeAuthAccount !== undefined
         && hasPresentInvalidAuthType(entry);
-      if (parsed && !invalidKnownSelectionAuthType
-        && hasValidSelectionStorage(parsed, schemaVersion)) {
-        providers.push(parsed);
+      const selectionError = parsed
+        ? selectionStorageError(parsed, schemaVersion)
+        : undefined;
+      if (parsed && selectionError && schemaVersion >= REGISTRY_SCHEMA_VERSION_WITH_MATERIALIZED_ACTIVE_ACCOUNT) {
+        throw new RegistrySelectionStorageError(parsed.id, selectionError);
       }
+      if (parsed && !invalidKnownSelectionAuthType && !selectionError) providers.push(parsed);
     }
   }
   const registry: ProviderRegistry = {
@@ -401,6 +432,19 @@ class RegistryDurabilityCheckError extends Error {
   }
 }
 
+function selectionStorageDiagnostic(
+  path: string,
+  cause: RegistrySelectionStorageError,
+): Error {
+  return new Error(
+    'Could not safely persist the selected OAuth account before launch. '
+    + `The provider registry at ${path} contains an invalid provider entry: `
+    + `invalid OAuth account selection storage for provider "${cause.providerId}": ${cause.detail}. `
+    + `Repair it or restore ${path}.bak, then retry.`,
+    { cause },
+  );
+}
+
 function selectedAccountFilesystemError(
   path: string,
   cause: unknown,
@@ -428,31 +472,18 @@ export function loadRegistry(path = getProvidersPath()): ProviderRegistry {
   try {
     const raw = JSON.parse(readFileSync(path, 'utf8'));
     registry = parseRegistry(raw);
-  } catch {
+  } catch (error) {
+    if (error instanceof RegistrySelectionStorageError) {
+      throw selectionStorageDiagnostic(path, error);
+    }
     return { schemaVersion: REGISTRY_SCHEMA_VERSION, providers: [] };
   }
 
   const migration = migrateRegistry(registry);
-  if (!migration.changed) {
-    // A previous publication may have renamed ANY schema version before its
-    // parent-directory durability barrier failed. This includes clearing a v5
-    // selection back to v1/v2. Re-sync every successfully parsed winner so a
-    // plain retry repairs both selection and downgrade transitions.
-    try {
-      syncParentDirectory(path);
-    } catch (error) {
-      if (hasMaterializedActiveAccount(registry)) {
-        throw selectedAccountFilesystemError(path, error, 'durably sync');
-      }
-      const detail = error instanceof Error ? error.message : String(error);
-      throw new Error(
-        `Could not durably sync the provider registry at ${path}: ${detail} `
-        + 'Check filesystem permissions, storage health, and free disk space, then retry.',
-        { cause: error },
-      );
-    }
-    return registry;
-  }
+  // Reads retain their historical leniency and acquire no directory durability
+  // contract. A migration publication below still performs the write-side
+  // fsync barrier through saveRegistry.
+  if (!migration.changed) return registry;
 
   let winner = registry;
   let materializedActiveAccount = migration.materializedActiveAccount;
@@ -526,6 +557,9 @@ export function loadRegistry(path = getProvidersPath()): ProviderRegistry {
     }, { lockPath: `${path}.lock` });
     return winner;
   } catch (error) {
+    if (error instanceof RegistrySelectionStorageError) {
+      throw selectionStorageDiagnostic(path, error);
+    }
     if (error instanceof RegistryDurabilityCheckError) {
       if (materializedActiveAccount) {
         throw selectedAccountFilesystemError(
@@ -597,30 +631,7 @@ export function loadRegistryStrict(path = getProvidersPath()): ProviderRegistry 
   return registry;
 }
 
-export function saveRegistry(registry: ProviderRegistry, path = getProvidersPath()): void {
-  assertRegistryWriteOwnership(path);
-  // Programmatic callers and strict legacy loads may hand this function a
-  // v3/v4 selector. Upgrade it under the same write lock so this build never
-  // publishes a selector that a downgraded launch will ignore.
-  if (registry.schemaVersion >= REGISTRY_SCHEMA_VERSION_WITH_ACTIVE_ACCOUNT
-    && registry.schemaVersion <= REGISTRY_SCHEMA_VERSION_WITH_ACCOUNT_MODEL_CACHES) {
-    migrateActiveOAuthAccountStorage(registry);
-  }
-  for (const provider of registry.providers) {
-    if (!hasValidSelectionStorage(
-      provider,
-      REGISTRY_SCHEMA_VERSION_WITH_MATERIALIZED_ACTIVE_ACCOUNT,
-    )) {
-      throw new RegistrySaveValidationError(
-        'Provider registry contains invalid OAuth account selection storage.',
-      );
-    }
-  }
-  // Slot state fences older writers via the schema version (see types.ts);
-  // slot-free registries return to v1 so old builds interoperate again.
-  // Highest state present wins. Version 3 fences the selector from older
-  // writers; version 5 also projects it into `authRef`, which older lenient
-  // launchers already read.
+function registrySchemaVersion(registry: ProviderRegistry): number {
   const hasMaterializedSelector = registry.providers.some(
     provider => provider.defaultAuthRef !== undefined,
   );
@@ -631,15 +642,51 @@ export function saveRegistry(registry: ProviderRegistry, path = getProvidersPath
   const hasSlots = registry.providers.some(
     provider => provider.authAccounts && Object.keys(provider.authAccounts).length > 0,
   );
-  const schemaVersion = hasMaterializedSelector
+  return hasMaterializedSelector
     ? REGISTRY_SCHEMA_VERSION_WITH_MATERIALIZED_ACTIVE_ACCOUNT
     : hasAccountModelCaches
       ? REGISTRY_SCHEMA_VERSION_WITH_ACCOUNT_MODEL_CACHES
       : hasSelector
         ? REGISTRY_SCHEMA_VERSION_WITH_ACTIVE_ACCOUNT
         : hasSlots
-        ? REGISTRY_SCHEMA_VERSION_WITH_ACCOUNT_SLOTS
+          ? REGISTRY_SCHEMA_VERSION_WITH_ACCOUNT_SLOTS
           : REGISTRY_SCHEMA_VERSION;
+}
+
+export function saveRegistry(registry: ProviderRegistry, path = getProvidersPath()): void {
+  assertRegistryWriteOwnership(path);
+  // A selector attached to a pre-selector schema has no defined storage
+  // provenance, so the writer cannot know whether authRef is the default or a
+  // selected slot. V3/v4 inputs do define authRef as the default and remain
+  // safe migration/repair sources, including when the selected slot is missing.
+  if (registry.schemaVersion < REGISTRY_SCHEMA_VERSION_WITH_ACTIVE_ACCOUNT
+    && registry.providers.some(provider => provider.activeAuthAccount !== undefined
+      && provider.defaultAuthRef === undefined)) {
+    throw new RegistrySaveValidationError(
+      'Provider registry contains invalid OAuth account selection storage.',
+    );
+  }
+  // Programmatic callers and strict legacy loads may hand this function a
+  // v3/v4 selector. Upgrade it under the same write lock when its selected slot
+  // exists. A missing slot remains unchanged and persists behind its legacy
+  // schema fence so unrelated mutations do not destroy the repair path.
+  if (registry.schemaVersion >= REGISTRY_SCHEMA_VERSION_WITH_ACTIVE_ACCOUNT
+    && registry.schemaVersion <= REGISTRY_SCHEMA_VERSION_WITH_ACCOUNT_MODEL_CACHES) {
+    migrateActiveOAuthAccountStorage(registry);
+  }
+  // Slot state fences older writers via the schema version (see types.ts);
+  // slot-free registries return to v1 so old builds interoperate again.
+  // Highest state present wins. Version 3 fences a repairable legacy selector;
+  // version 5 also projects a valid selection into `authRef`, which older
+  // lenient launchers already read.
+  const schemaVersion = registrySchemaVersion(registry);
+  for (const provider of registry.providers) {
+    if (!hasValidSelectionStorage(provider, schemaVersion)) {
+      throw new RegistrySaveValidationError(
+        'Provider registry contains invalid OAuth account selection storage.',
+      );
+    }
+  }
   const serializedRegistry = { ...registry, schemaVersion };
   // Validate the exact JSON shape about to be published. This catches values
   // omitted by JSON.stringify (for example an accidentally undefined authRef)

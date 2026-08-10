@@ -9,6 +9,7 @@ const fsState = vi.hoisted(() => ({
   events: [] as string[],
   failTempFsync: false,
   failParentFsync: false,
+  parentFsyncErrorCode: 'EIO',
   dropLockAfterTempFsync: false,
   maxWriteBytes: Number.POSITIVE_INFINITY,
   tempWriteSizes: [] as number[],
@@ -91,7 +92,11 @@ vi.mock('node:fs', async importOriginal => {
       }
       if (path === dirname(fsState.registryPath)) {
         fsState.events.push('parent-fsync');
-        if (fsState.failParentFsync) throw ioError('parent fsync failed');
+        if (fsState.failParentFsync) {
+          throw Object.assign(new Error('parent fsync failed'), {
+            code: fsState.parentFsyncErrorCode,
+          });
+        }
       }
       actual.fsyncSync(fd);
     }),
@@ -111,7 +116,12 @@ import {
   rmSync,
   writeFileSync,
 } from 'node:fs';
-import { emptyRegistry, loadRegistry, saveRegistry } from '../src/registry/io.js';
+import {
+  emptyRegistry,
+  loadRegistry,
+  saveRegistry,
+  syncParentDirectory,
+} from '../src/registry/io.js';
 import {
   RegistryLockLostError,
   withRegistryWriteLockSync,
@@ -130,6 +140,7 @@ describe('registry publication durability', () => {
     fsState.events = [];
     fsState.failTempFsync = false;
     fsState.failParentFsync = false;
+    fsState.parentFsyncErrorCode = 'EIO';
     fsState.dropLockAfterTempFsync = false;
     fsState.maxWriteBytes = Number.POSITIVE_INFINITY;
     fsState.tempWriteSizes = [];
@@ -175,6 +186,27 @@ describe('registry publication durability', () => {
     expect(fsState.events).toEqual(['temp-fsync']);
     expect(existsSync(fsState.registryPath)).toBe(false);
   });
+
+  it('does not acquire a directory durability contract for an ordinary lenient read', () => {
+    writeFileSync(fsState.registryPath, `${JSON.stringify(emptyRegistry())}\n`);
+    fsState.failParentFsync = true;
+    fsState.parentFsyncErrorCode = 'EACCES';
+
+    expect(loadRegistry(fsState.registryPath)).toEqual(emptyRegistry());
+    expect(fsState.events).toEqual([]);
+    expect(() => syncParentDirectory(fsState.registryPath)).toThrow('parent fsync failed');
+  });
+
+  it.each(['EINVAL', 'ENOTSUP', 'EPERM'])(
+    'tolerates only the documented platform directory-fsync error %s',
+    code => {
+      fsState.failParentFsync = true;
+      fsState.parentFsyncErrorCode = code;
+
+      expect(() => syncParentDirectory(fsState.registryPath)).not.toThrow();
+      expect(fsState.events).toEqual(['parent-fsync']);
+    },
+  );
 
   it('classifies selected-account migration write failures as filesystem recovery', () => {
     writeFileSync(fsState.registryPath, `${JSON.stringify({
@@ -276,7 +308,7 @@ describe('registry publication durability', () => {
     expect(thrown?.message).not.toContain('Stop other Clodex processes');
   });
 
-  it('repairs a post-rename parent sync failure on the next selected-account load', () => {
+  it('repairs a post-rename parent sync failure at the next selected-account write boundary', () => {
     writeFileSync(fsState.registryPath, `${JSON.stringify({
       schemaVersion: 3,
       providers: [{
@@ -305,8 +337,15 @@ describe('registry publication durability', () => {
     fsState.failParentFsync = false;
     fsState.events = [];
     fsState.registryReadCount = 0;
-    expect(loadRegistry(fsState.registryPath).schemaVersion).toBe(5);
-    expect(fsState.events).toEqual(['parent-fsync']);
+    const loaded = loadRegistry(fsState.registryPath);
+    expect(loaded.schemaVersion).toBe(5);
+    expect(fsState.events).toEqual([]);
+
+    withRegistryWriteLockSync(
+      () => saveRegistry(loaded, fsState.registryPath),
+      { lockPath: `${fsState.registryPath}.lock` },
+    );
+    expect(fsState.events).toEqual(['temp-fsync', 'rename', 'parent-fsync']);
   });
 
   it('syncs an already-migrated winner reread under the migration lock', () => {
@@ -355,10 +394,10 @@ describe('registry publication durability', () => {
     fsState.registryReadCount = 0;
     fsState.replaceRegistryAtRead = 0;
     expect(loadRegistry(fsState.registryPath).schemaVersion).toBe(5);
-    expect(fsState.events).toEqual(['parent-fsync']);
+    expect(fsState.events).toEqual([]);
   });
 
-  it('repairs a post-rename parent sync failure after clearing back to schema v2', () => {
+  it('repairs a post-rename clear at the next registry write boundary', () => {
     writeFileSync(fsState.registryPath, `${JSON.stringify({
       schemaVersion: 5,
       providers: [{
@@ -394,8 +433,15 @@ describe('registry publication durability', () => {
     fsState.failParentFsync = false;
     fsState.events = [];
     fsState.registryReadCount = 0;
-    expect(loadRegistry(fsState.registryPath).schemaVersion).toBe(2);
-    expect(fsState.events).toEqual(['parent-fsync']);
+    const loaded = loadRegistry(fsState.registryPath);
+    expect(loaded.schemaVersion).toBe(2);
+    expect(fsState.events).toEqual([]);
+
+    withRegistryWriteLockSync(
+      () => saveRegistry(loaded, fsState.registryPath),
+      { lockPath: `${fsState.registryPath}.lock` },
+    );
+    expect(fsState.events).toEqual(['temp-fsync', 'rename', 'parent-fsync']);
   });
 
   it('reports a parent sync failure only after the rename has committed', () => {
