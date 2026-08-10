@@ -1530,6 +1530,82 @@ describe('selective HTTP proxy', () => {
     }
   }, 20_000);
 
+  it('records a normally closed error SSE as a failed terminal without changing client bytes', async () => {
+    const certificates = ensureHttpProxyCertificates();
+    const inferenceLogPath = join(testHome, 'adapter-error-sse-inference.jsonl');
+    const errorSse = [
+      'event: message_start',
+      'data: {"type":"message_start","message":{"usage":{"input_tokens":0,"output_tokens":0}}}',
+      '',
+      'event: error',
+      'data: {"type":"error","error":{"type":"api_error","message":"synthetic failure"}}',
+      '',
+      '',
+    ].join('\n');
+    const adapterServer = http.createServer(async (req, res) => {
+      const ended = once(req, 'end');
+      req.resume();
+      await ended;
+      res.writeHead(200, {
+        'Content-Type': 'text/event-stream',
+        'Content-Length': Buffer.byteLength(errorSse),
+        'Connection': 'close',
+      });
+      res.end(errorSse);
+    });
+    const adapterPort = await listen(adapterServer);
+    const route = {
+      aliasId: 'clodex:test:translated-model',
+      realModelId: 'translated-model',
+      displayName: 'Translated Model',
+      upstreamUrl: '',
+      apiKey: 'provider-key',
+      modelFormat: 'openai' as const,
+      npm: '@ai-sdk/openai-compatible',
+      providerId: 'test-provider',
+    };
+    const proxy = await startHttpProxy({
+      routes: [route],
+      adapterHandle: {
+        port: adapterPort,
+        token: 'adapter-local-token',
+        close: () => {
+          adapterServer.closeAllConnections();
+          adapterServer.close();
+        },
+      },
+      inferenceLogPath,
+    });
+
+    try {
+      const response = await requestMitm(
+        proxy.port,
+        certificates.caCert,
+        '/v1/messages',
+        JSON.stringify({
+          model: route.aliasId,
+          messages: [{ role: 'user', content: 'synthetic error terminal' }],
+          stream: true,
+        }),
+      );
+
+      expect(response).toContain(errorSse);
+      const entries = readFileSync(inferenceLogPath, 'utf8').trim().split('\n').map(line => JSON.parse(line));
+      const requestEntry = entries.find(entry => !entry.event);
+      expect(entries).toContainEqual(expect.objectContaining({
+        event: 'response_failed',
+        requestId: requestEntry.requestId,
+        statusCode: 200,
+        terminalOutcome: 'error',
+        terminalCategory: 'error_sse',
+        terminationSource: 'upstream_failure',
+      }));
+      expect(entries.some(entry => entry.event === 'response_completed')).toBe(false);
+    } finally {
+      await proxy.close();
+    }
+  }, 20_000);
+
   it('terminates and logs a translated response when the adapter closes before end', async () => {
     const certificates = ensureHttpProxyCertificates();
     const inferenceLogPath = join(testHome, 'adapter-abort-inference.jsonl');

@@ -1,17 +1,19 @@
 import { afterEach, describe, it, expect } from 'vitest';
-import { mkdtempSync, readFileSync, rmSync } from 'node:fs';
+import { chmodSync, mkdtempSync, readFileSync, rmSync, statSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import {
   clearTraceSecrets,
   getInferenceSessionLogPath,
   getLatestMessagePreview,
+  getSessionLogPath,
   redactTraceLine,
   redactTraceLog,
   registerTraceSecret,
   writeInferenceRequestLog,
   writeInferenceRouteUnavailableLog,
   writeInferenceResponseLifecycleLog,
+  writeInferenceWebSocketDiagnosticLog,
   writeInferenceResponseErrorLog,
   writeProxyLifecycleLog,
   writeWebSocketDiagnosticRequestLog,
@@ -141,6 +143,24 @@ describe('inference request log', () => {
         port: 58985,
         inheritedProxyPort: 58972,
       });
+    } finally {
+      if (previousHome === undefined) delete process.env['CLODEX_HOME'];
+      else process.env['CLODEX_HOME'] = previousHome;
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it('confines a Claude-owned mode-0644 debug child below the mode-0700 session directory', () => {
+    const dir = mkdtempSync(join(tmpdir(), 'clodex-session-mode-'));
+    const previousHome = process.env['CLODEX_HOME'];
+    process.env['CLODEX_HOME'] = dir;
+    try {
+      const child = getSessionLogPath('claude-debug');
+      writeFileSync(child, 'synthetic debug placeholder', { mode: 0o644 });
+      chmodSync(child, 0o644);
+
+      expect(statSync(join(dir, 'logs', 'sessions')).mode & 0o777).toBe(0o700);
+      expect(statSync(child).mode & 0o777).toBe(0o644);
     } finally {
       if (previousHome === undefined) delete process.env['CLODEX_HOME'];
       else process.env['CLODEX_HOME'] = previousHome;
@@ -288,6 +308,107 @@ describe('inference request log', () => {
     }
   });
 
+  it('writes only allowlisted terminal WebSocket facts and rejects unsafe upstream ids', () => {
+    const dir = mkdtempSync(join(tmpdir(), 'clodex-inference-ws-'));
+    const path = join(dir, 'requests.jsonl');
+    try {
+      writeInferenceWebSocketDiagnosticLog(path, {
+        event: 'ws_response_error',
+        requestId: 'req_correlation123',
+        source: 'error_frame',
+        mappedStatusCode: 500,
+        replaySafe: false,
+        outputBegan: true,
+        attemptCount: 1,
+        replayCount: 0,
+        upstreamRequestId: '123e4567-e89b-42d3-a456-426614174000',
+        claudeSessionId: 'SENTINEL-SESSION',
+        accountId: 'SENTINEL-ACCOUNT',
+        partitionKey: 'SENTINEL-PARTITION',
+        messageId: 'SENTINEL-MESSAGE',
+        headers: { authorization: 'SENTINEL-HEADER' },
+        body: 'SENTINEL-BODY',
+        errorMessage: 'SENTINEL-PROMPT',
+      });
+      writeInferenceWebSocketDiagnosticLog(path, {
+        event: 'ws_transport_retry',
+        requestId: 'req_correlation123',
+        source: 'socket_close',
+        closeCode: 1006,
+        replaySafe: true,
+        outcome: 'started',
+        outputBegan: false,
+        attemptCount: 2,
+        replayCount: 1,
+        upstreamRequestId: 'req_upstream123',
+      });
+      writeInferenceWebSocketDiagnosticLog(path, {
+        event: 'ws_transport_retry',
+        requestId: 'req_correlation123',
+        source: 'socket_close',
+        closeCode: 1006,
+        replaySafe: true,
+        outcome: 'exhausted',
+        outputBegan: false,
+        attemptCount: 2,
+        replayCount: 1,
+        upstreamRequestId: 'sk-secret-like-request-id',
+      });
+      writeInferenceWebSocketDiagnosticLog(path, {
+        event: 'ws_response_error',
+        willRetry: true,
+        source: 'response_event',
+      });
+      writeInferenceWebSocketDiagnosticLog(path, {
+        event: 'ws_head_decision',
+        source: 'socket_close',
+      });
+
+      const raw = readFileSync(path, 'utf8');
+      const entries = raw.trim().split('\n').map(line => JSON.parse(line));
+      expect(entries).toHaveLength(3);
+      expect(entries[0]).toMatchObject({
+        event: 'ws_response_error',
+        transport: 'openai_responses_websocket',
+        requestId: 'req_correlation123',
+        source: 'error_frame',
+        statusCode: 500,
+        replaySafe: false,
+        outcome: 'terminal',
+        outputBegan: true,
+        attemptCount: 1,
+        replayCount: 0,
+        upstreamRequestId: '123e4567-e89b-42d3-a456-426614174000',
+      });
+      expect(Object.keys(entries[0]).sort()).toEqual([
+        'attemptCount', 'event', 'outcome', 'outputBegan', 'replayCount', 'replaySafe',
+        'requestId', 'source', 'statusCode', 'timestamp', 'transport', 'upstreamRequestId',
+      ]);
+      expect(entries[1]).toMatchObject({
+        event: 'ws_transport_retry',
+        source: 'socket_close',
+        closeCode: 1006,
+        replaySafe: true,
+        outcome: 'started',
+        outputBegan: false,
+        attemptCount: 2,
+        replayCount: 1,
+      });
+      expect(entries[1].upstreamRequestId).toBe('req_upstream123');
+      expect(entries[2]).toMatchObject({ outcome: 'exhausted', closeCode: 1006 });
+      expect(entries[2]).not.toHaveProperty('upstreamRequestId');
+      for (const sentinel of [
+        'SENTINEL-SESSION', 'SENTINEL-ACCOUNT', 'SENTINEL-PARTITION',
+        'SENTINEL-MESSAGE', 'SENTINEL-HEADER', 'SENTINEL-BODY', 'SENTINEL-PROMPT',
+        'sk-secret-like-request-id',
+      ]) {
+        expect(raw).not.toContain(sentinel);
+      }
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
   it('records local route rejection without upstream attribution', () => {
     const dir = mkdtempSync(join(tmpdir(), 'clodex-route-unavailable-'));
     const path = join(dir, 'requests.jsonl');
@@ -344,6 +465,11 @@ describe('inference request log', () => {
         errorSignature: 'reasoning_part_not_found',
         failureSource: 'adapter_response_error',
         terminationSource: 'upstream_failure',
+        terminalOutcome: 'error',
+        terminalCategory: 'total_timeout',
+        elapsedMs: 600_000.4,
+        limitMs: 600_000,
+        outputBegan: true,
       });
       writeInferenceResponseLifecycleLog(path, {
         event: 'response_client_disconnected',
@@ -388,6 +514,11 @@ describe('inference request log', () => {
         errorSignature: 'reasoning_part_not_found',
         failureSource: 'adapter_response_error',
         terminationSource: 'upstream_failure',
+        terminalOutcome: 'error',
+        terminalCategory: 'total_timeout',
+        elapsedMs: 600_000,
+        limitMs: 600_000,
+        outputBegan: true,
       });
       expect(failure).not.toHaveProperty('claudeSessionId');
       expect(disconnect).toMatchObject({

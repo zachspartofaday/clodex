@@ -38,6 +38,40 @@ export type SdkTranslationErrorSignature =
   | 'reasoning_part_not_found'
   | 'text_part_not_found';
 
+type SdkTimeoutCategory = 'idle_timeout' | 'total_timeout';
+
+interface SdkTimeoutDetails {
+  category: SdkTimeoutCategory;
+  elapsedMs: number;
+  limitMs: number;
+  outputBegan: boolean;
+}
+
+class SdkTimeoutError extends Error implements SdkTimeoutDetails {
+  override readonly name = 'SdkTimeoutError';
+
+  constructor(
+    readonly category: SdkTimeoutCategory,
+    message: string,
+    readonly elapsedMs: number,
+    readonly limitMs: number,
+    readonly outputBegan: boolean,
+  ) {
+    super(message);
+  }
+}
+
+export function sdkTimeoutDetails(error: unknown): SdkTimeoutDetails | undefined {
+  return error instanceof SdkTimeoutError
+    ? {
+        category: error.category,
+        elapsedMs: error.elapsedMs,
+        limitMs: error.limitMs,
+        outputBegan: error.outputBegan,
+      }
+    : undefined;
+}
+
 /** Classify privacy-safe AI SDK stream-state errors without logging dynamic part ids. */
 export function sdkTranslationErrorSignature(error: unknown): SdkTranslationErrorSignature | undefined {
   const message = error instanceof Error
@@ -993,12 +1027,28 @@ export async function streamAnthropicResponse(
   const idleAbort = new AbortController();
   const stopForwardingAbort = forwardAbortSignal(observer?.abortSignal, idleAbort);
   const abortSignal = idleAbort.signal;
+  const startedAt = Date.now();
+  let lastPartAt = startedAt;
+  let outputBegan = false;
+  const idleTimeoutError = () => new SdkTimeoutError(
+    'idle_timeout',
+    `no data received from provider for ${Math.round(idleTimeoutMs / 1000)}s`,
+    Math.max(0, Date.now() - lastPartAt),
+    idleTimeoutMs,
+    outputBegan,
+  );
   let idleTimer = setTimeout(
-    () => idleAbort.abort(new Error(`no data received from provider for ${Math.round(idleTimeoutMs / 1000)}s`)),
+    () => idleAbort.abort(idleTimeoutError()),
     idleTimeoutMs,
   );
   const totalTimer = setTimeout(
-    () => idleAbort.abort(new Error(`provider stream exceeded ${Math.round(SDK_TOTAL_TIMEOUT_MS / 1000)}s`)),
+    () => idleAbort.abort(new SdkTimeoutError(
+      'total_timeout',
+      `provider stream exceeded ${Math.round(SDK_TOTAL_TIMEOUT_MS / 1000)}s`,
+      Math.max(0, Date.now() - startedAt),
+      SDK_TOTAL_TIMEOUT_MS,
+      outputBegan,
+    )),
     SDK_TOTAL_TIMEOUT_MS,
   );
   // Do not combine streamText's total/chunk timeout signals here. In AI SDK
@@ -1016,8 +1066,9 @@ export async function streamAnthropicResponse(
     try {
       for await (const part of result.stream as AsyncIterable<FullStreamPart>) {
         clearTimeout(idleTimer);
+        lastPartAt = Date.now();
         idleTimer = setTimeout(
-          () => idleAbort.abort(new Error(`no data received from provider for ${Math.round(idleTimeoutMs / 1000)}s`)),
+          () => idleAbort.abort(idleTimeoutError()),
           idleTimeoutMs,
         );
         yield part;
@@ -1028,7 +1079,17 @@ export async function streamAnthropicResponse(
   })();
 
   try {
-    await writeAnthropicStream(watchedStream, modelId, write, log, { ...observer, abortSignal }, params.tools);
+    await writeAnthropicStream(
+      watchedStream,
+      modelId,
+      chunk => {
+        if (chunk.length > 0) outputBegan = true;
+        write(chunk);
+      },
+      log,
+      { ...observer, abortSignal },
+      params.tools,
+    );
   } finally {
     stopForwardingAbort();
     clearTimeout(idleTimer);
@@ -1064,12 +1125,28 @@ export async function generateAnthropicResponse(
     const stopForwardingAbort = forwardAbortSignal(options.abortSignal, forceAbort);
     const abortSignal = forceAbort.signal;
     const idleTimeoutMs = options.idleTimeoutMs ?? SDK_STREAM_IDLE_TIMEOUT_MS;
+    const startedAt = Date.now();
+    let lastPartAt = startedAt;
+    let outputBegan = false;
+    const idleTimeoutError = () => new SdkTimeoutError(
+      'idle_timeout',
+      `no data received from provider for ${Math.round(idleTimeoutMs / 1000)}s`,
+      Math.max(0, Date.now() - lastPartAt),
+      idleTimeoutMs,
+      outputBegan,
+    );
     let idleTimer = setTimeout(
-      () => forceAbort.abort(new Error(`no data received from provider for ${Math.round(idleTimeoutMs / 1000)}s`)),
+      () => forceAbort.abort(idleTimeoutError()),
       idleTimeoutMs,
     );
     const totalTimer = setTimeout(
-      () => forceAbort.abort(new Error(`provider stream exceeded ${Math.round(SDK_TOTAL_TIMEOUT_MS / 1000)}s`)),
+      () => forceAbort.abort(new SdkTimeoutError(
+        'total_timeout',
+        `provider stream exceeded ${Math.round(SDK_TOTAL_TIMEOUT_MS / 1000)}s`,
+        Math.max(0, Date.now() - startedAt),
+        SDK_TOTAL_TIMEOUT_MS,
+        outputBegan,
+      )),
       SDK_TOTAL_TIMEOUT_MS,
     );
     // See the streaming path above: Relay owns these timers and explicitly
@@ -1088,8 +1165,9 @@ export async function generateAnthropicResponse(
     try {
       for await (const part of r.stream as AsyncIterable<FullStreamPart>) {
         clearTimeout(idleTimer);
+        lastPartAt = Date.now();
         idleTimer = setTimeout(
-          () => forceAbort.abort(new Error(`no data received from provider for ${Math.round(idleTimeoutMs / 1000)}s`)),
+          () => forceAbort.abort(idleTimeoutError()),
           idleTimeoutMs,
         );
         options.onPart?.(part.type);
@@ -1101,8 +1179,11 @@ export async function generateAnthropicResponse(
             ? part.error
             : new Error(typeof part.error === 'string' ? part.error : 'Upstream stream failed');
         }
-        if (part.type === 'text-delta') streamedText.push(part.text ?? '');
-        else if (part.type === 'tool-call') {
+        if (part.type === 'text-delta') {
+          if ((part.text ?? '').length > 0) outputBegan = true;
+          streamedText.push(part.text ?? '');
+        } else if (part.type === 'tool-call') {
+          outputBegan = true;
           streamedToolCalls.push({
             toolCallId: part.toolCallId ?? '',
             toolName: part.toolName ?? '',
@@ -1129,8 +1210,15 @@ export async function generateAnthropicResponse(
   } else {
     const generateAbort = new AbortController();
     const stopForwardingAbort = forwardAbortSignal(options?.abortSignal, generateAbort);
+    const startedAt = Date.now();
     const totalTimer = setTimeout(
-      () => generateAbort.abort(new Error(`provider request exceeded ${Math.round(SDK_TOTAL_TIMEOUT_MS / 1000)}s`)),
+      () => generateAbort.abort(new SdkTimeoutError(
+        'total_timeout',
+        `provider request exceeded ${Math.round(SDK_TOTAL_TIMEOUT_MS / 1000)}s`,
+        Math.max(0, Date.now() - startedAt),
+        SDK_TOTAL_TIMEOUT_MS,
+        false,
+      )),
       SDK_TOTAL_TIMEOUT_MS,
     );
     try {

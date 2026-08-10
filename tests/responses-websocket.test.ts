@@ -304,6 +304,10 @@ describe('createResponsesWebSocketFetch', () => {
       socketErrorCode: 'ECONNRESET',
       frameCount: 0,
       emittedModelData: false,
+      replaySafe: true,
+      outputBegan: false,
+      attemptCount: 2,
+      replayCount: 1,
       errorMessageBytes: 21,
       errorMessageHash: expect.stringMatching(/^[a-f0-9]{16}$/),
     }));
@@ -312,8 +316,13 @@ describe('createResponsesWebSocketFetch', () => {
       outcome: 'recovered',
       requestId: 'req-socket-error',
       connectionId: 2,
+      source: 'socket_error',
       frameCount: 1,
       emittedModelData: false,
+      replaySafe: true,
+      outputBegan: false,
+      attemptCount: 2,
+      replayCount: 1,
     }));
     expect(JSON.stringify(diagnostics)).not.toContain('secret socket failure');
   });
@@ -526,7 +535,10 @@ describe('createResponsesWebSocketFetch', () => {
   });
 
   it('does not retry after model output has reached the downstream stream', async () => {
-    const wsFetch = createResponsesWebSocketFetch(WS_URL);
+    const diagnostics: ResponsesWebSocketDiagnosticEvent[] = [];
+    const wsFetch = createResponsesWebSocketFetch(WS_URL, undefined, {
+      onDiagnostic: event => diagnostics.push(event),
+    });
     const res = await wsFetch('https://x', {
       method: 'POST',
       headers: {},
@@ -547,6 +559,54 @@ describe('createResponsesWebSocketFetch', () => {
     const body = await readAll(res);
     expect(body).toContain('partial output');
     expect(body).toContain('websocket_transport_error');
+    expect(diagnostics).toContainEqual(expect.objectContaining({
+      event: 'ws_response_error',
+      outcome: 'terminal',
+      source: 'socket_error',
+      replaySafe: false,
+      outputBegan: true,
+      attemptCount: 1,
+      replayCount: 0,
+    }));
+    expect(diagnostics).not.toContainEqual(expect.objectContaining({
+      event: 'ws_transport_retry',
+    }));
+  });
+
+  it('records close 1006 after output as terminal and never replays it', async () => {
+    const diagnostics: ResponsesWebSocketDiagnosticEvent[] = [];
+    const wsFetch = createResponsesWebSocketFetch(WS_URL, undefined, {
+      onDiagnostic: event => diagnostics.push(event),
+    });
+    const res = await wsFetch('https://x', {
+      method: 'POST',
+      headers: {},
+      body: JSON.stringify(sessionPayload([])),
+    });
+    const socket = lastSocket();
+    socket.emit('open');
+    socket.emit('message', Buffer.from(JSON.stringify({
+      type: 'response.output_text.delta',
+      delta: 'partial output',
+    })));
+    socket.emit('close', 1006, Buffer.from('SENTINEL-PRIVATE-CLOSE-REASON'));
+
+    expect(fakeSockets).toHaveLength(1);
+    expect(await readAll(res)).toContain('websocket_transport_error');
+    expect(diagnostics).toContainEqual(expect.objectContaining({
+      event: 'ws_response_error',
+      outcome: 'terminal',
+      source: 'socket_close',
+      closeCode: 1006,
+      replaySafe: false,
+      outputBegan: true,
+      attemptCount: 1,
+      replayCount: 0,
+    }));
+    expect(diagnostics).not.toContainEqual(expect.objectContaining({
+      event: 'ws_transport_retry',
+    }));
+    expect(JSON.stringify(diagnostics)).not.toContain('SENTINEL-PRIVATE-CLOSE-REASON');
   });
 
   it('retries a failed incremental continuation with the complete original context', async () => {
@@ -989,6 +1049,55 @@ describe('createResponsesWebSocketFetch', () => {
     // suppressed so a diagnostics consumer does not read one failed request as
     // two distinct failures under disjoint field sets.
     expect(diagnostics.filter(event => event.event === 'ws_response_error')).toHaveLength(1);
+  });
+
+  it('keeps only a tightly shaped upstream request id from an in-band HTTP 500', async () => {
+    const diagnostics: ResponsesWebSocketDiagnosticEvent[] = [];
+    const wsFetch = createResponsesWebSocketFetch(WS_URL, undefined, {
+      onDiagnostic: event => diagnostics.push(event),
+    });
+    const safeId = '123e4567-e89b-42d3-a456-426614174000';
+    const safe = await wsFetch('https://x', {
+      method: 'POST', headers: {}, body: JSON.stringify(sessionPayload([])),
+    });
+    lastSocket().emit('message', Buffer.from(JSON.stringify({
+      type: 'error',
+      status: 500,
+      request_id: safeId,
+      error: { type: 'server_error', message: 'SENTINEL-UPSTREAM-BODY' },
+    })));
+    await readAll(safe);
+
+    expect(diagnostics).toContainEqual(expect.objectContaining({
+      event: 'ws_response_error',
+      outcome: 'terminal',
+      source: 'error_frame',
+      mappedStatusCode: 500,
+      upstreamRequestId: safeId,
+      replaySafe: true,
+      outputBegan: false,
+      attemptCount: 1,
+      replayCount: 0,
+    }));
+
+    const malformed = await wsFetch('https://x', {
+      method: 'POST', headers: {}, body: JSON.stringify(sessionPayload([])),
+    });
+    lastSocket().emit('message', Buffer.from(JSON.stringify({
+      type: 'error',
+      status: 500,
+      request_id: 'sk-secret-like-request-id',
+      error: { type: 'server_error', message: 'SENTINEL-SECOND-BODY' },
+    })));
+    await readAll(malformed);
+
+    const errors = diagnostics.filter(event => event.event === 'ws_response_error');
+    expect(errors).toHaveLength(2);
+    expect(errors[1]).not.toHaveProperty('upstreamRequestId');
+    const serialized = JSON.stringify(errors);
+    expect(serialized).not.toContain('sk-secret-like-request-id');
+    expect(serialized).not.toContain('SENTINEL-UPSTREAM-BODY');
+    expect(serialized).not.toContain('SENTINEL-SECOND-BODY');
   });
 
   it('bounds an upstream-controlled error code in the rejection diagnostic', async () => {

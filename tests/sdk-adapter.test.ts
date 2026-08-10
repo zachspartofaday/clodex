@@ -14,6 +14,7 @@ import {
   supportsOpenAiPromptCacheBreakpoints,
   extractClaudeSessionId,
   claudeSessionPromptCacheKey,
+  sdkTimeoutDetails,
   sdkTranslationErrorSignature,
   resetServiceTierWarningForTests,
 } from '../src/sdk-adapter.js';
@@ -989,15 +990,68 @@ describe('streamAnthropicResponse idle timeout', () => {
       },
     };
 
-    await expect(streamAnthropicResponse(
+    const error = await streamAnthropicResponse(
       hangingModel as never,
       { messages: [{ role: 'user', content: [{ type: 'text', text: 'hi' }] }] as never },
       'test-model',
       () => {},
       undefined,
       { idleTimeoutMs: 50 },
-    )).rejects.toThrow('no data received from provider');
+    ).then(() => undefined, reason => reason);
+
+    expect(error).toBeInstanceOf(Error);
+    expect((error as Error).message).toContain('no data received from provider');
+    expect(sdkTimeoutDetails(error)).toMatchObject({
+      category: 'idle_timeout',
+      limitMs: 50,
+      outputBegan: false,
+    });
+    expect(sdkTimeoutDetails(error)?.elapsedMs).toBeGreaterThanOrEqual(40);
   }, 10_000);
+
+  it('classifies the fixed total timeout while SDK parts continue and output has begun', async () => {
+    vi.useFakeTimers();
+    vi.resetModules();
+    async function* stream() {
+      yield { type: 'start' };
+      for (;;) {
+        await new Promise(resolve => setTimeout(resolve, 1_000));
+        yield { type: 'text-delta', text: 'x' };
+      }
+    }
+    const streamText = vi.fn(() => ({ stream: stream() }));
+    vi.doMock('ai', () => ({
+      generateText: vi.fn(),
+      streamText,
+      tool: vi.fn((spec: unknown) => spec),
+      jsonSchema: vi.fn((schema: unknown) => schema),
+    }));
+
+    try {
+      const adapter = await import('../src/sdk-adapter.js');
+      const settled = adapter.streamAnthropicResponse(
+        {} as never,
+        { messages: [] },
+        'test-model',
+        () => {},
+      ).then(() => undefined, reason => reason);
+
+      await vi.advanceTimersByTimeAsync(adapter.SDK_TOTAL_TIMEOUT_MS);
+      const error = await settled;
+      expect((error as Error).message).toContain('provider stream exceeded 600s');
+      expect(adapter.sdkTimeoutDetails(error)).toEqual({
+        category: 'total_timeout',
+        elapsedMs: adapter.SDK_TOTAL_TIMEOUT_MS,
+        limitMs: adapter.SDK_TOTAL_TIMEOUT_MS,
+        outputBegan: true,
+      });
+      expect(streamText.mock.calls[0]![0].abortSignal.aborted).toBe(true);
+    } finally {
+      vi.useRealTimers();
+      vi.doUnmock('ai');
+      vi.resetModules();
+    }
+  });
 });
 
 // ── streaming translation ────────────────────────────────────────────────────

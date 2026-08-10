@@ -1062,6 +1062,9 @@ describe('SDK translated error logging', () => {
         phase: 'preparing_translation',
         sdkParts: 0,
         translatedBytes: 0,
+        terminalOutcome: 'error',
+        terminalCategory: 'local_adapter_exception',
+        outputBegan: false,
       }));
     } finally {
       handle.close();
@@ -1137,6 +1140,9 @@ describe('SDK translated error logging', () => {
         event: 'translation_failed',
         requestId: 'req-error-1',
         lastPartType: 'error',
+        terminalOutcome: 'error',
+        terminalCategory: 'upstream_error',
+        outputBegan: false,
       }));
     } finally {
       if (previousRequestPreview === undefined) delete process.env['CLODEX_LOG_REQUEST_PREVIEW'];
@@ -1420,6 +1426,9 @@ describe('SDK translated error logging', () => {
       expect(completed.sdkParts).toBeGreaterThan(0);
       expect(completed.translatedBytes).toBeGreaterThan(0);
       expect(completed.translatedChunks).toBeGreaterThan(0);
+      expect(completed).not.toHaveProperty('terminalOutcome');
+      expect(completed).not.toHaveProperty('terminalCategory');
+      expect(completed).not.toHaveProperty('outputBegan');
     } finally {
       handle.close();
       await new Promise<void>(resolve => upstream.close(() => resolve()));
@@ -1560,18 +1569,20 @@ describe('SDK translated error logging', () => {
         max_tokens: 100,
         messages: [{ role: 'user', content: 'hi' }],
         stream: false,
-      }, 'req-nonstream-1');
+      });
 
       expect(res.status).toBe(200);
       const entries = readFileSync(inferenceLogPath, 'utf8').trim().split('\n').map(line => JSON.parse(line));
+      const generatedRequestId = entries.find(entry => entry.event === 'translation_dispatched')?.requestId;
+      expect(generatedRequestId).toMatch(/^[0-9a-f-]{36}$/);
       expect(entries).toContainEqual(expect.objectContaining({
         event: 'translation_dispatched',
-        requestId: 'req-nonstream-1',
+        requestId: generatedRequestId,
         phase: 'waiting_for_sdk',
       }));
       expect(entries).toContainEqual(expect.objectContaining({
         event: 'translation_completed',
-        requestId: 'req-nonstream-1',
+        requestId: generatedRequestId,
         phase: 'waiting_for_sdk',
       }));
     } finally {
