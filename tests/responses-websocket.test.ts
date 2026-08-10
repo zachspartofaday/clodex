@@ -3620,29 +3620,45 @@ describe('createResponsesWebSocketFetch', () => {
     expect(sent.input).toEqual(full);
   });
 
-  it('starts and resumes TTL clocks only after each response stream finishes', async () => {
+  it('lets active work finish past hard TTL, then retires the socket before reuse', async () => {
     let now = 1_000;
+    const diagnostics: ResponsesWebSocketDiagnosticEvent[] = [];
     const wsFetch = createResponsesWebSocketFetch(WS_URL, undefined, {
-      accountId: 'acct-paused-ttl',
-      nurseryIdleTtlMs: 100,
-      idleTtlMs: 100,
+      accountId: 'acct-physical-hard-ttl',
+      nurseryIdleTtlMs: 10_000,
+      idleTtlMs: 10_000,
       hardTtlMs: 100,
       now: () => now,
+      onDiagnostic: event => diagnostics.push(event),
     });
     const firstInput = [{ role: 'user', content: [{ type: 'input_text', text: 'one' }] }];
     const first = await wsFetch('https://x', {
       method: 'POST', headers: {}, body: JSON.stringify(sessionPayload(firstInput)),
     });
-    const socket = lastSocket();
-    socket.emit('open');
+    const firstSocket = lastSocket();
+    firstSocket.emit('open');
 
-    // The initial stream lasts far longer than every TTL, but none of that
-    // in-flight time should age the retained head.
-    now = 2_000;
-    emitTextResponse(socket, 'resp_pause_1', 'answer one');
+    // cleanupExpiredConnections skips active entries, so another lookup after
+    // the physical hard TTL cannot interrupt this productive response.
+    now = 1_101;
+    const cleanupProbe = await wsFetch('https://x', {
+      method: 'POST',
+      headers: {},
+      body: JSON.stringify(sessionPayload(
+        [{ role: 'user', content: [{ type: 'input_text', text: 'probe' }] }],
+        { prompt_cache_key: 'hard-ttl-cleanup-probe' },
+      )),
+    });
+    expect(firstSocket.close).not.toHaveBeenCalled();
+    const probeSocket = lastSocket();
+    probeSocket.emit('open');
+    emitTextResponse(probeSocket, 'resp_hard_ttl_probe', 'probe answer');
+    await readAll(cleanupProbe);
+
+    emitTextResponse(firstSocket, 'resp_hard_ttl', 'answer one');
     await readAll(first);
+    expect(firstSocket.close).not.toHaveBeenCalled();
 
-    now = 2_050;
     const secondInput = [
       ...firstInput,
       { role: 'assistant', content: [{ type: 'output_text', text: 'answer one' }] },
@@ -3651,26 +3667,22 @@ describe('createResponsesWebSocketFetch', () => {
     const second = await wsFetch('https://x', {
       method: 'POST', headers: {}, body: JSON.stringify(sessionPayload(secondInput)),
     });
-    expect(fakeSockets).toHaveLength(1);
 
-    // Suspend the already-running clocks during another long response.
-    now = 3_050;
-    emitTextResponse(socket, 'resp_pause_2', 'answer two');
-    await readAll(second);
-
-    now = 3_099;
-    const thirdInput = [
-      ...secondInput,
-      { role: 'assistant', content: [{ type: 'output_text', text: 'answer two' }] },
-      { role: 'user', content: [{ type: 'input_text', text: 'three' }] },
-    ];
-    await wsFetch('https://x', {
-      method: 'POST', headers: {}, body: JSON.stringify(sessionPayload(thirdInput)),
+    expect(firstSocket.close).toHaveBeenCalled();
+    expect(fakeSockets).toHaveLength(3);
+    const replacement = lastSocket();
+    replacement.emit('open');
+    const sent = JSON.parse(replacement.send.mock.calls[0]![0] as string);
+    expect(sent.previous_response_id).toBeUndefined();
+    expect(sent.input).toEqual(secondInput);
+    expect(diagnostics.at(-1)).toMatchObject({
+      event: 'ws_head_decision',
+      decision: 'new_partition_head',
+      evictions: [expect.objectContaining({ reason: 'hard_ttl' })],
     });
 
-    expect(fakeSockets).toHaveLength(1);
-    const sent = JSON.parse(socket.send.mock.calls[2]![0] as string);
-    expect(sent.previous_response_id).toBe('resp_pause_2');
+    emitTextResponse(replacement, 'resp_hard_ttl_replacement', 'answer two');
+    await readAll(second);
   });
 
   it('promotes a continued nursery head and preserves it past the nursery TTL at capacity', async () => {

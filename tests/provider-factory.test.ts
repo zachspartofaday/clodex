@@ -533,7 +533,7 @@ describe('effortProviderOptions + deepMergeProviderOptions', () => {
 });
 
 describe('createLanguageModel', () => {
-  it('prefers the current OpenAI OAuth token account claim over stored metadata', async () => {
+  it('prefers the current OAuth account claim and uses WebSocket when preference metadata is omitted', async () => {
     vi.resetModules();
     const responses = vi.fn((modelId: string) => ({ modelId, provider: 'openai-responses' }));
     const chat = vi.fn((modelId: string) => ({ modelId, provider: 'openai-chat' }));
@@ -556,17 +556,17 @@ describe('createLanguageModel', () => {
     expect(createOpenAI).toHaveBeenCalledWith({
       apiKey: accessToken,
       baseURL: 'https://chatgpt.com/backend-api/codex',
+      fetch: expect.any(Function),
       headers: {
         'ChatGPT-Account-Id': 'acct-123',
         originator: 'clodex',
       },
     });
-    expect(createOpenAI.mock.calls[0]![0]).not.toHaveProperty('fetch');
     expect(responses).toHaveBeenCalledWith('gpt-5.5');
     vi.doUnmock('@ai-sdk/openai');
   });
 
-  it('uses the custom WebSocket fetch only for OAuth Responses models flagged preferWebSockets', async () => {
+  it('also uses the custom WebSocket fetch when OAuth Responses metadata prefers it', async () => {
     vi.resetModules();
     const responses = vi.fn((modelId: string) => ({ modelId, provider: 'openai-responses' }));
     const chat = vi.fn((modelId: string) => ({ modelId, provider: 'openai-chat' }));

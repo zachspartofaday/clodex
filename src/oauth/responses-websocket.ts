@@ -108,7 +108,6 @@ interface ConnectionEntry {
   generation: 'nursery' | 'established' | 'isolated';
   open: boolean;
   createdAt: number;
-  ttlPausedMs: number;
   inFlightStartedAt?: number;
   lastUsedAt: number;
   inFlight: boolean;
@@ -1447,14 +1446,14 @@ function cleanupExpiredConnections(now: number): Array<Record<string, unknown>> 
     const idleTtlMs = entry.generation === 'nursery'
       ? entry.options.nurseryIdleTtlMs
       : entry.options.idleTtlMs;
-    const ttlAgeMs = Math.max(0, now - entry.createdAt - entry.ttlPausedMs);
-    if (ttlAgeMs >= entry.options.hardTtlMs || now - entry.lastUsedAt >= idleTtlMs) {
+    const physicalAgeMs = Math.max(0, now - entry.createdAt);
+    if (physicalAgeMs >= entry.options.hardTtlMs || now - entry.lastUsedAt >= idleTtlMs) {
       entry.debug('evicting expired idle connection');
       evictions.push({
         connectionId: entry.debugId,
         partitionKey: entry.key,
         generation: entry.generation,
-        reason: ttlAgeMs >= entry.options.hardTtlMs
+        reason: physicalAgeMs >= entry.options.hardTtlMs
           ? 'hard_ttl'
           : entry.generation === 'nursery' ? 'nursery_idle_ttl' : 'idle_ttl',
       });
@@ -1543,11 +1542,8 @@ function dispatchContext(entry: ConnectionEntry, ctx: RequestContext): void {
   if (entry.open) sendContext(entry, ctx);
 }
 
-function finishInFlightPeriod(entry: ConnectionEntry, now: number): void {
-  if (entry.inFlightStartedAt !== undefined) {
-    entry.ttlPausedMs += Math.max(0, now - entry.inFlightStartedAt);
-    entry.inFlightStartedAt = undefined;
-  }
+function finishInFlightPeriod(entry: ConnectionEntry): void {
+  entry.inFlightStartedAt = undefined;
 }
 
 function resetContextForRetry(ctx: RequestContext): void {
@@ -1822,7 +1818,7 @@ function handleSocketMessage(entry: ConnectionEntry, data: RawData): void {
     const failed = FAILURE_EVENT_TYPES.has(type ?? '');
     if (!failed && ctx.responseId && entry.persistent) {
       const now = entry.options.now();
-      finishInFlightPeriod(entry, now);
+      finishInFlightPeriod(entry);
       entry.responseId = ctx.responseId;
       entry.requestInput = inputArray(ctx.originalPayload);
       entry.expectedAssistant = expectedAssistantItems(ctx);
@@ -1874,7 +1870,6 @@ function createConnection(
     generation: persistent ? 'nursery' : 'isolated',
     open: false,
     createdAt: now,
-    ttlPausedMs: 0,
     lastUsedAt: now,
     inFlight: false,
     options,
@@ -2188,9 +2183,7 @@ export function createResponsesWebSocketFetch(
         connectionId: entry.debugId,
         generation: entry.generation,
         inFlight: entry.inFlight,
-        ageMs: Math.max(0, now - entry.createdAt - entry.ttlPausedMs),
-        physicalAgeMs: Math.max(0, now - entry.createdAt),
-        ttlPausedMs: entry.ttlPausedMs,
+        ageMs: Math.max(0, now - entry.createdAt),
         idleMs: Math.max(0, now - entry.lastUsedAt),
         promptChanges: changedPromptFields(entry.promptFieldHashes, promptFieldHashes),
         mismatch: candidateMismatchDetails?.get(entry)

@@ -113,7 +113,7 @@ export interface ProviderModelSpec {
   headers?: Record<string, string>;
   /** Backend capability: model requires the Responses-Lite request shape (x-openai-internal-codex-responses-lite). */
   useResponsesLite?: boolean;
-  /** Backend capability: model must use the WebSocket Responses transport instead of HTTP. */
+  /** Backend preference metadata for the WebSocket Responses transport; not a capability gate. */
   preferWebSockets?: boolean;
   /** Provider-neutral per-model wire quirks. */
   compatibility?: ModelRuntimeCompatibility;
@@ -188,10 +188,10 @@ export async function createLanguageModel(spec: ProviderModelSpec): Promise<Lang
               ? { version: CODEX_RESPONSES_LITE_VERSION, 'x-openai-internal-codex-responses-lite': 'true' }
               : {}),
           },
-          // ChatGPT/Codex OAuth Responses models flagged preferWebSockets use
-          // the persistent WebSocket transport; ordinary OAuth Responses models
-          // use normal HTTP transport.
-          ...(useResponsesEndpoint && spec.preferWebSockets
+          // ChatGPT/Codex OAuth Responses default to the persistent WebSocket
+          // transport. preferWebSockets is backend preference metadata, not a
+          // capability gate: missing metadata must not silently select HTTP.
+          ...(useResponsesEndpoint
             ? {
                 fetch: createResponsesWebSocketFetch(CODEX_RESPONSES_LITE_WS_URL, spec.onDebug, {
                   providerId: spec.providerId ?? 'openai',

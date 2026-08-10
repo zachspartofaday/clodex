@@ -267,7 +267,8 @@ describe('registry/refresh-models', () => {
       expect(luna?.preferWebSockets).toBe(true);
       expect(luna?.contextWindow).toBe(272_000);
       expect(sol?.contextWindow).toBe(272_000);
-      // A model the backend does not flag stays on the HTTP path.
+      // Missing backend preference metadata remains absent; transport selection
+      // must not reinterpret the omission as HTTP-only or WebSocket-unsupported.
       expect(sol?.useResponsesLite).toBeUndefined();
       expect(sol?.preferWebSockets).toBeUndefined();
     });
