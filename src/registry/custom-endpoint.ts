@@ -18,7 +18,7 @@ import {
 } from './lock.js';
 import type { CachedModel, RegistryProvider } from './types.js';
 import { customProviderId, isValidProviderId, slugifyProviderId } from './validate.js';
-import { validateCustomEndpointUrl } from './url-security.js';
+import { canonicalOpenAiBaseUrl, validateCustomEndpointUrl } from './url-security.js';
 import {
   getProviderDebugLogPath,
   makeTraceLogger,
@@ -157,7 +157,15 @@ function uniqueProviderId(displayName: string, registry: { providers: RegistryPr
 }
 
 export async function addCustomEndpointProvider(input: AddCustomEndpointInput): Promise<AddCustomEndpointResult> {
-  const urlCheck = await validateCustomEndpointUrl(input.baseUrl, {
+  const canonicalBaseUrl = input.kind === 'openai' ? canonicalOpenAiBaseUrl(input.baseUrl) : undefined;
+  if (canonicalBaseUrl === null) {
+    return {
+      added: false,
+      error: 'Invalid OpenAI base URL.',
+      hint: 'Use an HTTP(S) base URL with at most one trailing slash and no query, fragment, or user info.',
+    };
+  }
+  const urlCheck = await validateCustomEndpointUrl(canonicalBaseUrl ?? input.baseUrl, {
     allowInsecureLocal: input.allowInsecureLocal,
   });
   if (!urlCheck.ok || !urlCheck.normalizedUrl) {

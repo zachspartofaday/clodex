@@ -13,6 +13,7 @@ import {
   type RegistryProvider,
 } from './types.js';
 import { isValidProviderId } from './validate.js';
+import { canonicalOpenAiBaseUrl } from './url-security.js';
 import { classifyFreeStatus, isFreeStatus } from '../free-models.js';
 
 export type CredentialResolver = (provider: RegistryProvider) => string | null;
@@ -31,9 +32,11 @@ export function resolveEndpoint(
   }
   if (npm === '@ai-sdk/openai-compatible') {
     if (!apiUrl) return null;
+    const canonicalUrl = canonicalOpenAiBaseUrl(apiUrl);
+    if (canonicalUrl === null) return null;
     return {
       format: 'openai',
-      completionsUrl: apiUrl.replace(/\/$/, '') + '/chat/completions',
+      completionsUrl: canonicalUrl + '/chat/completions',
     };
   }
   // Any other npm — SDK adapter owns endpoints.
@@ -42,25 +45,6 @@ export function resolveEndpoint(
 
 export interface MaterializeOptions {
   agent?: CompatibilityAgent;
-}
-
-function normalizedEndpointUrl(rawUrl: string): string | null {
-  try {
-    const parsed = new URL(rawUrl.trim());
-    const serializedUrl = parsed.href;
-    const queryDelimiter = serializedUrl.indexOf('?');
-    if (queryDelimiter !== -1) {
-      const fragmentDelimiter = serializedUrl.indexOf('#');
-      if (fragmentDelimiter === -1 || queryDelimiter < fragmentDelimiter) return null;
-    }
-    const userInfo = parsed.username || parsed.password
-      ? `${parsed.username}${parsed.password ? `:${parsed.password}` : ''}@`
-      : '';
-    const pathname = parsed.pathname.replace(/\/$/, '');
-    return `${parsed.protocol}//${userInfo}${parsed.host}${pathname}${parsed.search}`;
-  } catch {
-    return null;
-  }
 }
 
 export function cachedModelToLocal(
@@ -76,9 +60,15 @@ export function cachedModelToLocal(
   const npm = cached.npm ?? provider.api.npm ?? '';
   const modelApiUrl = cached.apiUrl;
   const providerApiUrl = provider.api.url;
+  const normalizedModelUrl =
+    (npm === '@ai-sdk/openai' || npm === '@ai-sdk/openai-compatible') && modelApiUrl
+      ? canonicalOpenAiBaseUrl(modelApiUrl)
+      : undefined;
+  const normalizedProviderUrl =
+    (npm === '@ai-sdk/openai' || npm === '@ai-sdk/openai-compatible') && providerApiUrl
+      ? canonicalOpenAiBaseUrl(providerApiUrl)
+      : undefined;
   if (npm === '@ai-sdk/openai') {
-    const normalizedModelUrl = modelApiUrl ? normalizedEndpointUrl(modelApiUrl) : undefined;
-    const normalizedProviderUrl = providerApiUrl ? normalizedEndpointUrl(providerApiUrl) : undefined;
     if (
       normalizedModelUrl === null
       || normalizedProviderUrl === null
@@ -94,7 +84,20 @@ export function cachedModelToLocal(
       );
     }
   }
-  const apiUrl = modelApiUrl ?? providerApiUrl ?? '';
+  if (npm === '@ai-sdk/openai-compatible') {
+    if (normalizedModelUrl === null || normalizedProviderUrl === null) {
+      const which = normalizedModelUrl === null ? 'model' : 'provider';
+      throw new Error(
+        `Provider "${provider.id}" model "${cached.id}" has an invalid ${which} endpoint; `
+        + '@ai-sdk/openai-compatible requires a valid HTTP(S) base URL with at most one trailing slash '
+        + 'and no query, fragment, or user info.',
+      );
+    }
+  }
+  const apiUrl =
+    (npm === '@ai-sdk/openai' || npm === '@ai-sdk/openai-compatible')
+      ? normalizedModelUrl ?? normalizedProviderUrl ?? ''
+      : modelApiUrl ?? providerApiUrl ?? '';
   const endpoint = resolveEndpoint(npm, apiUrl);
   if (endpoint === null) return null;
 

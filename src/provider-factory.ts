@@ -14,6 +14,7 @@ import {
   injectClaudeIdentity,
 } from './oauth/claude-identity.js';
 import { isCredentialBearingHeader } from './credential-headers.js';
+import { canonicalOpenAiBaseUrl } from './registry/url-security.js';
 import { normalizeModelRuntimeCompatibility } from './registry/types.js';
 import {
   transformOpenAiCompatibleRequestBody,
@@ -166,6 +167,19 @@ export async function createLanguageModel(spec: ProviderModelSpec): Promise<Lang
   const { npm, modelId, apiKey, baseURL } = spec;
   const compatibility = normalizeModelRuntimeCompatibility(spec.compatibility);
 
+  // Fail closed before any SDK dynamic import: an explicit base URL for the
+  // exact OpenAI SDK packages must canonicalize to a same-origin route with no
+  // query/fragment/userinfo and at most one trailing slash.
+  const canonicalBaseURL =
+    baseURL && (npm === '@ai-sdk/openai' || npm === '@ai-sdk/openai-compatible')
+      ? canonicalOpenAiBaseUrl(baseURL)
+      : undefined;
+  if (canonicalBaseURL === null) {
+    throw new Error(
+      'Invalid OpenAI base URL. Use an HTTP(S) base URL with at most one trailing slash and no query, fragment, or user info.',
+    );
+  }
+
   if (npm === '@ai-sdk/openai') {
     const { createOpenAI } = await import('@ai-sdk/openai');
     const useResponsesEndpoint = shouldUseOpenAiResponsesEndpoint(modelId);
@@ -206,13 +220,13 @@ export async function createLanguageModel(spec: ProviderModelSpec): Promise<Lang
       : spec.authType === 'none'
         ? {
             apiKey: '',
-            ...(baseURL ? { baseURL } : {}),
+            ...(canonicalBaseURL ? { baseURL: canonicalBaseURL } : {}),
             ...(spec.headers ? { headers: spec.headers } : {}),
             fetch: fetchWithoutCredentialHeaders,
           }
         : {
             apiKey,
-            ...(baseURL ? { baseURL } : {}),
+            ...(canonicalBaseURL ? { baseURL: canonicalBaseURL } : {}),
             ...(spec.headers ? { headers: spec.headers } : {}),
           };
     const openai = createOpenAI(oauthOptions);
@@ -258,7 +272,7 @@ export async function createLanguageModel(spec: ProviderModelSpec): Promise<Lang
     const { createOpenAICompatible } = await import('@ai-sdk/openai-compatible');
     const options = {
       name: spec.providerId ?? 'openai-compatible',
-      baseURL: baseURL ?? '',
+      baseURL: canonicalBaseURL ?? '',
       ...(spec.authType !== 'none' && apiKey.trim() ? { apiKey } : {}),
       ...(spec.authType === 'none' ? { fetch: fetchWithoutCredentialHeaders } : {}),
       ...(spec.headers ? { headers: spec.headers } : {}),

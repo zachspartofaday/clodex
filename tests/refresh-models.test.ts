@@ -204,6 +204,64 @@ describe('refreshProviderModels', () => {
     expect(saveRegistry).not.toHaveBeenCalled();
   });
 
+  it.each(
+    (['@ai-sdk/openai', '@ai-sdk/openai-compatible'] as const).flatMap(npm => [
+      {
+        npm,
+        name: 'query',
+        url: 'https://93.184.216.34/v1?tenant=refresh-query-secret',
+        secrets: ['refresh-query-secret'],
+      },
+      {
+        npm,
+        name: 'fragment',
+        url: 'https://93.184.216.34/v1#refresh-fragment-secret',
+        secrets: ['refresh-fragment-secret'],
+      },
+      { npm, name: 'bare query delimiter', url: 'https://93.184.216.34/v1?', secrets: [] },
+      { npm, name: 'bare fragment delimiter', url: 'https://93.184.216.34/v1#', secrets: [] },
+      {
+        npm,
+        name: 'userinfo',
+        url: 'https://refresh-user:refresh-pass@93.184.216.34/v1',
+        secrets: ['refresh-user', 'refresh-pass'],
+      },
+      { npm, name: 'repeated trailing separators', url: 'https://93.184.216.34/v1//', secrets: [] },
+    ]),
+  )('rejects a route-modifying $npm $name before credential-bearing model discovery', async ({ npm, url, secrets }) => {
+    const registry: ProviderRegistry = {
+      schemaVersion: 1,
+      providers: [{
+        id: 'unsafe-openai',
+        templateId: 'custom-openai',
+        name: 'Unsafe OpenAI',
+        enabled: true,
+        authRef: 'keyring:provider:unsafe-openai',
+        authType: 'api',
+        api: { npm, url },
+        addedAt: '2026-06-17T00:00:00.000Z',
+      }],
+    };
+    vi.mocked(fetchTemplateModels).mockResolvedValue({
+      baseUrl: 'https://93.184.216.34/v1',
+      models: [{
+        id: 'unsafe-model',
+        name: 'Unsafe Model',
+        upstreamModelId: 'unsafe-model',
+        modelFormat: 'openai',
+      }],
+    });
+    vi.mocked(loadRegistryStrict).mockReturnValue(registry);
+
+    const result = await refreshProviderModels('unsafe-openai', 'sk-real-key', registry);
+
+    expect(result.ok).toBe(false);
+    expect(result.reason).toMatch(/invalid.*OpenAI.*base URL/i);
+    for (const secret of secrets) expect(result.reason).not.toContain(secret);
+    expect(fetchTemplateModels).not.toHaveBeenCalled();
+    expect(saveRegistry).not.toHaveBeenCalled();
+  });
+
   it('does not report an imported snapshot as a model-count change on first live refresh', async () => {
     const registry: ProviderRegistry = {
       version: 1,

@@ -609,6 +609,62 @@ describe('createLanguageModel', () => {
     vi.doUnmock('@ai-sdk/openai');
   });
 
+  it.each([
+    { npm: '@ai-sdk/openai', moduleName: '@ai-sdk/openai' },
+    { npm: '@ai-sdk/openai-compatible', moduleName: '@ai-sdk/openai-compatible' },
+  ] as const)('rejects route-modifying base URLs before constructing $npm', async ({ npm, moduleName }) => {
+    vi.resetModules();
+    const createSdk = vi.fn();
+    if (npm === '@ai-sdk/openai') {
+      createSdk.mockReturnValue({ responses: vi.fn(), chat: vi.fn() });
+      vi.doMock('@ai-sdk/openai', () => ({ createOpenAI: createSdk }));
+    } else {
+      createSdk.mockReturnValue(vi.fn());
+      vi.doMock('@ai-sdk/openai-compatible', () => ({ createOpenAICompatible: createSdk }));
+    }
+    const invalidBases = [
+      { baseURL: 'https://api.example.com/v1?tenant=factory-query-secret', secrets: ['factory-query-secret'] },
+      { baseURL: 'https://api.example.com/v1#factory-fragment-secret', secrets: ['factory-fragment-secret'] },
+      { baseURL: 'https://api.example.com/v1?', secrets: [] },
+      { baseURL: 'https://api.example.com/v1#', secrets: [] },
+      {
+        baseURL: 'https://factory-user:factory-pass@api.example.com/v1',
+        secrets: ['factory-user', 'factory-pass'],
+      },
+      { baseURL: 'https://api.example.com/v1//', secrets: [] },
+      { baseURL: 'ftp://api.example.com/v1', secrets: [] },
+    ];
+    const errors: unknown[] = [];
+
+    try {
+      const { createLanguageModel: create } = await import('../src/provider-factory.js');
+      for (const { baseURL } of invalidBases) {
+        try {
+          await create({
+            npm,
+            modelId: 'gpt-4o-mini',
+            apiKey: 'factory-api-key',
+            authType: 'api',
+            baseURL,
+          });
+        } catch (error) {
+          errors.push(error);
+        }
+      }
+    } finally {
+      vi.doUnmock(moduleName);
+    }
+
+    expect(createSdk).not.toHaveBeenCalled();
+    expect(errors).toHaveLength(invalidBases.length);
+    for (const [index, error] of errors.entries()) {
+      expect(error).toBeInstanceOf(Error);
+      const message = (error as Error).message;
+      expect(message).toMatch(/invalid.*OpenAI.*base URL/i);
+      for (const secret of invalidBases[index]!.secrets) expect(message).not.toContain(secret);
+    }
+  });
+
   it('ignores discovery baseURL for @ai-sdk/anthropic (SDK default includes /v1)', async () => {
     const anthropicFactory = vi.fn((modelId: string) => ({ modelId, provider: 'anthropic' }));
     const createAnthropic = vi.fn(() => anthropicFactory);

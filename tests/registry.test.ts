@@ -687,26 +687,29 @@ describe('materializeRegistry', () => {
     }
   });
 
-  it('accepts equivalent OpenAI endpoints when only fragments differ, including ? inside fragment text', () => {
+  it('accepts equivalent OpenAI endpoints with encoded delimiters in the path', () => {
     const registry = emptyRegistry();
     registry.providers.push({
-      id: 'fragment-openai',
-      templateId: 'fragment-openai',
-      name: 'Fragment OpenAI',
+      id: 'encoded-openai',
+      templateId: 'encoded-openai',
+      name: 'Encoded OpenAI',
       enabled: true,
-      authRef: 'keyring:provider:fragment-openai',
+      authRef: 'keyring:provider:encoded-openai',
       authType: 'api',
-      api: { npm: '@ai-sdk/openai', url: 'https://API.EXAMPLE.com:443/v1/#provider-frag?note=1' },
+      api: {
+        npm: '@ai-sdk/openai',
+        url: 'https://API.EXAMPLE.com:443/v1/%3Ftenant%3Dsafe/%23fragment/%40user/',
+      },
       addedAt: '2026-06-09T00:00:00.000Z',
       modelsCache: {
         fetchedAt: '2026-06-09T00:00:00.000Z',
         models: [{
-          id: 'fragment-model',
-          name: 'Fragment Model',
-          upstreamModelId: 'fragment-model',
+          id: 'encoded-model',
+          name: 'Encoded Model',
+          upstreamModelId: 'encoded-model',
           modelFormat: 'openai',
           npm: '@ai-sdk/openai',
-          apiUrl: 'https://api.example.com/v1#model-frag',
+          apiUrl: 'https://api.example.com/v1/%3Ftenant%3Dsafe/%23fragment/%40user',
         }],
       },
     });
@@ -714,7 +717,9 @@ describe('materializeRegistry', () => {
     const locals = materializeRegistry(registry, () => 'sentinel-authorization-value');
 
     expect(locals).toHaveLength(1);
-    expect(locals[0]?.models[0]?.apiBaseUrl).toBe('https://api.example.com/v1#model-frag');
+    expect(locals[0]?.models[0]?.apiBaseUrl).toBe(
+      'https://api.example.com/v1/%3Ftenant%3Dsafe/%23fragment/%40user',
+    );
   });
 
   it.each([
@@ -729,6 +734,30 @@ describe('materializeRegistry', () => {
       providerUrl: 'https://provider-user:provider-pass@api.example.com/v1',
       modelUrl: 'https://model-user:model-pass@api.example.com/v1',
       secrets: ['provider-user', 'provider-pass', 'model-user', 'model-pass'],
+    },
+    {
+      name: 'identical fragments',
+      providerUrl: 'https://api.example.com/v1#shared-fragment-secret',
+      modelUrl: 'https://api.example.com/v1#shared-fragment-secret',
+      secrets: ['shared-fragment-secret'],
+    },
+    {
+      name: 'bare fragment delimiters',
+      providerUrl: 'https://api.example.com/v1#',
+      modelUrl: 'https://api.example.com/v1#',
+      secrets: [],
+    },
+    {
+      name: 'identical userinfo',
+      providerUrl: 'https://shared-user:shared-pass@api.example.com/v1',
+      modelUrl: 'https://shared-user:shared-pass@api.example.com/v1',
+      secrets: ['shared-user', 'shared-pass'],
+    },
+    {
+      name: 'repeated trailing separators',
+      providerUrl: 'https://api.example.com/v1//',
+      modelUrl: 'https://api.example.com/v1//',
+      secrets: [],
     },
     {
       name: 'malformed endpoints',
@@ -770,6 +799,81 @@ describe('materializeRegistry', () => {
     expect(thrown).toBeInstanceOf(Error);
     const message = (thrown as Error).message;
     expect(message).toMatch(/sensitive-openai.*sensitive-model.*endpoint/i);
+    for (const secret of secrets) expect(message).not.toContain(secret);
+  });
+
+  it.each([
+    {
+      name: 'provider query',
+      providerUrl: 'https://api.example.com/v1?tenant=compatible-provider-secret',
+      modelUrl: undefined,
+      secrets: ['compatible-provider-secret'],
+    },
+    {
+      name: 'model fragment',
+      providerUrl: 'https://api.example.com/v1',
+      modelUrl: 'https://api.example.com/v1#compatible-model-secret',
+      secrets: ['compatible-model-secret'],
+    },
+    {
+      name: 'bare provider fragment',
+      providerUrl: 'https://api.example.com/v1#',
+      modelUrl: undefined,
+      secrets: [],
+    },
+    {
+      name: 'bare model query',
+      providerUrl: 'https://api.example.com/v1',
+      modelUrl: 'https://api.example.com/v1?',
+      secrets: [],
+    },
+    {
+      name: 'model userinfo',
+      providerUrl: 'https://api.example.com/v1',
+      modelUrl: 'https://compatible-user:compatible-pass@api.example.com/v1',
+      secrets: ['compatible-user', 'compatible-pass'],
+    },
+    {
+      name: 'repeated provider trailing separators',
+      providerUrl: 'https://api.example.com/v1//',
+      modelUrl: undefined,
+      secrets: [],
+    },
+  ])('fails closed without exposing endpoint secrets for OpenAI-compatible $name', ({ providerUrl, modelUrl, secrets }) => {
+    const registry = emptyRegistry();
+    registry.providers.push({
+      id: 'sensitive-compatible',
+      templateId: 'sensitive-compatible',
+      name: 'Sensitive Compatible',
+      enabled: true,
+      authRef: 'keyring:provider:sensitive-compatible',
+      authType: 'api',
+      api: { npm: '@ai-sdk/openai-compatible', url: providerUrl },
+      addedAt: '2026-06-09T00:00:00.000Z',
+      modelsCache: {
+        fetchedAt: '2026-06-09T00:00:00.000Z',
+        models: [{
+          id: 'sensitive-compatible-model',
+          name: 'Sensitive Compatible Model',
+          upstreamModelId: 'sensitive-compatible-model',
+          modelFormat: 'openai',
+          npm: '@ai-sdk/openai-compatible',
+          apiUrl: modelUrl,
+        }],
+      },
+    });
+
+    let thrown: unknown;
+    try {
+      materializeRegistry(registry, () => 'sentinel-authorization-value');
+    } catch (error) {
+      thrown = error;
+    }
+
+    expect(thrown).toBeInstanceOf(Error);
+    const message = (thrown as Error).message;
+    expect(message).toMatch(/sensitive-compatible.*sensitive-compatible-model.*endpoint/i);
+    expect(message).not.toContain('sentinel-authorization-value');
     for (const secret of secrets) expect(message).not.toContain(secret);
   });
 

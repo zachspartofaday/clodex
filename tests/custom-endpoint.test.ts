@@ -98,7 +98,8 @@ vi.mock('../src/registry/lock.js', () => ({
     },
   ),
 }));
-vi.mock('../src/registry/url-security.js', () => ({
+vi.mock('../src/registry/url-security.js', async importOriginal => ({
+  ...(await importOriginal<typeof import('../src/registry/url-security.js')>()),
   validateCustomEndpointUrl: vi.fn(),
 }));
 
@@ -204,6 +205,40 @@ describe('custom endpoint credential lifecycle', () => {
     expect(observedLockStates).toEqual([false, false]);
     expect(lockState.entries).toBe(2);
     expect(lockState.active).toBe(false);
+  });
+
+  it.each([
+    {
+      name: 'query',
+      baseUrl: 'https://93.184.216.34/v1?tenant=custom-query-secret',
+      secrets: ['custom-query-secret'],
+    },
+    {
+      name: 'fragment',
+      baseUrl: 'https://93.184.216.34/v1#custom-fragment-secret',
+      secrets: ['custom-fragment-secret'],
+    },
+    { name: 'bare query delimiter', baseUrl: 'https://93.184.216.34/v1?', secrets: [] },
+    { name: 'bare fragment delimiter', baseUrl: 'https://93.184.216.34/v1#', secrets: [] },
+    {
+      name: 'userinfo',
+      baseUrl: 'https://custom-user:custom-pass@93.184.216.34/v1',
+      secrets: ['custom-user', 'custom-pass'],
+    },
+    { name: 'repeated trailing separators', baseUrl: 'https://93.184.216.34/v1//', secrets: [] },
+  ])('rejects a route-modifying OpenAI $name before validation, discovery, or credential mutation', async ({ baseUrl, secrets }) => {
+    const result = await addCustomEndpointProvider({ ...endpointInput, baseUrl });
+
+    expect(result).toMatchObject({
+      added: false,
+      error: expect.stringMatching(/invalid.*OpenAI.*base URL/i),
+    });
+    const diagnostic = `${result.error ?? ''} ${result.hint ?? ''}`;
+    for (const secret of secrets) expect(diagnostic).not.toContain(secret);
+    expect(validateCustomEndpointUrl).not.toHaveBeenCalled();
+    expect(fetchTemplateModels).not.toHaveBeenCalled();
+    expect(provisionProviderCredential).not.toHaveBeenCalled();
+    expect(saveRegistry).not.toHaveBeenCalled();
   });
 
   it('represents a blank key as anonymous without writing a placeholder credential', async () => {
