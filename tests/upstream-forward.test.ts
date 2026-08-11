@@ -1,6 +1,6 @@
 // tests/upstream-forward.test.ts
 import { describe, it, expect, vi, afterEach } from 'vitest';
-import type { Transform } from 'node:stream';
+import { PassThrough, type Transform } from 'node:stream';
 import {
   anthropicUpstreamHeaders,
   fetchWithOAuthRetry,
@@ -182,20 +182,17 @@ describe('relayAnthropicMessages responseModelOverride', () => {
     const chunks: Buffer[] = [];
     let headers: Record<string, string> = {};
     let status = 0;
-    const res = {
-      writeHead(code: number, hdrs: Record<string, string>) { status = code; headers = hdrs; return res; },
-      write(chunk: unknown) { chunks.push(Buffer.from(chunk as Buffer)); return true; },
-      end(chunk?: unknown) { if (chunk) chunks.push(Buffer.from(chunk as Buffer)); res.finished = true; res.emit?.('finish'); },
-      destroy() { /* noop */ },
-      on() { return res; },
-      once() { return res; },
-      emit() { return false; },
-      removeListener() { return res; },
-      finished: false,
+    const res = Object.assign(new PassThrough(), {
+      writeHead(code: number, hdrs: Record<string, string>) {
+        status = code;
+        headers = hdrs;
+        return res;
+      },
       body: () => Buffer.concat(chunks).toString('utf8'),
       status: () => status,
       headers: () => headers,
-    };
+    });
+    res.on('data', chunk => chunks.push(Buffer.from(chunk)));
     return res;
   };
 
@@ -221,6 +218,51 @@ describe('relayAnthropicMessages responseModelOverride', () => {
     const body = JSON.parse(res.body()) as { model: string };
     expect(body.model).toBe('clodex:acme:sonnet[200k]');
     expect(res.headers()['Content-Length']).toBe(String(Buffer.byteLength(res.body())));
+  });
+
+  it('does not rewrite an unrelated JSON response solely because it has a model field', async () => {
+    const raw = JSON.stringify({ object: 'model', id: 'catalog-entry', model: 'upstream-catalog-id' });
+    vi.stubGlobal('fetch', vi.fn(async () => new Response(raw, {
+      status: 200, headers: { 'Content-Type': 'application/json' },
+    })));
+    const res = makeRes();
+    await relayAnthropicMessages(
+      res as never,
+      'https://upstream.example/v1/messages',
+      { model: 'claude-sonnet-4-5' },
+      'key',
+      false,
+      { responseModelOverride: 'clodex:acme:sonnet[200k]' },
+    );
+
+    expect(res.body()).toBe(raw);
+  });
+
+  it('rewrites the streaming message_start model to the requested id', async () => {
+    const raw = 'event: message_start\n'
+      + 'data: {"type":"message_start","message":{"id":"msg_1","model":"claude-sonnet-4-5"}}\n\n'
+      + 'event: message_stop\n'
+      + 'data: {"type":"message_stop"}\n\n';
+    vi.stubGlobal('fetch', vi.fn(async () => new Response(raw, {
+      status: 200, headers: { 'Content-Type': 'text/event-stream' },
+    })));
+    const res = makeRes();
+    const finished = new Promise<void>((resolve, reject) => {
+      res.once('finish', resolve);
+      res.once('error', reject);
+    });
+    await relayAnthropicMessages(
+      res as never,
+      'https://upstream.example/v1/messages',
+      { model: 'claude-sonnet-4-5', stream: true },
+      'key',
+      true,
+      { responseModelOverride: 'clodex:acme:sonnet[200k]' },
+    );
+    await finished;
+
+    expect(res.body()).toContain('"model":"clodex:acme:sonnet[200k]"');
+    expect(res.body()).not.toContain('"model":"claude-sonnet-4-5"');
   });
 
   it('leaves the JSON body untouched without an override', async () => {

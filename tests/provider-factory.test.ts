@@ -338,6 +338,63 @@ describe('getReasoningCapabilities', () => {
     )).toEqual({ opencodeGo: { reasoningEffort: 'high' } });
   });
 
+  it('does not treat non-reasoning compatibility metadata as reasoning-authoritative', () => {
+    const metadata = {
+      providerId: 'custom',
+      compatibility: { maxTokensField: 'max_completion_tokens' as const },
+    };
+
+    expect(getPatchReasoningCapabilities(
+      '@ai-sdk/openai-compatible',
+      'deepseek-v4-flash',
+      metadata,
+    ).levels).toEqual(['high', 'max', 'off']);
+    expect(effortProviderOptions(
+      '@ai-sdk/openai-compatible',
+      'max',
+      'deepseek-v4-flash',
+      metadata,
+    )).toMatchObject({
+      openaiCompatible: { reasoningEffort: 'max' },
+      deepseek: { thinking: { type: 'enabled' } },
+    });
+  });
+
+  it('normalizes malformed compatibility before capability and effort routing', () => {
+    const metadata = {
+      providerId: 'custom',
+      compatibility: {
+        reasoningEffortMap: 'not-an-object',
+        supportsReasoningEffort: true,
+      } as never,
+    };
+
+    expect(getPatchReasoningCapabilities(
+      '@ai-sdk/openai-compatible',
+      'custom-reasoning-model',
+      metadata,
+    ).levels).toEqual(['low', 'medium', 'high']);
+    expect(effortProviderOptions(
+      '@ai-sdk/openai-compatible',
+      'high',
+      'custom-reasoning-model',
+      metadata,
+    )).toEqual({ custom: { reasoningEffort: 'high' } });
+  });
+
+  it('scopes OpenAI-compatible compatibility effort metadata to that adapter', () => {
+    const metadata = {
+      compatibility: { reasoningEffortMap: { high: 'max' } },
+    };
+
+    expect(getReasoningCapabilities('@ai-sdk/openai', 'gpt-5.6-sol', metadata).levels).toEqual([
+      'none', 'low', 'medium', 'high', 'xhigh', 'max',
+    ]);
+    expect(effortProviderOptions('@ai-sdk/openai', 'high', 'gpt-5.6-sol', metadata)).toEqual({
+      openai: { reasoningEffort: 'high' },
+    });
+  });
+
   it('treats an explicit reasoning-effort disable as internal-only reasoning', () => {
     const metadata = {
       providerId: 'opencode-go',

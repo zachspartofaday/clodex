@@ -6,7 +6,12 @@ import { resolveContextWindow } from '../context-window.js';
 import type { LocalProvider, LocalProviderModel } from '../types.js';
 import { normalizeGoogleDisplayName, normalizeGoogleModelId } from './google-model-id.js';
 import { findModelsDevModel } from './models-dev.js';
-import type { CachedModel, ProviderRegistry, RegistryProvider } from './types.js';
+import {
+  normalizeModelRuntimeCompatibility,
+  type CachedModel,
+  type ProviderRegistry,
+  type RegistryProvider,
+} from './types.js';
 import { isValidProviderId } from './validate.js';
 import { classifyFreeStatus, isFreeStatus } from '../free-models.js';
 
@@ -39,6 +44,16 @@ export interface MaterializeOptions {
   agent?: CompatibilityAgent;
 }
 
+function normalizedEndpointUrl(rawUrl: string): string {
+  const trimmed = rawUrl.trim();
+  try {
+    const parsed = new URL(trimmed);
+    return `${parsed.protocol}//${parsed.host}${parsed.pathname}`.replace(/\/$/, '');
+  } catch {
+    return trimmed.replace(/\/$/, '');
+  }
+}
+
 export function cachedModelToLocal(
   cached: CachedModel,
   provider: RegistryProvider,
@@ -50,7 +65,21 @@ export function cachedModelToLocal(
   });
 
   const npm = cached.npm ?? provider.api.npm ?? '';
-  const apiUrl = cached.apiUrl ?? provider.api.url ?? '';
+  const modelApiUrl = cached.apiUrl;
+  const providerApiUrl = provider.api.url;
+  if (
+    npm === '@ai-sdk/openai'
+    && modelApiUrl
+    && providerApiUrl
+    && normalizedEndpointUrl(modelApiUrl) !== normalizedEndpointUrl(providerApiUrl)
+  ) {
+    throw new Error(
+      `Provider "${provider.id}" model "${cached.id}" endpoint ${modelApiUrl} `
+      + `does not match provider endpoint ${providerApiUrl}; @ai-sdk/openai cannot safely `
+      + 'honor a conflicting model-level endpoint override.',
+    );
+  }
+  const apiUrl = modelApiUrl ?? providerApiUrl ?? '';
   const endpoint = resolveEndpoint(npm, apiUrl);
   if (endpoint === null) return null;
 
@@ -80,7 +109,7 @@ export function cachedModelToLocal(
     useResponsesLite: cached.useResponsesLite,
     preferWebSockets: cached.preferWebSockets,
     modalities: cached.modalities,
-    compatibility: cached.compatibility,
+    compatibility: normalizeModelRuntimeCompatibility(cached.compatibility),
   };
 }
 

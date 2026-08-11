@@ -538,7 +538,9 @@ export async function startProxyCatalog(
             // exact requested id back, or patched Claude Code misses the alias
             // context-window key and can skip auto-compaction.
             responseModelOverride:
-              typeof originalModel === 'string' && originalModel !== route.realModelId
+              resolvedRoute
+              && typeof originalModel === 'string'
+              && originalModel !== route.realModelId
                 ? originalModel
                 : undefined,
             onUpstreamError: inferenceLogPath

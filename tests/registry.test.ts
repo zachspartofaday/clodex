@@ -1,4 +1,5 @@
 import { describe, it, expect, beforeEach, afterEach } from 'vitest';
+import { createServer } from 'node:http';
 import { mkdtempSync, mkdirSync, readFileSync, rmSync, writeFileSync, existsSync, statSync } from 'node:fs';
 import { join } from 'node:path';
 import { tmpdir } from 'node:os';
@@ -524,6 +525,121 @@ describe('materializeRegistry', () => {
     expect(locals[0]?.models[0]).toMatchObject({
       isFree: true,
       freeStatus: 'free_provider',
+    });
+  });
+
+  it('fails closed on conflicting OpenAI endpoints before authorization-bearing traffic', async () => {
+    const authorizationHeaders: string[] = [];
+    let requestCount = 0;
+    const unintendedHost = createServer((req, res) => {
+      requestCount += 1;
+      const authorization = req.headers.authorization;
+      if (authorization) authorizationHeaders.push(authorization);
+      res.writeHead(200, { 'Content-Type': 'application/json' });
+      res.end('{}');
+    });
+    await new Promise<void>(resolve => unintendedHost.listen(0, '127.0.0.1', resolve));
+    const address = unintendedHost.address();
+    if (!address || typeof address === 'string') throw new Error('Expected TCP listener');
+
+    const registry = emptyRegistry();
+    registry.providers.push({
+      id: 'mixed-openai',
+      templateId: 'mixed-openai',
+      name: 'Mixed OpenAI',
+      enabled: true,
+      authRef: 'keyring:provider:mixed-openai',
+      authType: 'api',
+      api: { npm: '@ai-sdk/openai', url: 'https://provider.example/v1' },
+      addedAt: '2026-06-09T00:00:00.000Z',
+      modelsCache: {
+        fetchedAt: '2026-06-09T00:00:00.000Z',
+        models: [{
+          id: 'conflicting-model',
+          name: 'Conflicting Model',
+          upstreamModelId: 'conflicting-model',
+          modelFormat: 'openai',
+          npm: '@ai-sdk/openai',
+          apiUrl: `http://127.0.0.1:${address.port}/v1`,
+        }],
+      },
+    });
+
+    try {
+      expect(() => materializeRegistry(registry, () => 'sentinel-authorization-value')).toThrow(
+        /mixed-openai.*conflicting-model.*endpoint.*does not match.*provider endpoint/i,
+      );
+      expect(requestCount).toBe(0);
+      expect(authorizationHeaders).toEqual([]);
+    } finally {
+      await new Promise<void>((resolve, reject) => unintendedHost.close(error => error ? reject(error) : resolve()));
+    }
+  });
+
+  it('accepts equivalent OpenAI model and provider endpoints after URL normalization', () => {
+    const registry = emptyRegistry();
+    registry.providers.push({
+      id: 'equivalent-openai',
+      templateId: 'equivalent-openai',
+      name: 'Equivalent OpenAI',
+      enabled: true,
+      authRef: 'keyring:provider:equivalent-openai',
+      authType: 'api',
+      api: { npm: '@ai-sdk/openai', url: 'https://API.EXAMPLE.com:443/v1/' },
+      addedAt: '2026-06-09T00:00:00.000Z',
+      modelsCache: {
+        fetchedAt: '2026-06-09T00:00:00.000Z',
+        models: [{
+          id: 'equivalent-model',
+          name: 'Equivalent Model',
+          upstreamModelId: 'equivalent-model',
+          modelFormat: 'openai',
+          npm: '@ai-sdk/openai',
+          apiUrl: 'https://api.example.com/v1',
+        }],
+      },
+    });
+
+    const locals = materializeRegistry(registry, () => 'sentinel-authorization-value');
+
+    expect(locals).toHaveLength(1);
+    expect(locals[0]?.models[0]?.apiBaseUrl).toBe('https://api.example.com/v1');
+  });
+
+  it('normalizes compatibility metadata before it reaches runtime consumers', () => {
+    const registry = emptyRegistry();
+    registry.providers.push({
+      id: 'normalized-compatibility',
+      templateId: 'normalized-compatibility',
+      name: 'Normalized Compatibility',
+      enabled: true,
+      authRef: 'keyring:provider:normalized-compatibility',
+      authType: 'api',
+      api: { npm: '@ai-sdk/openai-compatible', url: 'https://api.example.com/v1' },
+      addedAt: '2026-06-09T00:00:00.000Z',
+      modelsCache: {
+        fetchedAt: '2026-06-09T00:00:00.000Z',
+        models: [{
+          id: 'normalized-model',
+          name: 'Normalized Model',
+          upstreamModelId: 'normalized-model',
+          modelFormat: 'openai',
+          compatibility: {
+            reasoningEffortMap: 'not-an-object',
+            supportsReasoningEffort: true,
+            thinkingFormat: 'unknown',
+            maxTokensField: 'max_completion_tokens',
+            supportsStore: 'yes',
+          } as never,
+        }],
+      },
+    });
+
+    const locals = materializeRegistry(registry, () => 'key');
+
+    expect(locals[0]?.models[0]?.compatibility).toEqual({
+      supportsReasoningEffort: true,
+      maxTokensField: 'max_completion_tokens',
     });
   });
 

@@ -68,6 +68,39 @@ describe('refreshProviderModels', () => {
     expect(persistedRegistry.providers[0]?.modelsCache?.models[0]?.id).toBe('live-a');
   });
 
+  it('preserves a refreshed model endpoint instead of replacing it with the provider endpoint', async () => {
+    const registry: ProviderRegistry = {
+      schemaVersion: 1,
+      providers: [{
+        id: 'groq',
+        templateId: 'groq',
+        name: 'Groq',
+        enabled: true,
+        authRef: 'keyring:provider:groq',
+        authType: 'api',
+        api: { npm: '@ai-sdk/groq', url: 'https://api.groq.com/openai/v1' },
+        addedAt: '2026-01-01T00:00:00.000Z',
+      }],
+    };
+    vi.mocked(loadRegistryStrict).mockReturnValue(registry);
+    vi.mocked(fetchTemplateModels).mockResolvedValue({
+      baseUrl: 'https://api.groq.com/openai/v1',
+      models: [{
+        id: 'mixed-model',
+        name: 'Mixed Model',
+        upstreamModelId: 'mixed-model',
+        modelFormat: 'openai',
+        apiUrl: 'https://model.example/v1',
+      }],
+    });
+
+    const result = await refreshProviderModels('groq', 'test-key', registry);
+
+    expect(result).toMatchObject({ ok: true, modelCount: 1 });
+    expect(registry.providers[0]?.api.url).toBe('https://api.groq.com/openai/v1');
+    expect(registry.providers[0]?.modelsCache?.models[0]?.apiUrl).toBe('https://model.example/v1');
+  });
+
   it('does not apply discovery results after credentials change', async () => {
     const initialRegistry: ProviderRegistry = {
       schemaVersion: 1,
