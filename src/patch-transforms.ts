@@ -33,7 +33,7 @@ import { isReservedModelAlias } from './model-aliases.js';
  * and never receive the new transforms, silently. `tests/patcher.test.ts` pins a
  * hash of this file to force that decision to be made rather than forgotten.
  */
-export const PATCH_TRANSFORMS_VERSION = 6;
+export const PATCH_TRANSFORMS_VERSION = 7;
 
 export interface PatchScriptModelEntry {
   /** Ordered native identities for this model. */
@@ -81,6 +81,11 @@ function escapeRegex(value: string): string {
   return value.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
 }
 
+// PATCH 8d/8e markers, hoisted to module scope so discovery and the site
+// constructions below share one definition of each grammar.
+const effortHelperMarker = '/*ccpatch:effort-level-list*/';
+const effortMetadataMarker = '/*ccpatch:effort-level-consumer*/';
+
 /**
  * Locate the retained native effort ladder by semantic contents, not by the
  * minifier's current binding name. The ladder is the exact native five-level
@@ -93,40 +98,86 @@ function escapeRegex(value: string): string {
  *    FIRST declarator of exactly one `var|let|const ID[,;=]` declaration
  *    (Claude 2.1.227's `var FL,Tn; ...;FL=["low",...];` inside an initializer).
  *
- * Requires exactly one qualifying assignment; any other count (missing,
- * duplicated, undeclared, or non-first declarator) returns `binding: undefined`
- * so both 8d/8e FAIL through the existing per-site reporting.
+ * Each derived occurrence qualifies only when its binding carries exactly one
+ * PATCH 8d helper and exactly two PATCH 8e consumers (fresh or marked-refresh
+ * grammar), so an unrelated ladder (for example a later `d6b`
+ * declaration/assignment with no helper or consumers) never displaces the real
+ * topology. Exactly one qualifying occurrence selects; any other count
+ * (missing, duplicated, undeclared, or non-first declarator; zero/two helpers;
+ * one/three consumers; a consumer bound to another name; or a second fully
+ * qualifying lookalike binding) returns `binding: undefined` so both 8d/8e
+ * FAIL through the existing per-site reporting.
  */
 function findEffortLadderBinding(source: string): {
   binding: string | undefined;
-  assignmentCount: number;
+  occurrenceCount: number;
 } {
   const identifier = '[A-Za-z_$][\\w$]*';
   const ladder = /\[\s*"low"\s*,\s*"medium"\s*,\s*"high"\s*,\s*"xhigh"\s*,\s*"max"\s*\]/g;
-  let assignmentCount = 0;
+  // PATCH 8d helper and PATCH 8e consumer anchors in both grammars, cloned from
+  // the site constructions below so discovery and application always agree on
+  // what a helper or consumer looks like.
+  const helperRegex = (binding: string): RegExp => new RegExp(
+    '(function [\\w$]+\\(([\\w$]+)\\)\\{)(return ' + escapeRegex(binding)
+    + '\\.filter\\(\\(([\\w$]+)\\)=>([\\w$]+)\\(\\4,\\2\\)\\)\\})',
+    'g',
+  );
+  const markedHelperRegex = (binding: string): RegExp => new RegExp(
+    '(function [\\w$]+\\(([\\w$]+)\\)\\{)'
+    + escapeRegex(effortHelperMarker)
+    + 'var _ccl=Object\\.assign\\(Object\\.create\\(null\\),\\{[^{}]*\\}\\)'
+    + '\\[String\\(\\2\\|\\|""\\)\\.trim\\(\\)\\.toLowerCase\\(\\)\\];'
+    + 'if\\(_ccl!==void 0\\)return _ccl\\.filter\\(function\\(_cclv\\)\\{return '
+    + '([\\w$]+)\\(_cclv,\\2\\)\\}\\);'
+    + '(?=return ' + escapeRegex(binding) + '\\.filter\\(\\(([\\w$]+)\\)=>\\3\\(\\4,\\2\\)\\)\\})',
+    'g',
+  );
+  const consumerRegex = (binding: string): RegExp => new RegExp(
+    'supportedEffortLevels:' + escapeRegex(binding)
+    + '(\\.filter\\(\\(([\\w$]+)\\)=>\\{if\\(\\2==="max"&&!([\\w$]+)\\(([\\w$]+)\\)\\)'
+    + 'return!1;if\\(\\2==="xhigh"&&!([\\w$]+)\\(\\4\\)\\)return!1;return!0\\}\\))',
+    'g',
+  );
+  const markedConsumerRegex = (binding: string): RegExp => new RegExp(
+    'supportedEffortLevels:\\(' + escapeRegex(effortMetadataMarker)
+    + 'Object\\.assign\\(Object\\.create\\(null\\),\\{[^{}]*\\}\\)'
+    + '\\[String\\(([\\w$]+)\\|\\|""\\)\\.trim\\(\\)\\.toLowerCase\\(\\)\\]'
+    + '\\?\\?' + escapeRegex(binding) + '\\)'
+    + '(\\.filter\\(\\(([\\w$]+)\\)=>\\{if\\(\\3==="max"&&!([\\w$]+)\\(\\1\\)\\)'
+    + 'return!1;if\\(\\3==="xhigh"&&!([\\w$]+)\\(\\1\\)\\)return!1;return!0\\}\\))',
+    'g',
+  );
+  const countMatches = (regex: RegExp): number => [...source.matchAll(regex)].length;
+  let occurrenceCount = 0;
   let binding: string | undefined;
   for (const match of source.matchAll(ladder)) {
     const prefix = source.slice(0, match.index);
     // Direct topology: the declaration's initializer is the ladder itself.
     const direct = new RegExp('(?:var|let|const)\\s+(' + identifier + ')\\s*=\\s*$').exec(prefix);
+    let derived: string | undefined;
     if (direct) {
-      assignmentCount += 1;
-      binding = direct[1]!;
-      continue;
+      derived = direct[1]!;
+    } else {
+      // Split topology: a bare assignment of a binding declared as the first
+      // declarator of exactly one `var|let|const` statement.
+      const bare = new RegExp('(' + identifier + ')\\s*=\\s*$').exec(prefix);
+      if (!bare) continue;
+      const declarations = [...source.matchAll(new RegExp(
+        '(?:var|let|const)\\s+' + escapeRegex(bare[1]!) + '[,;=]',
+        'g',
+      ))];
+      if (declarations.length !== 1) continue;
+      derived = bare[1]!;
     }
-    // Split topology: a bare assignment of a binding declared as the first
-    // declarator of exactly one `var|let|const` statement.
-    const bare = new RegExp('(' + identifier + ')\\s*=\\s*$').exec(prefix);
-    if (!bare) continue;
-    const declarations = [...source.matchAll(new RegExp(
-      '(?:var|let|const)\\s+' + escapeRegex(bare[1]!) + '[,;=]',
-      'g',
-    ))];
-    if (declarations.length !== 1) continue;
-    assignmentCount += 1;
-    binding = bare[1]!;
+    // Qualification: this occurrence is the selected topology only when its
+    // binding carries exactly one helper and both consumers in either grammar.
+    const helpers = countMatches(helperRegex(derived!)) + countMatches(markedHelperRegex(derived!));
+    const consumers = countMatches(consumerRegex(derived!)) + countMatches(markedConsumerRegex(derived!));
+    if (helpers !== 1 || consumers !== 2) continue;
+    occurrenceCount += 1;
+    binding = derived;
   }
-  return { binding: assignmentCount === 1 ? binding : undefined, assignmentCount };
+  return { binding: occurrenceCount === 1 ? binding : undefined, occurrenceCount };
 }
 export function projectNativeEffort(
   effort: PatchScriptEffort | undefined,
@@ -648,25 +699,25 @@ export function applyClodexPatches(source: string, config: PatchScriptModelConfi
   // exact five-level list (direct `var PM=["low",...];` or the 2.1.227 split
   // `var FL,Tn; ...;FL=["low",...];` first-declarator form) rather than hard-
   // coded: the helper, both consumers, and every injected fallback must all
-  // reference the SAME escaped binding. Any count mismatch (missing/duplicate
-  // assignment, undeclared/non-first declarator, zero/two helpers, one/three
-  // consumers, or a consumer bound to another name) FAILs the affected site
-  // through the existing per-site reporting.
+  // reference the SAME escaped binding. An occurrence is only a candidate when
+  // its binding carries exactly one helper and both consumers (either grammar);
+  // a missing/duplicate assignment, an undeclared or non-first declarator,
+  // zero/two helpers, one/three consumers, a consumer bound to another name, or
+  // a second fully qualifying lookalike binding FAILs both 8d/8e with the
+  // topology count through the existing per-site reporting.
   // ---------------------------------------------------------------------------
   const effortLevels = Object.fromEntries(
     Object.entries(EFFORT_BY_KEY).map(([key, effort]) => [key, effort!.levels]),
   );
   const hasEffortModels = Object.keys(effortLevels).length > 0;
-  const effortHelperMarker = '/*ccpatch:effort-level-list*/';
-  const effortMetadataMarker = '/*ccpatch:effort-level-consumer*/';
   const needsEffortHelper = hasEffortModels || js.includes(effortHelperMarker);
   const needsEffortMetadata = hasEffortModels || js.includes(effortMetadataMarker);
   const discoveredLadder = needsEffortHelper || needsEffortMetadata
     ? findEffortLadderBinding(js)
-    : { binding: undefined, assignmentCount: 0 };
+    : { binding: undefined, occurrenceCount: 0 };
   const effortListBinding = discoveredLadder.binding;
   if (!effortListBinding && (needsEffortHelper || needsEffortMetadata)) {
-    const extra = `effort ladder assignment matched ${discoveredLadder.assignmentCount} times (expected 1)`;
+    const extra = `effort ladder topology matched ${discoveredLadder.occurrenceCount} times (expected 1)`;
     if (needsEffortHelper) log('FAIL', 'PATCH 8d: exact effort level helper', extra);
     if (needsEffortMetadata) log('FAIL', 'PATCH 8e: exact effort metadata lists', extra);
   }

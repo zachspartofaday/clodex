@@ -1137,8 +1137,8 @@ describe('PATCH_TRANSFORMS_VERSION', () => {
     ).replace(/\r\n/g, '\n');
     const digest = createHash('sha256').update(source).digest('hex');
     expect({ version: PATCH_TRANSFORMS_VERSION, digest }).toEqual({
-      version: 6,
-      digest: '5cbd06a7b4810001050fe0342538a214127e4de18c5bfd0408725f43bb990232',
+      version: 7,
+      digest: 'a187c78eab53ed48a8bdcb73bba252579d557cdad03c43b92edced912d9fbef9',
     });
   });
 });
@@ -1707,7 +1707,11 @@ const CLAUDE_PROXY_EFFORT_FIXTURE = [
  * and the helper plus both metadata consumers all reference the same binding
  * (`FL`). The four elements keep this exact order: helper reference, `var FL,...`,
  * the initializer containing `;FL=["low","medium","high","xhigh","max"];`, then
- * both consumers.
+ * both consumers. A separate, unrelated `d6b` ladder (its own declaration plus
+ * a canonical assignment, but no helper or consumers) follows, exercising the
+ * selector's qualification rule: only the binding carrying exactly one helper
+ * and both consumers may be chosen, so the FL topology still wins and the
+ * injected fallback never binds to `d6b`.
  */
 const SPLIT_EM1 = 'var EM1={...o&&{supportsEffort:!0,supportedEffortLevels:FL.filter((l)=>{if(l==="max"&&!eqe(n))return!1;if(l==="xhigh"&&!I_e(n))return!1;return!0})}};';
 const SPLIT_EM2 = 'var EM2={...To&&{supportsEffort:!0,supportedEffortLevels:FL.filter((Fo)=>{if(Fo==="max"&&!eqe(Et))return!1;if(Fo==="xhigh"&&!I_e(Et))return!1;return!0})}};';
@@ -1719,6 +1723,8 @@ const CLAUDE_SPLIT_FIXTURE = [
   'var R2=function(){Tn=1;FL=["low","medium","high","xhigh","max"];Tn=2};',
   SPLIT_EM1,
   SPLIT_EM2,
+  'var d6b;',
+  'd6b=["low","medium","high","xhigh","max"];',
   'function iJe(e,t){return!0}',
   'function OI(e){if(SNr(e))return!1;let t=Ede(e,"effort");if(t!==void 0)return t;return!1}',
   'function I_e(e){if(SNr(e))return!1;let t=Ede(e,"xhigh_effort");if(t!==void 0)return t;return!1}',
@@ -2261,8 +2267,8 @@ describe('patch script identity naming', () => {
       { status: 'FAIL', name: 'PATCH 8a: effort capability', extra: 'anchor not found' },
       { status: 'FAIL', name: 'PATCH 8b: xhigh effort capability', extra: 'anchor not found' },
       { status: 'FAIL', name: 'PATCH 8c: max effort capability', extra: 'anchor not found' },
-      { status: 'FAIL', name: 'PATCH 8d: exact effort level helper', extra: 'effort ladder assignment matched 0 times (expected 1)' },
-      { status: 'FAIL', name: 'PATCH 8e: exact effort metadata lists', extra: 'effort ladder assignment matched 0 times (expected 1)' },
+      { status: 'FAIL', name: 'PATCH 8d: exact effort level helper', extra: 'effort ladder topology matched 0 times (expected 1)' },
+      { status: 'FAIL', name: 'PATCH 8e: exact effort metadata lists', extra: 'effort ladder topology matched 0 times (expected 1)' },
       { status: 'FAIL', name: 'PATCH 8f: preserve requested effort', extra: 'anchor not found' },
       { status: 'FAIL', name: 'PATCH 9: default effort', extra: 'anchor not found' },
     ]);
@@ -2408,9 +2414,11 @@ describe('2.1.227 split effort ladder topology', () => {
     ]);
 
     const out = patched.content;
-    // The injected fallbacks correlate to the SPLIT binding, never the old name.
+    // The injected fallbacks correlate to the SPLIT binding, never the old name
+    // and never the unrelated d6b ladder.
     expect(out).toContain('??FL)');
     expect(out).not.toContain('??PM)');
+    expect(out).not.toContain('??d6b)');
     for (const id of ['sol', 'sol[1m]', 'clodex:openai:gpt-5.6-sol']) {
       expect(executeExactEffortLevels(out, id, 'FL')).toEqual([
         'low', 'medium', 'high', 'xhigh', 'max',
@@ -2462,8 +2470,8 @@ describe('2.1.227 split effort ladder topology', () => {
       splitConfig,
     );
     const expected = to.includes('FL=["low","medium","high","xhigh","max"]')
-      ? 'effort ladder assignment matched 2 times (expected 1)'
-      : 'effort ladder assignment matched 0 times (expected 1)';
+      ? 'effort ladder topology matched 2 times (expected 1)'
+      : 'effort ladder topology matched 0 times (expected 1)';
     expect(patched.results).toEqual(expect.arrayContaining([
       { status: 'FAIL', name: 'PATCH 8d: exact effort level helper', extra: expected },
       { status: 'FAIL', name: 'PATCH 8e: exact effort metadata lists', extra: expected },
@@ -2477,25 +2485,25 @@ describe('2.1.227 split effort ladder topology', () => {
       splitConfig,
     );
     expect(patched.results).toEqual(expect.arrayContaining([
-      { status: 'FAIL', name: 'PATCH 8d: exact effort level helper', extra: 'anchor not found' },
-      { status: 'FAIL', name: 'PATCH 8e: exact effort metadata lists', extra: 'anchor matched 0 times (expected 2)' },
+      { status: 'FAIL', name: 'PATCH 8d: exact effort level helper', extra: 'effort ladder topology matched 0 times (expected 1)' },
+      { status: 'FAIL', name: 'PATCH 8e: exact effort metadata lists', extra: 'effort ladder topology matched 0 times (expected 1)' },
     ]));
     expect(patched.content).not.toContain('??FL)');
   });
 
-  it('fails the helper site when the unique helper is missing', () => {
+  it('fails both correlated sites when the unique helper is missing', () => {
     const patched = applyClodexPatches(
       CLAUDE_SPLIT_FIXTURE.replace('function a3e(e){return FL.filter((t)=>iJe(t,e))}', 'function a3e(e){return null}'),
       splitConfig,
     );
     expect(patched.results).toEqual(expect.arrayContaining([
-      { status: 'FAIL', name: 'PATCH 8d: exact effort level helper', extra: 'anchor not found' },
-      { status: 'OK', name: 'PATCH 8e: exact effort metadata lists' },
+      { status: 'FAIL', name: 'PATCH 8d: exact effort level helper', extra: 'effort ladder topology matched 0 times (expected 1)' },
+      { status: 'FAIL', name: 'PATCH 8e: exact effort metadata lists', extra: 'effort ladder topology matched 0 times (expected 1)' },
     ]));
-    expect(patched.content).toContain('??FL)');
+    expect(patched.content).not.toContain('??FL)');
   });
 
-  it('fails the helper site when two helpers match the anchor', () => {
+  it('fails both correlated sites when two helpers match the anchor', () => {
     const patched = applyClodexPatches(
       CLAUDE_SPLIT_FIXTURE.replace(
         'function a3e(e){return FL.filter((t)=>iJe(t,e))}',
@@ -2505,21 +2513,49 @@ describe('2.1.227 split effort ladder topology', () => {
       splitConfig,
     );
     expect(patched.results).toEqual(expect.arrayContaining([
-      { status: 'FAIL', name: 'PATCH 8d: exact effort level helper', extra: 'anchor matched 2 times (expected 1)' },
+      { status: 'FAIL', name: 'PATCH 8d: exact effort level helper', extra: 'effort ladder topology matched 0 times (expected 1)' },
+      { status: 'FAIL', name: 'PATCH 8e: exact effort metadata lists', extra: 'effort ladder topology matched 0 times (expected 1)' },
     ]));
+    expect(patched.content).not.toContain('??FL)');
   });
 
   it.each([
     ['one', 1, '\n' + SPLIT_EM2, ''],
     ['three', 3, SPLIT_EM2, SPLIT_EM2 + '\n' + 'var EM3=' + SPLIT_EM1.slice(8)],
-  ])('fails the metadata sites with %s consumer', (_label, count, from, to) => {
+  ])('fails both correlated sites with %s consumer', (_label, _count, from, to) => {
     const patched = applyClodexPatches(
       CLAUDE_SPLIT_FIXTURE.replace(from, to),
       splitConfig,
     );
     expect(patched.results).toEqual(expect.arrayContaining([
-      { status: 'FAIL', name: 'PATCH 8e: exact effort metadata lists', extra: `anchor matched ${count} times (expected 2)` },
+      { status: 'FAIL', name: 'PATCH 8d: exact effort level helper', extra: 'effort ladder topology matched 0 times (expected 1)' },
+      { status: 'FAIL', name: 'PATCH 8e: exact effort metadata lists', extra: 'effort ladder topology matched 0 times (expected 1)' },
     ]));
+    expect(patched.content).not.toContain('??FL)');
+  });
+
+  it('fails both correlated sites when a lookalike d6b topology also qualifies', () => {
+    // d6b already carries the canonical ladder from the deployed fixture; give
+    // it its own helper plus both metadata consumers so the selector sees TWO
+    // fully qualifying occurrences (FL and d6b) and must refuse to pick.
+    const em3 = SPLIT_EM1.replace('var EM1=', 'var EM3=')
+      .replace('supportedEffortLevels:FL', 'supportedEffortLevels:d6b');
+    const em4 = SPLIT_EM2.replace('var EM2=', 'var EM4=')
+      .replace('supportedEffortLevels:FL', 'supportedEffortLevels:d6b');
+    const lookalike = CLAUDE_SPLIT_FIXTURE
+      .replace(
+        'function a3e(e){return FL.filter((t)=>iJe(t,e))}',
+        'function a3e(e){return FL.filter((t)=>iJe(t,e))}\n'
+          + 'function b3e(e){return d6b.filter((t)=>iJe(t,e))}',
+      )
+      .replace(SPLIT_EM2, SPLIT_EM2 + '\n' + em3 + '\n' + em4);
+    const patched = applyClodexPatches(lookalike, splitConfig);
+    expect(patched.results).toEqual(expect.arrayContaining([
+      { status: 'FAIL', name: 'PATCH 8d: exact effort level helper', extra: 'effort ladder topology matched 2 times (expected 1)' },
+      { status: 'FAIL', name: 'PATCH 8e: exact effort metadata lists', extra: 'effort ladder topology matched 2 times (expected 1)' },
+    ]));
+    expect(patched.content).not.toContain('??FL)');
+    expect(patched.content).not.toContain('??d6b)');
   });
 
   it.each(['$ladder', '_ladder', 'ladder2'])('correlates a split ladder bound to %s', binding => {
