@@ -1137,8 +1137,8 @@ describe('PATCH_TRANSFORMS_VERSION', () => {
     ).replace(/\r\n/g, '\n');
     const digest = createHash('sha256').update(source).digest('hex');
     expect({ version: PATCH_TRANSFORMS_VERSION, digest }).toEqual({
-      version: 7,
-      digest: 'a187c78eab53ed48a8bdcb73bba252579d557cdad03c43b92edced912d9fbef9',
+      version: 8,
+      digest: 'd818abdbdb5ea45dc914c2b5fd4933e61ce01010e909120f0027b4784bf2891e',
     });
   });
 });
@@ -2616,5 +2616,110 @@ describe('2.1.227 split effort ladder topology', () => {
     const proofs = captureBuiltInPatchProofs(patched.content, splitConfig, patched.results);
     expect(builtInPatchProofsChanged(patched.content, proofs)).toBe(false);
     expect(builtInPatchProofsChanged(patched.content.replace(from, to), proofs)).toBe(true);
+  });
+});
+
+describe('unbounded assignment-prefix guard (PATCH 8d/8e discovery)', () => {
+  // An 8192-character identifier hides a colon-prefixed canonical array in
+  // front of the real ladder: the bounded scan must neither bind to a suffix
+  // of the oversized identifier nor let it disturb the qualifying topology.
+  const hostileIdentifier = 'H' + 'x'.repeat(8191); // 8192 chars
+  const hostilePrefix = `var ${hostileIdentifier}:["low","medium","high","xhigh","max"],`;
+  const config = {
+    'clodex:openai:gpt-5.6-sol': {
+      alias: 'sol',
+      context: 272_000,
+      effort: {
+        levels: ['low', 'medium', 'high', 'xhigh', 'max'],
+        defaultLevel: 'high',
+      },
+    },
+  };
+  const withHostilePrefix = (source: string, ladderLine: string): string =>
+    source.replace(ladderLine, `${hostilePrefix}\n${ladderLine}`);
+  const hostileVariants = (): Array<[string, string, string]> => [
+    [
+      'historic/direct',
+      withHostilePrefix(CLAUDE_FIXTURE, 'var PM=["low","medium","high","xhigh","max"];'),
+      'PM',
+    ],
+    [
+      'split',
+      withHostilePrefix(CLAUDE_SPLIT_FIXTURE, 'var FL,Tn;'),
+      'FL',
+    ],
+    [
+      'direct marked-refresh',
+      withHostilePrefix(
+        runPatchScript(config, CLAUDE_FIXTURE),
+        'var PM=["low","medium","high","xhigh","max"];',
+      ),
+      'PM',
+    ],
+    [
+      'split marked-refresh',
+      withHostilePrefix(runPatchScript(config, CLAUDE_SPLIT_FIXTURE), 'var FL,Tn;'),
+      'FL',
+    ],
+  ];
+
+  it('bounds every direct/bare binding-regex input to 4097 characters during discovery', () => {
+    const originalExec = RegExp.prototype.exec;
+    let longestBindingScan = 0;
+    RegExp.prototype.exec = function (this: RegExp, input: string) {
+      // The direct and bare assignment regexes are the only regexes in the
+      // pipeline carrying the `[^\w$]` left-boundary class, so the source
+      // string identifies exactly the scans this guard bounds.
+      if (this.source.includes('[^\\w$]')) {
+        longestBindingScan = Math.max(longestBindingScan, input.length);
+      }
+      return originalExec.call(this, input);
+    };
+    try {
+      for (const [, source] of hostileVariants()) {
+        applyClodexPatches(source, config);
+      }
+    } finally {
+      RegExp.prototype.exec = originalExec;
+    }
+    expect(longestBindingScan).toBeLessThanOrEqual(4097);
+  });
+
+  it.each(hostileVariants())(
+    'keeps the %s topology when an 8192-char hostile prefix precedes the ladder',
+    (_label, source, binding) => {
+      const patched = applyClodexPatches(source, config);
+      expect(patched.results.filter(result => result.status === 'FAIL')).toEqual([]);
+      expect(patched.content).toContain(`??${binding})`);
+    },
+  );
+
+  it('fails closed when a fully qualifying lookalike assignment identifier exceeds the scan bound', () => {
+    // The lookalike carries its own declaration, canonical assignment, helper,
+    // and both metadata consumers. An unbounded scan would find the assignment
+    // and qualify it, binding discovery to the 8192-character identifier; the
+    // bounded scan cannot prove a true left boundary in front of it, so both
+    // effort sites fail closed and no fallback is injected.
+    const id = hostileIdentifier;
+    const lookalike = [
+      CLAUDE_CORE_FIXTURE,
+      `var ${id};`,
+      `${id}=["low","medium","high","xhigh","max"];`,
+      `function a3e(e){return ${id}.filter((t)=>iJe(t,e))}`,
+      `var EM1={...o&&{supportsEffort:!0,supportedEffortLevels:${id}.filter((l)=>{if(l==="max"&&!eqe(n))return!1;if(l==="xhigh"&&!I_e(n))return!1;return!0})}};`,
+      `var EM2={...To&&{supportsEffort:!0,supportedEffortLevels:${id}.filter((Fo)=>{if(Fo==="max"&&!eqe(Et))return!1;if(Fo==="xhigh"&&!I_e(Et))return!1;return!0})}};`,
+      'function iJe(e,t){return!0}',
+      'function OI(e){if(SNr(e))return!1;let t=Ede(e,"effort");if(t!==void 0)return t;return!1}',
+      'function I_e(e){if(SNr(e))return!1;let t=Ede(e,"xhigh_effort");if(t!==void 0)return t;return!1}',
+      'function eqe(e){if(SNr(e))return!1;let t=Ede(e,"max_effort");if(t!==void 0)return t;return!1}',
+      'function nEu(e,t){let r=e;if(typeof r==="string"&&a_e(r))r=IDe(r,t);if(r==="max"&&!eqe(t))r="high";if(r==="xhigh"&&!I_e(t))r="high";return r}',
+      'function ait(e){return ww(lo(e))?.default_effort??"high"}',
+    ].join('\n');
+    const patched = applyClodexPatches(lookalike, config);
+    expect(patched.results).toEqual(expect.arrayContaining([
+      { status: 'FAIL', name: 'PATCH 8d: exact effort level helper', extra: 'effort ladder topology matched 0 times (expected 1)' },
+      { status: 'FAIL', name: 'PATCH 8e: exact effort metadata lists', extra: 'effort ladder topology matched 0 times (expected 1)' },
+    ]));
+    expect(patched.content).not.toContain(`??${id})`);
   });
 });

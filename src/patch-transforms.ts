@@ -33,7 +33,7 @@ import { isReservedModelAlias } from './model-aliases.js';
  * and never receive the new transforms, silently. `tests/patcher.test.ts` pins a
  * hash of this file to force that decision to be made rather than forgotten.
  */
-export const PATCH_TRANSFORMS_VERSION = 7;
+export const PATCH_TRANSFORMS_VERSION = 8;
 
 export interface PatchScriptModelEntry {
   /** Ordered native identities for this model. */
@@ -85,6 +85,13 @@ function escapeRegex(value: string): string {
 // constructions below share one definition of each grammar.
 const effortHelperMarker = '/*ccpatch:effort-level-list*/';
 const effortMetadataMarker = '/*ccpatch:effort-level-consumer*/';
+
+// How far back a ladder-binding assignment scan may look before a canonical
+// array. The scan input is at most this + 1 characters, so the extra character
+// proves a true left boundary and an oversized identifier can never feed a
+// suffix of itself into the assignment regexes. Assignment tails longer than
+// this deliberately fail closed.
+const EFFORT_BINDING_PREFIX_LENGTH = 4096;
 
 /**
  * Locate the retained native effort ladder by semantic contents, not by the
@@ -151,16 +158,18 @@ function findEffortLadderBinding(source: string): {
   let occurrenceCount = 0;
   let binding: string | undefined;
   for (const match of source.matchAll(ladder)) {
-    const prefix = source.slice(0, match.index);
+    const prefixStart = Math.max(0, match.index - EFFORT_BINDING_PREFIX_LENGTH);
+    const prefix = source.slice(prefixStart === 0 ? 0 : prefixStart - 1, match.index);
+    const boundary = prefixStart === 0 ? '(?:^|[^\\w$])' : '[^\\w$]';
     // Direct topology: the declaration's initializer is the ladder itself.
-    const direct = new RegExp('(?:var|let|const)\\s+(' + identifier + ')\\s*=\\s*$').exec(prefix);
+    const direct = new RegExp(boundary + '(?:var|let|const)\\s+(' + identifier + ')\\s*=\\s*$').exec(prefix);
     let derived: string | undefined;
     if (direct) {
       derived = direct[1]!;
     } else {
       // Split topology: a bare assignment of a binding declared as the first
       // declarator of exactly one `var|let|const` statement.
-      const bare = new RegExp('(' + identifier + ')\\s*=\\s*$').exec(prefix);
+      const bare = new RegExp(boundary + '(' + identifier + ')\\s*=\\s*$').exec(prefix);
       if (!bare) continue;
       const declarations = [...source.matchAll(new RegExp(
         '(?:var|let|const)\\s+' + escapeRegex(bare[1]!) + '[,;=]',
