@@ -6,8 +6,14 @@ import { resolveContextWindow } from '../context-window.js';
 import type { LocalProvider, LocalProviderModel } from '../types.js';
 import { normalizeGoogleDisplayName, normalizeGoogleModelId } from './google-model-id.js';
 import { findModelsDevModel } from './models-dev.js';
-import type { CachedModel, ProviderRegistry, RegistryProvider } from './types.js';
+import {
+  normalizeModelRuntimeCompatibility,
+  type CachedModel,
+  type ProviderRegistry,
+  type RegistryProvider,
+} from './types.js';
 import { isValidProviderId } from './validate.js';
+import { canonicalOpenAiBaseUrl } from './url-security.js';
 import { classifyFreeStatus, isFreeStatus } from '../free-models.js';
 
 export type CredentialResolver = (provider: RegistryProvider) => string | null;
@@ -26,9 +32,11 @@ export function resolveEndpoint(
   }
   if (npm === '@ai-sdk/openai-compatible') {
     if (!apiUrl) return null;
+    const canonicalUrl = canonicalOpenAiBaseUrl(apiUrl);
+    if (canonicalUrl === null) return null;
     return {
       format: 'openai',
-      completionsUrl: apiUrl.replace(/\/$/, '') + '/chat/completions',
+      completionsUrl: canonicalUrl + '/chat/completions',
     };
   }
   // Any other npm — SDK adapter owns endpoints.
@@ -50,7 +58,46 @@ export function cachedModelToLocal(
   });
 
   const npm = cached.npm ?? provider.api.npm ?? '';
-  const apiUrl = cached.apiUrl ?? provider.api.url ?? '';
+  const modelApiUrl = cached.apiUrl;
+  const providerApiUrl = provider.api.url;
+  const normalizedModelUrl =
+    (npm === '@ai-sdk/openai' || npm === '@ai-sdk/openai-compatible') && modelApiUrl
+      ? canonicalOpenAiBaseUrl(modelApiUrl)
+      : undefined;
+  const normalizedProviderUrl =
+    (npm === '@ai-sdk/openai' || npm === '@ai-sdk/openai-compatible') && providerApiUrl
+      ? canonicalOpenAiBaseUrl(providerApiUrl)
+      : undefined;
+  if (npm === '@ai-sdk/openai') {
+    if (
+      normalizedModelUrl === null
+      || normalizedProviderUrl === null
+      || (
+        normalizedModelUrl !== undefined
+        && normalizedProviderUrl !== undefined
+        && normalizedModelUrl !== normalizedProviderUrl
+      )
+    ) {
+      throw new Error(
+        `Provider "${provider.id}" model "${cached.id}" endpoint does not match provider endpoint; `
+        + '@ai-sdk/openai requires valid equivalent model and provider endpoints.',
+      );
+    }
+  }
+  if (npm === '@ai-sdk/openai-compatible') {
+    if (normalizedModelUrl === null || normalizedProviderUrl === null) {
+      const which = normalizedModelUrl === null ? 'model' : 'provider';
+      throw new Error(
+        `Provider "${provider.id}" model "${cached.id}" has an invalid ${which} endpoint; `
+        + '@ai-sdk/openai-compatible requires a valid HTTP(S) base URL with at most one trailing slash '
+        + 'and no query, fragment, or user info.',
+      );
+    }
+  }
+  const apiUrl =
+    (npm === '@ai-sdk/openai' || npm === '@ai-sdk/openai-compatible')
+      ? normalizedModelUrl ?? normalizedProviderUrl ?? ''
+      : modelApiUrl ?? providerApiUrl ?? '';
   const endpoint = resolveEndpoint(npm, apiUrl);
   if (endpoint === null) return null;
 
@@ -80,7 +127,7 @@ export function cachedModelToLocal(
     useResponsesLite: cached.useResponsesLite,
     preferWebSockets: cached.preferWebSockets,
     modalities: cached.modalities,
-    compatibility: cached.compatibility,
+    compatibility: normalizeModelRuntimeCompatibility(cached.compatibility),
   };
 }
 

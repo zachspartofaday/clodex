@@ -66,9 +66,11 @@ export function buildHttpProxyRoutes(
       unavailable.push(favorite);
       continue;
     }
-    const supported = model.modelFormat === 'anthropic'
-      ? Boolean(model.baseUrl)
-      : isSdkMigratedNpm(model.npm);
+    const supported = model.modelFormat === 'openai'
+      ? isSdkMigratedNpm(model.npm)
+      : model.modelFormat === 'anthropic'
+        ? Boolean(model.baseUrl)
+        : false;
     if (!supported) {
       unsupported.push(favorite);
       continue;

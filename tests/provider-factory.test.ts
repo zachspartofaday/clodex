@@ -338,6 +338,63 @@ describe('getReasoningCapabilities', () => {
     )).toEqual({ opencodeGo: { reasoningEffort: 'high' } });
   });
 
+  it('does not treat non-reasoning compatibility metadata as reasoning-authoritative', () => {
+    const metadata = {
+      providerId: 'custom',
+      compatibility: { maxTokensField: 'max_completion_tokens' as const },
+    };
+
+    expect(getPatchReasoningCapabilities(
+      '@ai-sdk/openai-compatible',
+      'deepseek-v4-flash',
+      metadata,
+    ).levels).toEqual(['high', 'max', 'off']);
+    expect(effortProviderOptions(
+      '@ai-sdk/openai-compatible',
+      'max',
+      'deepseek-v4-flash',
+      metadata,
+    )).toMatchObject({
+      openaiCompatible: { reasoningEffort: 'max' },
+      deepseek: { thinking: { type: 'enabled' } },
+    });
+  });
+
+  it('normalizes malformed compatibility before capability and effort routing', () => {
+    const metadata = {
+      providerId: 'custom',
+      compatibility: {
+        reasoningEffortMap: 'not-an-object',
+        supportsReasoningEffort: true,
+      } as never,
+    };
+
+    expect(getPatchReasoningCapabilities(
+      '@ai-sdk/openai-compatible',
+      'custom-reasoning-model',
+      metadata,
+    ).levels).toEqual(['low', 'medium', 'high']);
+    expect(effortProviderOptions(
+      '@ai-sdk/openai-compatible',
+      'high',
+      'custom-reasoning-model',
+      metadata,
+    )).toEqual({ custom: { reasoningEffort: 'high' } });
+  });
+
+  it('scopes OpenAI-compatible compatibility effort metadata to that adapter', () => {
+    const metadata = {
+      compatibility: { reasoningEffortMap: { high: 'max' } },
+    };
+
+    expect(getReasoningCapabilities('@ai-sdk/openai', 'gpt-5.6-sol', metadata).levels).toEqual([
+      'none', 'low', 'medium', 'high', 'xhigh', 'max',
+    ]);
+    expect(effortProviderOptions('@ai-sdk/openai', 'high', 'gpt-5.6-sol', metadata)).toEqual({
+      openai: { reasoningEffort: 'high' },
+    });
+  });
+
   it('treats an explicit reasoning-effort disable as internal-only reasoning', () => {
     const metadata = {
       providerId: 'opencode-go',
@@ -539,15 +596,75 @@ describe('createLanguageModel', () => {
       modelId: 'authenticated-model',
       apiKey: 'provider-key',
       authType: 'api',
+      baseURL: 'https://selected.example/v1',
       headers: { 'X-Plan': 'paid' },
     });
 
     expect(createOpenAI).toHaveBeenCalledWith({
       apiKey: 'provider-key',
+      baseURL: 'https://selected.example/v1',
       headers: { 'X-Plan': 'paid' },
     });
     expect(responses).toHaveBeenCalledWith('authenticated-model');
     vi.doUnmock('@ai-sdk/openai');
+  });
+
+  it.each([
+    { npm: '@ai-sdk/openai', moduleName: '@ai-sdk/openai' },
+    { npm: '@ai-sdk/openai-compatible', moduleName: '@ai-sdk/openai-compatible' },
+  ] as const)('rejects route-modifying base URLs before constructing $npm', async ({ npm, moduleName }) => {
+    vi.resetModules();
+    const createSdk = vi.fn();
+    if (npm === '@ai-sdk/openai') {
+      createSdk.mockReturnValue({ responses: vi.fn(), chat: vi.fn() });
+      vi.doMock('@ai-sdk/openai', () => ({ createOpenAI: createSdk }));
+    } else {
+      createSdk.mockReturnValue(vi.fn());
+      vi.doMock('@ai-sdk/openai-compatible', () => ({ createOpenAICompatible: createSdk }));
+    }
+    const invalidBases = [
+      { baseURL: 'https://api.example.com/v1?tenant=factory-query-secret', secrets: ['factory-query-secret'] },
+      { baseURL: 'https://api.example.com/v1#factory-fragment-secret', secrets: ['factory-fragment-secret'] },
+      { baseURL: 'https://api.example.com/v1?', secrets: [] },
+      { baseURL: 'https://api.example.com/v1#', secrets: [] },
+      {
+        baseURL: 'https://factory-user:factory-pass@api.example.com/v1',
+        secrets: ['factory-user', 'factory-pass'],
+      },
+      { baseURL: 'https://@api.example.com/v1', secrets: [] },
+      { baseURL: 'https://:@api.example.com/v1', secrets: [] },
+      { baseURL: 'https://api.example.com/v1//', secrets: [] },
+      { baseURL: 'ftp://api.example.com/v1', secrets: [] },
+    ];
+    const errors: unknown[] = [];
+
+    try {
+      const { createLanguageModel: create } = await import('../src/provider-factory.js');
+      for (const { baseURL } of invalidBases) {
+        try {
+          await create({
+            npm,
+            modelId: 'gpt-4o-mini',
+            apiKey: 'factory-api-key',
+            authType: 'api',
+            baseURL,
+          });
+        } catch (error) {
+          errors.push(error);
+        }
+      }
+    } finally {
+      vi.doUnmock(moduleName);
+    }
+
+    expect(createSdk).not.toHaveBeenCalled();
+    expect(errors).toHaveLength(invalidBases.length);
+    for (const [index, error] of errors.entries()) {
+      expect(error).toBeInstanceOf(Error);
+      const message = (error as Error).message;
+      expect(message).toMatch(/invalid.*OpenAI.*base URL/i);
+      for (const secret of invalidBases[index]!.secrets) expect(message).not.toContain(secret);
+    }
   });
 
   it('ignores discovery baseURL for @ai-sdk/anthropic (SDK default includes /v1)', async () => {

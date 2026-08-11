@@ -7,6 +7,50 @@ export const REGISTRY_SCHEMA_VERSION = 1;
 
 export type RegistrySubscriptionFilter = 'free';
 
+export function normalizeModelRuntimeCompatibility(
+  value: unknown,
+): ModelRuntimeCompatibility | undefined {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) return undefined;
+  const source = value as Record<string, unknown>;
+  const normalized: ModelRuntimeCompatibility = {};
+
+  if (
+    source.reasoningEffortMap
+    && typeof source.reasoningEffortMap === 'object'
+    && !Array.isArray(source.reasoningEffortMap)
+  ) {
+    const entries = Object.entries(source.reasoningEffortMap as Record<string, unknown>)
+      .filter((entry): entry is [string, string | null] => (
+        typeof entry[1] === 'string' || entry[1] === null
+      ));
+    if (entries.length > 0) normalized.reasoningEffortMap = Object.fromEntries(entries);
+  }
+  if (typeof source.supportsReasoningEffort === 'boolean') {
+    normalized.supportsReasoningEffort = source.supportsReasoningEffort;
+  }
+  if (source.thinkingFormat === 'deepseek' || source.thinkingFormat === 'qwen') {
+    normalized.thinkingFormat = source.thinkingFormat;
+  }
+  if (typeof source.requiresReasoningContentOnAssistantMessages === 'boolean') {
+    normalized.requiresReasoningContentOnAssistantMessages = source.requiresReasoningContentOnAssistantMessages;
+  }
+  if (typeof source.supportsStore === 'boolean') normalized.supportsStore = source.supportsStore;
+  if (typeof source.supportsDeveloperRole === 'boolean') {
+    normalized.supportsDeveloperRole = source.supportsDeveloperRole;
+  }
+  if (
+    source.maxTokensField === 'max_tokens'
+    || source.maxTokensField === 'max_completion_tokens'
+  ) {
+    normalized.maxTokensField = source.maxTokensField;
+  }
+  if (typeof source.supportsLongCacheRetention === 'boolean') {
+    normalized.supportsLongCacheRetention = source.supportsLongCacheRetention;
+  }
+
+  return Object.keys(normalized).length > 0 ? normalized : undefined;
+}
+
 export interface CachedModel {
   id: string;
   name: string;

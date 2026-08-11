@@ -78,6 +78,19 @@ describe('HTTP proxy routes', () => {
     ]);
   });
 
+  it('does not treat an unknown model format as a supported translated route', () => {
+    const unknownFormat = [{
+      ...providers[0]!,
+      models: [{ ...providers[0]!.models[0]!, modelFormat: 'future-format' }],
+    }] as unknown as LocalProvider[];
+    const favorite = { providerId: 'groq', modelId: 'llama-3.3-70b' };
+
+    const result = buildHttpProxyRoutes(unknownFormat, [favorite]);
+
+    expect(result.routes).toEqual([]);
+    expect(result.unsupported).toEqual([favorite]);
+  });
+
   it('does not create a route when the provider credential is empty', () => {
     const noKey = [{ ...providers[0]!, apiKey: '' }];
     const result = buildHttpProxyRoutes(noKey, [{ providerId: 'groq', modelId: 'llama-3.3-70b' }]);

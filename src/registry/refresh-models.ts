@@ -6,7 +6,7 @@ import { fetchTemplateModels } from './fetch-template-models.js';
 import { loadRegistryStrict, saveRegistry } from './io.js';
 import { withRegistryWriteLock } from './lock.js';
 import { resolveModelSource } from './model-source.js';
-import { validateCustomEndpointUrl } from './url-security.js';
+import { canonicalOpenAiBaseUrl, validateCustomEndpointUrl } from './url-security.js';
 import {
   effectiveProviderBaseUrl,
   resolveProviderTemplate,
@@ -230,11 +230,23 @@ async function refreshApiListProvider(
     return { models: [], error: 'Provider has no API base URL configured.' };
   }
 
-  let safeBaseUrl = baseUrl;
+  let safeBaseUrl: string;
+  if (npm === '@ai-sdk/openai' || npm === '@ai-sdk/openai-compatible') {
+    const canonicalBaseUrl = canonicalOpenAiBaseUrl(baseUrl);
+    if (canonicalBaseUrl === null) {
+      return {
+        models: [],
+        error: 'Invalid OpenAI base URL. Use an HTTP(S) base URL with at most one trailing slash and no query, fragment, or user info.',
+      };
+    }
+    safeBaseUrl = canonicalBaseUrl;
+  } else {
+    safeBaseUrl = baseUrl;
+  }
   const configuredUrl = provider.api.url?.trim();
   const templateDefault = catalogTemplate?.defaultBaseUrl?.trim();
   if (configuredUrl && configuredUrl !== templateDefault) {
-    const urlCheck = await validateCustomEndpointUrl(baseUrl, {
+    const urlCheck = await validateCustomEndpointUrl(safeBaseUrl, {
       allowInsecureLocal: catalogTemplate?.apiKeyOptional === true,
     });
     if (!urlCheck.ok || !urlCheck.normalizedUrl) {

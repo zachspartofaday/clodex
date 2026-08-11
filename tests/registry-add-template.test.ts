@@ -351,6 +351,26 @@ describe('registry/add-template', () => {
     expect(io.saveRegistry).toHaveBeenCalled();
   });
 
+  it('preserves a discovered model endpoint instead of replacing it with the provider endpoint', async () => {
+    vi.mocked(fetchTemplate.fetchTemplateModels).mockResolvedValue({
+      models: [{
+        id: 'mixed-model',
+        name: 'Mixed Model',
+        upstreamModelId: 'mixed-model',
+        modelFormat: 'openai',
+        npm: '@ai-sdk/openai',
+        apiUrl: 'https://model.example/v1',
+      }],
+      baseUrl: 'https://provider.example/v1',
+    });
+
+    const res = await addProviderFromTemplate(dummyTemplate, 'key_123');
+
+    expect(res.added).toBe(true);
+    expect(res.provider?.api.url).toBe('https://provider.example/v1');
+    expect(res.provider?.modelsCache?.models[0]?.apiUrl).toBe('https://model.example/v1');
+  });
+
   it('represents optional no-key access without a stored credential reference', async () => {
     const anonymousTemplate = { ...dummyTemplate, apiKeyOptional: true };
 

@@ -432,6 +432,9 @@ export async function startProxyCatalog(
         return;
       }
       const route = resolvedRoute ?? defaultRoute;
+      const responseModel = resolvedRoute && typeof originalModel === 'string'
+        ? originalModel
+        : route.realModelId;
       if (messagesEndpoint === 'count_tokens' && route.modelFormat !== 'anthropic') {
         const inputTokens = estimateAnthropicInputTokens(anthropicBody);
         plog(() => `token-count: local estimate model=${originalModel} input_tokens=${inputTokens}`);
@@ -538,7 +541,9 @@ export async function startProxyCatalog(
             // exact requested id back, or patched Claude Code misses the alias
             // context-window key and can skip auto-compaction.
             responseModelOverride:
-              typeof originalModel === 'string' && originalModel !== route.realModelId
+              resolvedRoute
+              && typeof originalModel === 'string'
+              && originalModel !== route.realModelId
                 ? originalModel
                 : undefined,
             onUpstreamError: inferenceLogPath
@@ -656,7 +661,7 @@ export async function startProxyCatalog(
                 () => streamAnthropicResponse(
                   model,
                   params,
-                  originalModel,
+                  responseModel,
                   writeStreamChunk,
                   plog,
                   {
@@ -684,7 +689,7 @@ export async function startProxyCatalog(
               () => generateAnthropicResponse(
                 model,
                 params,
-                originalModel,
+                responseModel,
                 {
                   forceStream: openAiOAuth,
                   abortSignal: clientAbort.signal,

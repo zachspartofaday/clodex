@@ -68,6 +68,39 @@ describe('refreshProviderModels', () => {
     expect(persistedRegistry.providers[0]?.modelsCache?.models[0]?.id).toBe('live-a');
   });
 
+  it('preserves a refreshed model endpoint instead of replacing it with the provider endpoint', async () => {
+    const registry: ProviderRegistry = {
+      schemaVersion: 1,
+      providers: [{
+        id: 'groq',
+        templateId: 'groq',
+        name: 'Groq',
+        enabled: true,
+        authRef: 'keyring:provider:groq',
+        authType: 'api',
+        api: { npm: '@ai-sdk/groq', url: 'https://api.groq.com/openai/v1' },
+        addedAt: '2026-01-01T00:00:00.000Z',
+      }],
+    };
+    vi.mocked(loadRegistryStrict).mockReturnValue(registry);
+    vi.mocked(fetchTemplateModels).mockResolvedValue({
+      baseUrl: 'https://api.groq.com/openai/v1',
+      models: [{
+        id: 'mixed-model',
+        name: 'Mixed Model',
+        upstreamModelId: 'mixed-model',
+        modelFormat: 'openai',
+        apiUrl: 'https://model.example/v1',
+      }],
+    });
+
+    const result = await refreshProviderModels('groq', 'test-key', registry);
+
+    expect(result).toMatchObject({ ok: true, modelCount: 1 });
+    expect(registry.providers[0]?.api.url).toBe('https://api.groq.com/openai/v1');
+    expect(registry.providers[0]?.modelsCache?.models[0]?.apiUrl).toBe('https://model.example/v1');
+  });
+
   it('does not apply discovery results after credentials change', async () => {
     const initialRegistry: ProviderRegistry = {
       schemaVersion: 1,
@@ -167,6 +200,71 @@ describe('refreshProviderModels', () => {
 
     expect(result.ok).toBe(false);
     expect(result.reason).toMatch(/restricted|private|blocked/i);
+    expect(fetchTemplateModels).not.toHaveBeenCalled();
+    expect(saveRegistry).not.toHaveBeenCalled();
+  });
+
+  it.each(
+    (['@ai-sdk/openai', '@ai-sdk/openai-compatible'] as const).flatMap(npm => [
+      {
+        npm,
+        name: 'query',
+        url: 'https://93.184.216.34/v1?tenant=refresh-query-secret',
+        secrets: ['refresh-query-secret'],
+      },
+      {
+        npm,
+        name: 'fragment',
+        url: 'https://93.184.216.34/v1#refresh-fragment-secret',
+        secrets: ['refresh-fragment-secret'],
+      },
+      { npm, name: 'bare query delimiter', url: 'https://93.184.216.34/v1?', secrets: [] },
+      { npm, name: 'bare fragment delimiter', url: 'https://93.184.216.34/v1#', secrets: [] },
+      {
+        npm,
+        name: 'userinfo',
+        url: 'https://refresh-user:refresh-pass@93.184.216.34/v1',
+        secrets: ['refresh-user', 'refresh-pass'],
+      },
+      { npm, name: 'empty userinfo', url: 'https://@93.184.216.34/v1', secrets: [] },
+      {
+        npm,
+        name: 'empty username and password',
+        url: 'https://:@93.184.216.34/v1',
+        secrets: [],
+      },
+      { npm, name: 'repeated trailing separators', url: 'https://93.184.216.34/v1//', secrets: [] },
+    ]),
+  )('rejects a route-modifying $npm $name before credential-bearing model discovery', async ({ npm, url, secrets }) => {
+    const registry: ProviderRegistry = {
+      schemaVersion: 1,
+      providers: [{
+        id: 'unsafe-openai',
+        templateId: 'custom-openai',
+        name: 'Unsafe OpenAI',
+        enabled: true,
+        authRef: 'keyring:provider:unsafe-openai',
+        authType: 'api',
+        api: { npm, url },
+        addedAt: '2026-06-17T00:00:00.000Z',
+      }],
+    };
+    vi.mocked(fetchTemplateModels).mockResolvedValue({
+      baseUrl: 'https://93.184.216.34/v1',
+      models: [{
+        id: 'unsafe-model',
+        name: 'Unsafe Model',
+        upstreamModelId: 'unsafe-model',
+        modelFormat: 'openai',
+      }],
+    });
+    vi.mocked(loadRegistryStrict).mockReturnValue(registry);
+
+    const result = await refreshProviderModels('unsafe-openai', 'sk-real-key', registry);
+
+    expect(result.ok).toBe(false);
+    expect(result.reason).toMatch(/invalid.*OpenAI.*base URL/i);
+    for (const secret of secrets) expect(result.reason).not.toContain(secret);
     expect(fetchTemplateModels).not.toHaveBeenCalled();
     expect(saveRegistry).not.toHaveBeenCalled();
   });

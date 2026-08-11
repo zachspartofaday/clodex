@@ -14,6 +14,8 @@ import {
   injectClaudeIdentity,
 } from './oauth/claude-identity.js';
 import { isCredentialBearingHeader } from './credential-headers.js';
+import { canonicalOpenAiBaseUrl } from './registry/url-security.js';
+import { normalizeModelRuntimeCompatibility } from './registry/types.js';
 import {
   transformOpenAiCompatibleRequestBody,
   type ModelRuntimeCompatibility,
@@ -163,6 +165,20 @@ async function loadSdkProviderFactory(npm: string): Promise<SdkProviderFactory> 
 
 export async function createLanguageModel(spec: ProviderModelSpec): Promise<LanguageModel> {
   const { npm, modelId, apiKey, baseURL } = spec;
+  const compatibility = normalizeModelRuntimeCompatibility(spec.compatibility);
+
+  // Fail closed before any SDK dynamic import: an explicit base URL for the
+  // exact OpenAI SDK packages must canonicalize to a same-origin route with no
+  // query/fragment/userinfo and at most one trailing slash.
+  const canonicalBaseURL =
+    baseURL && (npm === '@ai-sdk/openai' || npm === '@ai-sdk/openai-compatible')
+      ? canonicalOpenAiBaseUrl(baseURL)
+      : undefined;
+  if (canonicalBaseURL === null) {
+    throw new Error(
+      'Invalid OpenAI base URL. Use an HTTP(S) base URL with at most one trailing slash and no query, fragment, or user info.',
+    );
+  }
 
   if (npm === '@ai-sdk/openai') {
     const { createOpenAI } = await import('@ai-sdk/openai');
@@ -204,10 +220,15 @@ export async function createLanguageModel(spec: ProviderModelSpec): Promise<Lang
       : spec.authType === 'none'
         ? {
             apiKey: '',
+            ...(canonicalBaseURL ? { baseURL: canonicalBaseURL } : {}),
             ...(spec.headers ? { headers: spec.headers } : {}),
             fetch: fetchWithoutCredentialHeaders,
           }
-        : { apiKey, ...(spec.headers ? { headers: spec.headers } : {}) };
+        : {
+            apiKey,
+            ...(canonicalBaseURL ? { baseURL: canonicalBaseURL } : {}),
+            ...(spec.headers ? { headers: spec.headers } : {}),
+          };
     const openai = createOpenAI(oauthOptions);
     return useResponsesEndpoint ? openai.responses(modelId) : openai.chat(modelId);
   }
@@ -251,14 +272,14 @@ export async function createLanguageModel(spec: ProviderModelSpec): Promise<Lang
     const { createOpenAICompatible } = await import('@ai-sdk/openai-compatible');
     const options = {
       name: spec.providerId ?? 'openai-compatible',
-      baseURL: baseURL ?? '',
+      baseURL: canonicalBaseURL ?? '',
       ...(spec.authType !== 'none' && apiKey.trim() ? { apiKey } : {}),
       ...(spec.authType === 'none' ? { fetch: fetchWithoutCredentialHeaders } : {}),
       ...(spec.headers ? { headers: spec.headers } : {}),
-      ...(spec.compatibility
+      ...(compatibility
         ? {
             transformRequestBody: (body: Record<string, unknown>) =>
-              transformOpenAiCompatibleRequestBody(body, spec.compatibility!),
+              transformOpenAiCompatibleRequestBody(body, compatibility),
           }
         : {}),
     };
@@ -640,11 +661,22 @@ function mapCodexEffortToGeminiBudget(effort: string): number | undefined {
   return GEMINI_25_BUDGETS[level];
 }
 
+function hasCompatibilityReasoningControl(
+  compatibility: ModelRuntimeCompatibility | undefined,
+): compatibility is ModelRuntimeCompatibility {
+  return compatibility !== undefined
+    && (
+      compatibility.supportsReasoningEffort !== undefined
+      || compatibility.reasoningEffortMap !== undefined
+      || compatibility.thinkingFormat !== undefined
+    );
+}
+
 function compatibilityReasoningCapabilities(
   metadata?: ReasoningMetadata,
 ): ReasoningCapabilities | undefined {
-  const compatibility = metadata?.compatibility;
-  if (!compatibility) return undefined;
+  const compatibility = normalizeModelRuntimeCompatibility(metadata?.compatibility);
+  if (!hasCompatibilityReasoningControl(compatibility)) return undefined;
 
   if (compatibility.supportsReasoningEffort === false) {
     return metadata?.reasoning === false
@@ -731,7 +763,9 @@ export function getReasoningCapabilities(
   metadata?: ReasoningMetadata,
 ): ReasoningCapabilities {
   const id = modelId.toLowerCase();
-  const compatibilityCapabilities = compatibilityReasoningCapabilities(metadata);
+  const compatibilityCapabilities = npm === '@ai-sdk/openai-compatible'
+    ? compatibilityReasoningCapabilities(metadata)
+    : undefined;
   if (compatibilityCapabilities) return compatibilityCapabilities;
 
   if (isOpenRouterRoute(npm, metadata)) {
@@ -906,12 +940,17 @@ export function getPatchReasoningCapabilities(
   modelId: string,
   metadata?: ReasoningMetadata,
 ): ReasoningCapabilities {
-  if (metadata?.compatibility?.supportsReasoningEffort === false) {
+  const compatibility = normalizeModelRuntimeCompatibility(metadata?.compatibility);
+  if (
+    npm === '@ai-sdk/openai-compatible'
+    && hasCompatibilityReasoningControl(compatibility)
+    && compatibility.supportsReasoningEffort === false
+  ) {
     return compatibilityReasoningCapabilities(metadata) ?? EMPTY_REASONING;
   }
   if (
     metadata?.reasoning === false
-    && !metadata?.compatibility?.reasoningEffortMap
+    && !compatibility?.reasoningEffortMap
     && !hasSupportedParameter(metadata, 'reasoning_effort')
     && !hasSupportedParameter(metadata, 'reasoning')
   ) {
@@ -952,14 +991,19 @@ export function effortProviderOptions(
 ): Record<string, Record<string, unknown>> | undefined {
   if (!effort) return undefined;
 
-  if (npm === '@ai-sdk/openai-compatible' && modelId && metadata?.compatibility) {
+  const compatibility = normalizeModelRuntimeCompatibility(metadata?.compatibility);
+  if (
+    npm === '@ai-sdk/openai-compatible'
+    && modelId
+    && hasCompatibilityReasoningControl(compatibility)
+  ) {
     const reasoningEffort = compatibilityReasoningEffort(
       effort,
       modelId,
-      metadata.compatibility,
+      compatibility,
     );
     if (!reasoningEffort) return undefined;
-    const key = metadata.providerId ? toCamelCase(metadata.providerId) : 'openaiCompatible';
+    const key = metadata?.providerId ? toCamelCase(metadata.providerId) : 'openaiCompatible';
     return { [key]: { reasoningEffort } };
   }
 

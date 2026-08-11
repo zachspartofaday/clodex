@@ -1,4 +1,5 @@
 import { describe, it, expect, beforeEach, afterEach } from 'vitest';
+import { createServer } from 'node:http';
 import { mkdtempSync, mkdirSync, readFileSync, rmSync, writeFileSync, existsSync, statSync } from 'node:fs';
 import { join } from 'node:path';
 import { tmpdir } from 'node:os';
@@ -524,6 +525,410 @@ describe('materializeRegistry', () => {
     expect(locals[0]?.models[0]).toMatchObject({
       isFree: true,
       freeStatus: 'free_provider',
+    });
+  });
+
+  it('fails closed on conflicting OpenAI endpoints before authorization-bearing traffic', async () => {
+    const authorizationHeaders: string[] = [];
+    let requestCount = 0;
+    const unintendedHost = createServer((req, res) => {
+      requestCount += 1;
+      const authorization = req.headers.authorization;
+      if (authorization) authorizationHeaders.push(authorization);
+      res.writeHead(200, { 'Content-Type': 'application/json' });
+      res.end('{}');
+    });
+    await new Promise<void>(resolve => unintendedHost.listen(0, '127.0.0.1', resolve));
+    const address = unintendedHost.address();
+    if (!address || typeof address === 'string') throw new Error('Expected TCP listener');
+
+    const registry = emptyRegistry();
+    registry.providers.push({
+      id: 'mixed-openai',
+      templateId: 'mixed-openai',
+      name: 'Mixed OpenAI',
+      enabled: true,
+      authRef: 'keyring:provider:mixed-openai',
+      authType: 'api',
+      api: { npm: '@ai-sdk/openai', url: 'https://provider.example/v1' },
+      addedAt: '2026-06-09T00:00:00.000Z',
+      modelsCache: {
+        fetchedAt: '2026-06-09T00:00:00.000Z',
+        models: [{
+          id: 'conflicting-model',
+          name: 'Conflicting Model',
+          upstreamModelId: 'conflicting-model',
+          modelFormat: 'openai',
+          npm: '@ai-sdk/openai',
+          apiUrl: `http://127.0.0.1:${address.port}/v1`,
+        }],
+      },
+    });
+
+    try {
+      expect(() => materializeRegistry(registry, () => 'sentinel-authorization-value')).toThrow(
+        /mixed-openai.*conflicting-model.*endpoint.*does not match.*provider endpoint/i,
+      );
+      expect(requestCount).toBe(0);
+      expect(authorizationHeaders).toEqual([]);
+    } finally {
+      await new Promise<void>((resolve, reject) => unintendedHost.close(error => error ? reject(error) : resolve()));
+    }
+  });
+
+  it('accepts equivalent OpenAI model and provider endpoints after URL normalization', () => {
+    const registry = emptyRegistry();
+    registry.providers.push({
+      id: 'equivalent-openai',
+      templateId: 'equivalent-openai',
+      name: 'Equivalent OpenAI',
+      enabled: true,
+      authRef: 'keyring:provider:equivalent-openai',
+      authType: 'api',
+      api: { npm: '@ai-sdk/openai', url: 'https://API.EXAMPLE.com:443/v1/' },
+      addedAt: '2026-06-09T00:00:00.000Z',
+      modelsCache: {
+        fetchedAt: '2026-06-09T00:00:00.000Z',
+        models: [{
+          id: 'equivalent-model',
+          name: 'Equivalent Model',
+          upstreamModelId: 'equivalent-model',
+          modelFormat: 'openai',
+          npm: '@ai-sdk/openai',
+          apiUrl: 'https://api.example.com/v1',
+        }],
+      },
+    });
+
+    const locals = materializeRegistry(registry, () => 'sentinel-authorization-value');
+
+    expect(locals).toHaveLength(1);
+    expect(locals[0]?.models[0]?.apiBaseUrl).toBe('https://api.example.com/v1');
+  });
+
+  it.each([
+    {
+      name: 'provider-only query',
+      providerQuery: '?tenant=provider-secret',
+      modelQuery: '',
+      secrets: ['provider-secret'],
+    },
+    {
+      name: 'model-only query',
+      providerQuery: '',
+      modelQuery: '?tenant=model-secret',
+      secrets: ['model-secret'],
+    },
+    {
+      name: 'identical queries on both',
+      providerQuery: '?tenant=shared-secret',
+      modelQuery: '?tenant=shared-secret',
+      secrets: ['shared-secret'],
+    },
+    {
+      name: 'bare query delimiter',
+      providerQuery: '',
+      modelQuery: '?',
+      secrets: ['?'],
+    },
+  ])('fails closed on query-bearing OpenAI endpoints before authorization-bearing traffic for $name', async ({ providerQuery, modelQuery, secrets }) => {
+    const authorizationHeaders: string[] = [];
+    let requestCount = 0;
+    const unintendedHost = createServer((req, res) => {
+      requestCount += 1;
+      const authorization = req.headers.authorization;
+      if (authorization) authorizationHeaders.push(authorization);
+      res.writeHead(200, { 'Content-Type': 'application/json' });
+      res.end('{}');
+    });
+    await new Promise<void>(resolve => unintendedHost.listen(0, '127.0.0.1', resolve));
+    const address = unintendedHost.address();
+    if (!address || typeof address === 'string') throw new Error('Expected TCP listener');
+
+    const registry = emptyRegistry();
+    registry.providers.push({
+      id: 'query-openai',
+      templateId: 'query-openai',
+      name: 'Query OpenAI',
+      enabled: true,
+      authRef: 'keyring:provider:query-openai',
+      authType: 'api',
+      api: { npm: '@ai-sdk/openai', url: `https://provider.example/v1${providerQuery}` },
+      addedAt: '2026-06-09T00:00:00.000Z',
+      modelsCache: {
+        fetchedAt: '2026-06-09T00:00:00.000Z',
+        models: [{
+          id: 'query-model',
+          name: 'Query Model',
+          upstreamModelId: 'query-model',
+          modelFormat: 'openai',
+          npm: '@ai-sdk/openai',
+          apiUrl: `http://127.0.0.1:${address.port}/v1${modelQuery}`,
+        }],
+      },
+    });
+
+    try {
+      let thrown: unknown;
+      try {
+        materializeRegistry(registry, () => 'sentinel-authorization-value');
+      } catch (error) {
+        thrown = error;
+      }
+
+      expect(thrown).toBeInstanceOf(Error);
+      const message = (thrown as Error).message;
+      expect(message).toMatch(/query-openai.*query-model.*endpoint.*does not match.*provider endpoint/i);
+      for (const secret of secrets) expect(message).not.toContain(secret);
+      expect(requestCount).toBe(0);
+      expect(authorizationHeaders).toEqual([]);
+    } finally {
+      await new Promise<void>((resolve, reject) => unintendedHost.close(error => error ? reject(error) : resolve()));
+    }
+  });
+
+  it('accepts equivalent OpenAI endpoints with encoded delimiters in the path', () => {
+    const registry = emptyRegistry();
+    registry.providers.push({
+      id: 'encoded-openai',
+      templateId: 'encoded-openai',
+      name: 'Encoded OpenAI',
+      enabled: true,
+      authRef: 'keyring:provider:encoded-openai',
+      authType: 'api',
+      api: {
+        npm: '@ai-sdk/openai',
+        url: 'https://API.EXAMPLE.com:443/v1/%3Ftenant%3Dsafe/%23fragment/%40user/',
+      },
+      addedAt: '2026-06-09T00:00:00.000Z',
+      modelsCache: {
+        fetchedAt: '2026-06-09T00:00:00.000Z',
+        models: [{
+          id: 'encoded-model',
+          name: 'Encoded Model',
+          upstreamModelId: 'encoded-model',
+          modelFormat: 'openai',
+          npm: '@ai-sdk/openai',
+          apiUrl: 'https://api.example.com/v1/%3Ftenant%3Dsafe/%23fragment/%40user',
+        }],
+      },
+    });
+
+    const locals = materializeRegistry(registry, () => 'sentinel-authorization-value');
+
+    expect(locals).toHaveLength(1);
+    expect(locals[0]?.models[0]?.apiBaseUrl).toBe(
+      'https://api.example.com/v1/%3Ftenant%3Dsafe/%23fragment/%40user',
+    );
+  });
+
+  it.each([
+    {
+      name: 'query mismatch',
+      providerUrl: 'https://api.example.com/v1?tenant=provider-secret',
+      modelUrl: 'https://api.example.com/v1?tenant=model-secret',
+      secrets: ['provider-secret', 'model-secret'],
+    },
+    {
+      name: 'userinfo mismatch',
+      providerUrl: 'https://provider-user:provider-pass@api.example.com/v1',
+      modelUrl: 'https://model-user:model-pass@api.example.com/v1',
+      secrets: ['provider-user', 'provider-pass', 'model-user', 'model-pass'],
+    },
+    {
+      name: 'empty userinfo mismatch',
+      providerUrl: 'https://@api.example.com/v1',
+      modelUrl: 'https://:@api.example.com/v1',
+      secrets: [],
+    },
+    {
+      name: 'identical fragments',
+      providerUrl: 'https://api.example.com/v1#shared-fragment-secret',
+      modelUrl: 'https://api.example.com/v1#shared-fragment-secret',
+      secrets: ['shared-fragment-secret'],
+    },
+    {
+      name: 'bare fragment delimiters',
+      providerUrl: 'https://api.example.com/v1#',
+      modelUrl: 'https://api.example.com/v1#',
+      secrets: [],
+    },
+    {
+      name: 'identical userinfo',
+      providerUrl: 'https://shared-user:shared-pass@api.example.com/v1',
+      modelUrl: 'https://shared-user:shared-pass@api.example.com/v1',
+      secrets: ['shared-user', 'shared-pass'],
+    },
+    {
+      name: 'repeated trailing separators',
+      providerUrl: 'https://api.example.com/v1//',
+      modelUrl: 'https://api.example.com/v1//',
+      secrets: [],
+    },
+    {
+      name: 'malformed endpoints',
+      providerUrl: 'not-a-url?token=malformed-secret',
+      modelUrl: 'not-a-url?token=malformed-secret',
+      secrets: ['malformed-secret'],
+    },
+  ])('fails closed without exposing endpoint secrets for $name', ({ providerUrl, modelUrl, secrets }) => {
+    const registry = emptyRegistry();
+    registry.providers.push({
+      id: 'sensitive-openai',
+      templateId: 'sensitive-openai',
+      name: 'Sensitive OpenAI',
+      enabled: true,
+      authRef: 'keyring:provider:sensitive-openai',
+      authType: 'api',
+      api: { npm: '@ai-sdk/openai', url: providerUrl },
+      addedAt: '2026-06-09T00:00:00.000Z',
+      modelsCache: {
+        fetchedAt: '2026-06-09T00:00:00.000Z',
+        models: [{
+          id: 'sensitive-model',
+          name: 'Sensitive Model',
+          upstreamModelId: 'sensitive-model',
+          modelFormat: 'openai',
+          npm: '@ai-sdk/openai',
+          apiUrl: modelUrl,
+        }],
+      },
+    });
+
+    let thrown: unknown;
+    try {
+      materializeRegistry(registry, () => 'sentinel-authorization-value');
+    } catch (error) {
+      thrown = error;
+    }
+
+    expect(thrown).toBeInstanceOf(Error);
+    const message = (thrown as Error).message;
+    expect(message).toMatch(/sensitive-openai.*sensitive-model.*endpoint/i);
+    for (const secret of secrets) expect(message).not.toContain(secret);
+  });
+
+  it.each([
+    {
+      name: 'provider query',
+      providerUrl: 'https://api.example.com/v1?tenant=compatible-provider-secret',
+      modelUrl: undefined,
+      secrets: ['compatible-provider-secret'],
+    },
+    {
+      name: 'provider-only empty userinfo',
+      providerUrl: 'https://@api.example.com/v1',
+      modelUrl: undefined,
+      secrets: [],
+    },
+    {
+      name: 'model fragment',
+      providerUrl: 'https://api.example.com/v1',
+      modelUrl: 'https://api.example.com/v1#compatible-model-secret',
+      secrets: ['compatible-model-secret'],
+    },
+    {
+      name: 'model-only empty username and password',
+      providerUrl: 'https://api.example.com/v1',
+      modelUrl: 'https://:@api.example.com/v1',
+      secrets: [],
+    },
+    {
+      name: 'bare provider fragment',
+      providerUrl: 'https://api.example.com/v1#',
+      modelUrl: undefined,
+      secrets: [],
+    },
+    {
+      name: 'bare model query',
+      providerUrl: 'https://api.example.com/v1',
+      modelUrl: 'https://api.example.com/v1?',
+      secrets: [],
+    },
+    {
+      name: 'model userinfo',
+      providerUrl: 'https://api.example.com/v1',
+      modelUrl: 'https://compatible-user:compatible-pass@api.example.com/v1',
+      secrets: ['compatible-user', 'compatible-pass'],
+    },
+    {
+      name: 'repeated provider trailing separators',
+      providerUrl: 'https://api.example.com/v1//',
+      modelUrl: undefined,
+      secrets: [],
+    },
+  ])('fails closed without exposing endpoint secrets for OpenAI-compatible $name', ({ providerUrl, modelUrl, secrets }) => {
+    const registry = emptyRegistry();
+    registry.providers.push({
+      id: 'sensitive-compatible',
+      templateId: 'sensitive-compatible',
+      name: 'Sensitive Compatible',
+      enabled: true,
+      authRef: 'keyring:provider:sensitive-compatible',
+      authType: 'api',
+      api: { npm: '@ai-sdk/openai-compatible', url: providerUrl },
+      addedAt: '2026-06-09T00:00:00.000Z',
+      modelsCache: {
+        fetchedAt: '2026-06-09T00:00:00.000Z',
+        models: [{
+          id: 'sensitive-compatible-model',
+          name: 'Sensitive Compatible Model',
+          upstreamModelId: 'sensitive-compatible-model',
+          modelFormat: 'openai',
+          npm: '@ai-sdk/openai-compatible',
+          apiUrl: modelUrl,
+        }],
+      },
+    });
+
+    let thrown: unknown;
+    try {
+      materializeRegistry(registry, () => 'sentinel-authorization-value');
+    } catch (error) {
+      thrown = error;
+    }
+
+    expect(thrown).toBeInstanceOf(Error);
+    const message = (thrown as Error).message;
+    expect(message).toMatch(/sensitive-compatible.*sensitive-compatible-model.*endpoint/i);
+    expect(message).not.toContain('sentinel-authorization-value');
+    for (const secret of secrets) expect(message).not.toContain(secret);
+  });
+
+  it('normalizes compatibility metadata before it reaches runtime consumers', () => {
+    const registry = emptyRegistry();
+    registry.providers.push({
+      id: 'normalized-compatibility',
+      templateId: 'normalized-compatibility',
+      name: 'Normalized Compatibility',
+      enabled: true,
+      authRef: 'keyring:provider:normalized-compatibility',
+      authType: 'api',
+      api: { npm: '@ai-sdk/openai-compatible', url: 'https://api.example.com/v1' },
+      addedAt: '2026-06-09T00:00:00.000Z',
+      modelsCache: {
+        fetchedAt: '2026-06-09T00:00:00.000Z',
+        models: [{
+          id: 'normalized-model',
+          name: 'Normalized Model',
+          upstreamModelId: 'normalized-model',
+          modelFormat: 'openai',
+          compatibility: {
+            reasoningEffortMap: 'not-an-object',
+            supportsReasoningEffort: true,
+            thinkingFormat: 'unknown',
+            maxTokensField: 'max_completion_tokens',
+            supportsStore: 'yes',
+          } as never,
+        }],
+      },
+    });
+
+    const locals = materializeRegistry(registry, () => 'key');
+
+    expect(locals[0]?.models[0]?.compatibility).toEqual({
+      supportsReasoningEffort: true,
+      maxTokensField: 'max_completion_tokens',
     });
   });
 

@@ -230,6 +230,7 @@ export async function relayAnthropicMessages(
   if (
     options.responseModelOverride
     && parsed && typeof parsed === 'object' && !Array.isArray(parsed)
+    && (parsed as Record<string, unknown>).type === 'message'
     && typeof (parsed as Record<string, unknown>).model === 'string'
   ) {
     (parsed as Record<string, unknown>).model = options.responseModelOverride;
