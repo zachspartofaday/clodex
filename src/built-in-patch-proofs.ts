@@ -177,17 +177,67 @@ export function captureBuiltInPatchProofs(
     'PATCH 8c: max effort capability',
     effortProofPattern('/*ccpatch:max-effort*/'),
   );
-  addPattern(
-    'PATCH 8d: exact effort level helper',
-    /\/\*ccpatch:effort-level-list\*\/var _ccl=Object\.assign\(Object\.create\(null\),\{[^{}]*\}\)\[String\([\w$]+\|\|""\)\.trim\(\)\.toLowerCase\(\)\];if\(_ccl!==void 0\)return _ccl\.filter\(function\(_cclv\)\{return [\w$]+\(_cclv,[\w$]+\)\}\);/,
-  );
-  if (protectsResult(results, 'PATCH 8e: exact effort metadata lists')) {
-    proofs.push(...capturePatternOccurrences(
-      source,
-      'PATCH 8e: exact effort metadata lists',
-      /supportedEffortLevels:\(\/\*ccpatch:effort-level-consumer\*\/Object\.assign\(Object\.create\(null\),\{[^{}]*\}\)\[String\([\w$]+\|\|""\)\.trim\(\)\.toLowerCase\(\)\]\?\?PM\)\.filter\(\([\w$]+\)=>\{if\([\w$]+==="max"&&![\w$]+\([\w$]+\)\)return!1;if\([\w$]+==="xhigh"&&![\w$]+\([\w$]+\)\)return!1;return!0\}\)/,
-      2,
-    ));
+  const protectsEffortHelper = protectsResult(results, 'PATCH 8d: exact effort level helper');
+  const protectsEffortMetadata = protectsResult(results, 'PATCH 8e: exact effort metadata lists');
+  if (protectsEffortHelper || protectsEffortMetadata) {
+    // The binding is derived from the UNIQUE marked helper's complete
+    // postcondition — the injected snippet plus its retained `return
+    // BINDING.filter(...)` tail. That keeps a single discovery authority (the
+    // transform's own anchor, which embeds the same escaped binding) instead of
+    // importing a second opinion about which binding the patch correlates.
+    const helper = new RegExp(
+      escapeRegex('/*ccpatch:effort-level-list*/')
+      + 'var _ccl=Object\\.assign\\(Object\\.create\\(null\\),\\{[^{}]*\\}\\)'
+      + '\\[String\\([\\w$]+\\|\\|""\\)\\.trim\\(\\)\\.toLowerCase\\(\\)\\];'
+      + 'if\\(_ccl!==void 0\\)return _ccl\\.filter\\(function\\(_cclv\\)\\{return '
+      + '[\\w$]+\\(_cclv,[\\w$]+\\)\\}\\);return ([A-Za-z_$][\\w$]*)\\.filter'
+      + '\\(\\([\\w$]+\\)=>[\\w$]+\\([\\w$]+,[\\w$]+\\)\\)\\}',
+    );
+    const flags = helper.flags.includes('g') ? helper.flags : `${helper.flags}g`;
+    const matcher = new RegExp(helper.source, flags);
+    const match = matcher.exec(source);
+    if (!match || matcher.exec(source)) {
+      throw new Error('clodex patch: could not capture built-in postcondition: PATCH 8d: exact effort level helper');
+    }
+    const effortListBinding = escapeRegex(match[1]!);
+    if (protectsEffortHelper) {
+      // The complete helper postcondition, its declaration (binding as the
+      // first declarator), and the canonical ladder assignment all hold the
+      // same binding.
+      proofs.push({
+        name: 'PATCH 8d: exact effort level helper',
+        protectedText: match[0],
+        occurrences: 1,
+      });
+      proofs.push(capturePattern(
+        source,
+        'PATCH 8d: effort ladder declaration',
+        new RegExp('(?:var|let|const)\\s+' + effortListBinding + '[,;=]'),
+      ));
+      proofs.push(capturePattern(
+        source,
+        'PATCH 8d: effort ladder assignment',
+        new RegExp(
+          effortListBinding
+          + '\\s*=\\s*\\[\\s*"low"\\s*,\\s*"medium"\\s*,\\s*"high"\\s*,\\s*"xhigh"\\s*,\\s*"max"\\s*\\]',
+        ),
+      ));
+    }
+    if (protectsEffortMetadata) {
+      proofs.push(...capturePatternOccurrences(
+        source,
+        'PATCH 8e: exact effort metadata lists',
+        new RegExp(
+          'supportedEffortLevels:\\(/\\*ccpatch:effort-level-consumer\\*/Object\\.assign'
+          + '\\(Object\\.create\\(null\\),\\{[^{}]*\\}\\)'
+          + '\\[String\\([\\w$]+\\|\\|""\\)\\.trim\\(\\)\\.toLowerCase\\(\\)\\]'
+          + '\\?\\?' + effortListBinding + '\\)\\.filter\\(\\([\\w$]+\\)=>\\{'
+          + 'if\\([\\w$]+==="max"&&![\\w$]+\\([\\w$]+\\)\\)return!1;'
+          + 'if\\([\\w$]+==="xhigh"&&![\\w$]+\\([\\w$]+\\)\\)return!1;return!0\\}\\)',
+        ),
+        2,
+      ));
+    }
   }
   addPattern(
     'PATCH 8f: preserve requested effort',
