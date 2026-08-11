@@ -4,6 +4,7 @@ import {
   anthropicErrorType,
   clampRetryAfterSeconds,
   formatUpstreamError,
+  frameStatusCode,
   isContextLengthExceededError,
   sdkUpstreamErrorDetails,
   upstreamHttpStatus,
@@ -89,6 +90,73 @@ describe('sdkUpstreamErrorDetails retry-after extraction', () => {
     }));
     expect(details?.statusCode).toBe(500);
     expect(details?.retryAfterSeconds).toBeUndefined();
+  });
+
+  it('omits a misleading capped HTTP backoff for a plan-level usage limit', () => {
+    const details = sdkUpstreamErrorDetails(apiCallError({
+      statusCode: 429,
+      data: {
+        error: {
+          type: 'usage_limit_reached',
+          code: 'usage_limit_reached',
+          message: 'Weekly usage limit reached',
+          retry_after_seconds: 21_600,
+        },
+      },
+    }));
+    expect(details).toMatchObject({ statusCode: 429, isRetryable: true });
+    expect(details?.retryAfterSeconds).toBeUndefined();
+  });
+
+  it('detects a usage limit whose discriminator survives only in the serialized body', () => {
+    // The SDK may serialize the error body into responseBody without also
+    // populating `data`; the usage-limit signal then lives only in that JSON,
+    // so the classifier must read the same structured payload both consumers
+    // use. Misread, the oversized retry-after below would be clamped to 60s
+    // instead of omitted.
+    const details = sdkUpstreamErrorDetails(apiCallError({
+      statusCode: 429,
+      responseBody: JSON.stringify({
+        error: {
+          type: 'usage_limit_reached',
+          code: 'usage_limit_reached',
+          message: 'Weekly usage limit reached',
+        },
+      }),
+      responseHeaders: { 'retry-after': '21600' },
+    }));
+    expect(details).toMatchObject({ statusCode: 429, isRetryable: true });
+    expect(details?.retryAfterSeconds).toBeUndefined();
+  });
+
+  it('treats a malformed serialized body as absent instead of crashing the classifier', () => {
+    const details = sdkUpstreamErrorDetails(apiCallError({
+      statusCode: 429,
+      responseBody: 'not json {',
+      responseHeaders: { 'retry-after': '3600' },
+    }));
+    expect(details).toMatchObject({ statusCode: 429, isRetryable: true, retryAfterSeconds: 60 });
+  });
+});
+
+describe('usage-limit classification', () => {
+  it('maps the clodex-specific usage-limit signal to retryable 429 semantics', () => {
+    expect(frameStatusCode(undefined, 'usage_limit_reached')).toBe(429);
+    expect(frameStatusCode(undefined, 'server_error usage_limit_reached')).toBe(429);
+
+    const details = sdkUpstreamErrorDetails({
+      type: 'usage_limit_reached',
+      code: 'usage_limit_reached',
+      message: 'Weekly usage limit reached',
+      retry_after_seconds: 30,
+    });
+    expect(details).toMatchObject({
+      statusCode: 429,
+      isRetryable: true,
+      retryAfterSeconds: 30,
+      attemptCount: 1,
+    });
+    expect(anthropicErrorType(details!.statusCode!)).toBe('rate_limit_error');
   });
 });
 
