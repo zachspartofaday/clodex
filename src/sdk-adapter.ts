@@ -839,7 +839,7 @@ export async function writeAnthropicStream(
     });
     started = true;
   };
-  const closeOpen = () => {
+  const closeOpen = (mode: 'normal' | 'terminal-error' = 'normal') => {
     if (openType === 'thinking') {
       emit('content_block_delta', {
         type: 'content_block_delta', index: blockIndex,
@@ -848,27 +848,33 @@ export async function writeAnthropicStream(
       pendingThinkingSig = undefined;
     }
     // Stream ended (or moved on) without a tool-call part for this block. Parse
-    // and sanitize complete buffered JSON when possible; malformed or partial
-    // JSON still passes through unchanged so the deltas are not lost.
+    // and sanitize complete buffered JSON when possible; on ordinary closure,
+    // malformed or partial JSON still passes through unchanged.
+    let suppressOpenStop = false;
     if (openType === 'tool' && openToolId !== null && !flushedTools.has(openToolId)) {
       const buffered = toolJsonBuffer.get(openToolId);
       let json = buffered;
+      let parsedObject = false;
       const toolName = toolNameById.get(openToolId);
-      if (buffered && toolName) {
+      if (buffered) {
         try {
           const parsed = JSON.parse(buffered) as unknown;
           if (parsed && typeof parsed === 'object' && !Array.isArray(parsed)) {
-            json = JSON.stringify(sanitizeToolInput(
-              parsed as Record<string, unknown>,
-              requiredProps.get(toolName),
-              toolName,
-            ));
+            parsedObject = true;
+            if (toolName) {
+              json = JSON.stringify(sanitizeToolInput(
+                parsed as Record<string, unknown>,
+                requiredProps.get(toolName),
+                toolName,
+              ));
+            }
           }
         } catch {
           // Preserve malformed/partial JSON exactly; the client owns its error.
         }
       }
-      if (json) {
+      suppressOpenStop = mode === 'terminal-error' && !parsedObject;
+      if (json && !suppressOpenStop) {
         emit('content_block_delta', {
           type: 'content_block_delta', index: blockIndex,
           delta: { type: 'input_json_delta', partial_json: json },
@@ -876,7 +882,9 @@ export async function writeAnthropicStream(
       }
       flushedTools.add(openToolId);
     }
-    if (openType) emit('content_block_stop', { type: 'content_block_stop', index: blockIndex });
+    if (openType && !suppressOpenStop) {
+      emit('content_block_stop', { type: 'content_block_stop', index: blockIndex });
+    }
     openType = null;
     openToolId = null;
   };
@@ -999,7 +1007,7 @@ export async function writeAnthropicStream(
         const errMsg = e?.message || (typeof part.error === 'string' ? part.error : JSON.stringify(e?.data ?? part.error));
         const errorType = anthropicErrorType(upstreamHttpStatus(part.error, errMsg));
         log?.(() => `sdk stream error (${errorType}): ${errMsg}`);
-        closeOpen();
+        closeOpen('terminal-error');
         throw part.error instanceof Error || (part.error && typeof part.error === 'object')
           ? part.error
           : new Error(errMsg);
