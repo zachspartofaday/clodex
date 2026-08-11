@@ -596,11 +596,13 @@ describe('createLanguageModel', () => {
       modelId: 'authenticated-model',
       apiKey: 'provider-key',
       authType: 'api',
+      baseURL: 'https://selected.example/v1',
       headers: { 'X-Plan': 'paid' },
     });
 
     expect(createOpenAI).toHaveBeenCalledWith({
       apiKey: 'provider-key',
+      baseURL: 'https://selected.example/v1',
       headers: { 'X-Plan': 'paid' },
     });
     expect(responses).toHaveBeenCalledWith('authenticated-model');

@@ -206,10 +206,15 @@ export async function createLanguageModel(spec: ProviderModelSpec): Promise<Lang
       : spec.authType === 'none'
         ? {
             apiKey: '',
+            ...(baseURL ? { baseURL } : {}),
             ...(spec.headers ? { headers: spec.headers } : {}),
             fetch: fetchWithoutCredentialHeaders,
           }
-        : { apiKey, ...(spec.headers ? { headers: spec.headers } : {}) };
+        : {
+            apiKey,
+            ...(baseURL ? { baseURL } : {}),
+            ...(spec.headers ? { headers: spec.headers } : {}),
+          };
     const openai = createOpenAI(oauthOptions);
     return useResponsesEndpoint ? openai.responses(modelId) : openai.chat(modelId);
   }

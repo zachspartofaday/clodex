@@ -44,13 +44,16 @@ export interface MaterializeOptions {
   agent?: CompatibilityAgent;
 }
 
-function normalizedEndpointUrl(rawUrl: string): string {
-  const trimmed = rawUrl.trim();
+function normalizedEndpointUrl(rawUrl: string): string | null {
   try {
-    const parsed = new URL(trimmed);
-    return `${parsed.protocol}//${parsed.host}${parsed.pathname}`.replace(/\/$/, '');
+    const parsed = new URL(rawUrl.trim());
+    const userInfo = parsed.username || parsed.password
+      ? `${parsed.username}${parsed.password ? `:${parsed.password}` : ''}@`
+      : '';
+    const pathname = parsed.pathname.replace(/\/$/, '');
+    return `${parsed.protocol}//${userInfo}${parsed.host}${pathname}${parsed.search}`;
   } catch {
-    return trimmed.replace(/\/$/, '');
+    return null;
   }
 }
 
@@ -67,17 +70,23 @@ export function cachedModelToLocal(
   const npm = cached.npm ?? provider.api.npm ?? '';
   const modelApiUrl = cached.apiUrl;
   const providerApiUrl = provider.api.url;
-  if (
-    npm === '@ai-sdk/openai'
-    && modelApiUrl
-    && providerApiUrl
-    && normalizedEndpointUrl(modelApiUrl) !== normalizedEndpointUrl(providerApiUrl)
-  ) {
-    throw new Error(
-      `Provider "${provider.id}" model "${cached.id}" endpoint ${modelApiUrl} `
-      + `does not match provider endpoint ${providerApiUrl}; @ai-sdk/openai cannot safely `
-      + 'honor a conflicting model-level endpoint override.',
-    );
+  if (npm === '@ai-sdk/openai') {
+    const normalizedModelUrl = modelApiUrl ? normalizedEndpointUrl(modelApiUrl) : undefined;
+    const normalizedProviderUrl = providerApiUrl ? normalizedEndpointUrl(providerApiUrl) : undefined;
+    if (
+      normalizedModelUrl === null
+      || normalizedProviderUrl === null
+      || (
+        normalizedModelUrl !== undefined
+        && normalizedProviderUrl !== undefined
+        && normalizedModelUrl !== normalizedProviderUrl
+      )
+    ) {
+      throw new Error(
+        `Provider "${provider.id}" model "${cached.id}" endpoint does not match provider endpoint; `
+        + '@ai-sdk/openai requires valid equivalent model and provider endpoints.',
+      );
+    }
   }
   const apiUrl = modelApiUrl ?? providerApiUrl ?? '';
   const endpoint = resolveEndpoint(npm, apiUrl);

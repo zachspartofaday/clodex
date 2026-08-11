@@ -333,6 +333,111 @@ describe('catalog model aliases', () => {
     }
   });
 
+  it.each([false, true])(
+    'does not echo an unresolved model id served by the default SDK route (stream=%s)',
+    async (stream) => {
+      const route: ProxyRoute = {
+        aliasId: 'clodex:test:default-sdk-model',
+        realModelId: 'default-sdk-model',
+        displayName: 'Default SDK Model',
+        upstreamUrl: '',
+        apiKey: 'provider-key',
+        modelFormat: 'openai',
+        npm: '@ai-sdk/openai-compatible',
+        baseURL: 'https://selected.example/v1',
+        providerId: 'test-provider',
+      };
+      const fetchMock = vi.fn(async (_input: string | URL | Request, init?: RequestInit) => {
+        const requestBody = JSON.parse(String(init?.body)) as { stream?: boolean };
+        if (requestBody.stream) {
+          return new Response([
+            `data: {"id":"chatcmpl-default","object":"chat.completion.chunk","created":1,"model":"${route.realModelId}","choices":[{"index":0,"delta":{"role":"assistant","content":"hello"},"finish_reason":null}]}`,
+            `data: {"id":"chatcmpl-default","object":"chat.completion.chunk","created":1,"model":"${route.realModelId}","choices":[{"index":0,"delta":{},"finish_reason":"stop"}]}`,
+            'data: [DONE]',
+            '',
+          ].join('\n\n'), {
+            status: 200,
+            headers: { 'Content-Type': 'text/event-stream' },
+          });
+        }
+        return new Response(JSON.stringify({
+          id: 'chatcmpl-default',
+          object: 'chat.completion',
+          created: 1,
+          model: route.realModelId,
+          choices: [{ index: 0, message: { role: 'assistant', content: 'hello' }, finish_reason: 'stop' }],
+          usage: { prompt_tokens: 1, completion_tokens: 1, total_tokens: 2 },
+        }), { status: 200, headers: { 'Content-Type': 'application/json' } });
+      });
+      vi.stubGlobal('fetch', fetchMock);
+      const handle = await startProxyCatalog([route], route.aliasId, false);
+
+      try {
+        const unresolvedModel = 'claude-unconfigured-sdk-fallback';
+        const response = await postToProxy(handle.port, handle.token, {
+          model: unresolvedModel,
+          max_tokens: 100,
+          messages: [{ role: 'user', content: 'hi' }],
+          stream,
+        });
+
+        expect(response.status).toBe(200);
+        expect(response.body).toContain(`"model":"${route.realModelId}"`);
+        expect(response.body).not.toContain(`"model":"${unresolvedModel}"`);
+      } finally {
+        handle.close();
+        vi.unstubAllGlobals();
+      }
+    },
+  );
+
+  it('dispatches ordinary OpenAI credentials only to the selected endpoint', async () => {
+    const sentinelCredential = 'sentinel-provider-credential';
+    const route: ProxyRoute = {
+      aliasId: 'clodex:test:selected-openai-model',
+      realModelId: 'gpt-3.5-turbo-instruct',
+      displayName: 'Selected OpenAI Model',
+      upstreamUrl: '',
+      apiKey: sentinelCredential,
+      authType: 'api',
+      modelFormat: 'openai',
+      npm: '@ai-sdk/openai',
+      baseURL: 'https://selected.example/v1',
+      providerId: 'test-provider',
+    };
+    const fetchMock = vi.fn(async () => new Response(JSON.stringify({
+      id: 'chatcmpl-selected',
+      object: 'chat.completion',
+      created: 1,
+      model: route.realModelId,
+      choices: [{ index: 0, message: { role: 'assistant', content: 'hello' }, finish_reason: 'stop' }],
+      usage: { prompt_tokens: 1, completion_tokens: 1, total_tokens: 2 },
+    }), { status: 200, headers: { 'Content-Type': 'application/json' } }));
+    vi.stubGlobal('fetch', fetchMock);
+    const handle = await startProxyCatalog([route], route.aliasId, false);
+
+    try {
+      const response = await postToProxy(handle.port, handle.token, {
+        model: route.aliasId,
+        max_tokens: 100,
+        messages: [{ role: 'user', content: 'hi' }],
+        stream: false,
+      });
+
+      expect(response.status).toBe(200);
+      expect(JSON.parse(response.body).model, response.body).toBe(route.aliasId);
+      expect(fetchMock).toHaveBeenCalledOnce();
+      const [input, init] = fetchMock.mock.calls[0] as unknown as [string | URL | Request, RequestInit];
+      const capturedUrl = String(input);
+      expect(capturedUrl).toBe('https://selected.example/v1/chat/completions');
+      expect(capturedUrl).not.toContain('api.openai.com');
+      expect(new Headers(init.headers).get('authorization')).toBe(`Bearer ${sentinelCredential}`);
+    } finally {
+      handle.close();
+      vi.unstubAllGlobals();
+    }
+  });
+
   it('rejects unresolved configured model ids without using the default route', async () => {
     const route: ProxyRoute = {
       aliasId: 'clodex:test:default-model',
