@@ -1138,7 +1138,7 @@ describe('PATCH_TRANSFORMS_VERSION', () => {
     const digest = createHash('sha256').update(source).digest('hex');
     expect({ version: PATCH_TRANSFORMS_VERSION, digest }).toEqual({
       version: 8,
-      digest: 'd818abdbdb5ea45dc914c2b5fd4933e61ce01010e909120f0027b4784bf2891e',
+      digest: '5b0e315bbade58f6702c166dc9d75a2f8bbc11a324c890a4f42d5ad2e069c54c',
     });
   });
 });
@@ -2590,6 +2590,42 @@ describe('2.1.227 split effort ladder topology', () => {
     const patched = applyClodexPatches(fixture, splitConfig);
     expect(patched.results.filter(result => result.status === 'FAIL')).toEqual([]);
     expect(patched.content).toContain('??PM)');
+  });
+
+  it('keeps complete-source topology passes independent of canonical ladder count', () => {
+    const canonicalLadder = '["low","medium","high","xhigh","max"]';
+    const countCompleteSourcePasses = (source: string) => {
+      const originalMatchAll = String.prototype.matchAll;
+      let completeSourcePasses = 0;
+      String.prototype.matchAll = function (this: string, regexp: RegExp) {
+        completeSourcePasses += 1;
+        return originalMatchAll.call(this, regexp);
+      };
+      try {
+        const patched = applyClodexPatches(source, splitConfig);
+        expect(patched.results.filter(result => result.status === 'FAIL')).toEqual([]);
+        return { completeSourcePasses, content: patched.content };
+      } finally {
+        String.prototype.matchAll = originalMatchAll;
+      }
+    };
+    const baseline = countCompleteSourcePasses(CLAUDE_SPLIT_FIXTURE);
+    const unrelatedLadders = Array.from(
+      { length: 12 },
+      (_, index) => `var D${index}=${canonicalLadder};`,
+    ).join('\n');
+    const largeAdversarialFixture = CLAUDE_SPLIT_FIXTURE.replace(
+      'function iJe(e,t){return!0}',
+      `/*${'x'.repeat(1_000_000)}*/\n${unrelatedLadders}\nfunction iJe(e,t){return!0}`,
+    );
+    const adversarial = countCompleteSourcePasses(largeAdversarialFixture);
+
+    expect(baseline.completeSourcePasses).toBe(7);
+    expect(adversarial.completeSourcePasses).toBe(7);
+    expect(adversarial.content).toContain('??FL)');
+    for (let index = 0; index < 12; index += 1) {
+      expect(adversarial.content).not.toContain(`??D${index})`);
+    }
   });
 
   it('captures declaration, assignment, helper, and both metadata postconditions for the split topology', () => {

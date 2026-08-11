@@ -123,38 +123,69 @@ function findEffortLadderBinding(source: string): {
   const ladder = /\[\s*"low"\s*,\s*"medium"\s*,\s*"high"\s*,\s*"xhigh"\s*,\s*"max"\s*\]/g;
   // PATCH 8d helper and PATCH 8e consumer anchors in both grammars, cloned from
   // the site constructions below so discovery and application always agree on
-  // what a helper or consumer looks like.
-  const helperRegex = (binding: string): RegExp => new RegExp(
-    '(function [\\w$]+\\(([\\w$]+)\\)\\{)(return ' + escapeRegex(binding)
-    + '\\.filter\\(\\(([\\w$]+)\\)=>([\\w$]+)\\(\\4,\\2\\)\\)\\})',
-    'g',
+  // what a helper or consumer looks like. Discovery scans each grammar exactly
+  // once per source with a binding-generic regex — the same grammar with the
+  // binding literal widened to an identifier capture — and indexes counts per
+  // binding, so candidate qualification below is O(1) per candidate instead of
+  // one complete-source scan per candidate.
+  const indexCounts = (regex: RegExp, bindingGroup: number): Map<string, number> => {
+    const counts = new Map<string, number>();
+    for (const match of source.matchAll(regex)) {
+      const name = match[bindingGroup]!;
+      counts.set(name, (counts.get(name) ?? 0) + 1);
+    }
+    return counts;
+  };
+  // Split topology: exactly one `var|let|const` first-declarator statement per
+  // binding.
+  const declarationCounts = indexCounts(
+    new RegExp('(?:var|let|const)\\s+(' + identifier + ')[,;=]', 'g'),
+    1,
   );
-  const markedHelperRegex = (binding: string): RegExp => new RegExp(
-    '(function [\\w$]+\\(([\\w$]+)\\)\\{)'
-    + escapeRegex(effortHelperMarker)
-    + 'var _ccl=Object\\.assign\\(Object\\.create\\(null\\),\\{[^{}]*\\}\\)'
-    + '\\[String\\(\\2\\|\\|""\\)\\.trim\\(\\)\\.toLowerCase\\(\\)\\];'
-    + 'if\\(_ccl!==void 0\\)return _ccl\\.filter\\(function\\(_cclv\\)\\{return '
-    + '([\\w$]+)\\(_cclv,\\2\\)\\}\\);'
-    + '(?=return ' + escapeRegex(binding) + '\\.filter\\(\\(([\\w$]+)\\)=>\\3\\(\\4,\\2\\)\\)\\})',
-    'g',
+  // Qualification: the selected binding carries exactly one PATCH 8d helper and
+  // exactly two PATCH 8e consumers in either grammar.
+  const freshHelperCounts = indexCounts(
+    new RegExp(
+      '(function [\\w$]+\\(([\\w$]+)\\)\\{)(return (' + identifier + ')'
+      + '\\.filter\\(\\(([\\w$]+)\\)=>([\\w$]+)\\(\\5,\\2\\)\\)\\})',
+      'g',
+    ),
+    4,
   );
-  const consumerRegex = (binding: string): RegExp => new RegExp(
-    'supportedEffortLevels:' + escapeRegex(binding)
-    + '(\\.filter\\(\\(([\\w$]+)\\)=>\\{if\\(\\2==="max"&&!([\\w$]+)\\(([\\w$]+)\\)\\)'
-    + 'return!1;if\\(\\2==="xhigh"&&!([\\w$]+)\\(\\4\\)\\)return!1;return!0\\}\\))',
-    'g',
+  const markedHelperCounts = indexCounts(
+    new RegExp(
+      '(function [\\w$]+\\(([\\w$]+)\\)\\{)'
+      + escapeRegex(effortHelperMarker)
+      + 'var _ccl=Object\\.assign\\(Object\\.create\\(null\\),\\{[^{}]*\\}\\)'
+      + '\\[String\\(\\2\\|\\|""\\)\\.trim\\(\\)\\.toLowerCase\\(\\)\\];'
+      + 'if\\(_ccl!==void 0\\)return _ccl\\.filter\\(function\\(_cclv\\)\\{return '
+      + '([\\w$]+)\\(_cclv,\\2\\)\\}\\);'
+      + '(?=return (' + identifier + ')\\.filter\\(\\(([\\w$]+)\\)=>\\3\\(\\5,\\2\\)\\)\\})',
+      'g',
+    ),
+    4,
   );
-  const markedConsumerRegex = (binding: string): RegExp => new RegExp(
-    'supportedEffortLevels:\\(' + escapeRegex(effortMetadataMarker)
-    + 'Object\\.assign\\(Object\\.create\\(null\\),\\{[^{}]*\\}\\)'
-    + '\\[String\\(([\\w$]+)\\|\\|""\\)\\.trim\\(\\)\\.toLowerCase\\(\\)\\]'
-    + '\\?\\?' + escapeRegex(binding) + '\\)'
-    + '(\\.filter\\(\\(([\\w$]+)\\)=>\\{if\\(\\3==="max"&&!([\\w$]+)\\(\\1\\)\\)'
-    + 'return!1;if\\(\\3==="xhigh"&&!([\\w$]+)\\(\\1\\)\\)return!1;return!0\\}\\))',
-    'g',
+  const freshConsumerCounts = indexCounts(
+    new RegExp(
+      'supportedEffortLevels:(' + identifier + ')'
+      + '(\\.filter\\(\\(([\\w$]+)\\)=>\\{if\\(\\3==="max"&&!([\\w$]+)\\(([\\w$]+)\\)\\)'
+      + 'return!1;if\\(\\3==="xhigh"&&!([\\w$]+)\\(\\5\\)\\)return!1;return!0\\}\\))',
+      'g',
+    ),
+    1,
   );
-  const countMatches = (regex: RegExp): number => [...source.matchAll(regex)].length;
+  const markedConsumerCounts = indexCounts(
+    new RegExp(
+      'supportedEffortLevels:\\(' + escapeRegex(effortMetadataMarker)
+      + 'Object\\.assign\\(Object\\.create\\(null\\),\\{[^{}]*\\}\\)'
+      + '\\[String\\(([\\w$]+)\\|\\|""\\)\\.trim\\(\\)\\.toLowerCase\\(\\)\\]'
+      + '\\?\\?(' + identifier + ')\\)'
+      + '(\\.filter\\(\\(([\\w$]+)\\)=>\\{if\\(\\4==="max"&&!([\\w$]+)\\(\\1\\)\\)'
+      + 'return!1;if\\(\\4==="xhigh"&&!([\\w$]+)\\(\\1\\)\\)return!1;return!0\\}\\))',
+      'g',
+    ),
+    2,
+  );
   let occurrenceCount = 0;
   let binding: string | undefined;
   for (const match of source.matchAll(ladder)) {
@@ -171,17 +202,13 @@ function findEffortLadderBinding(source: string): {
       // declarator of exactly one `var|let|const` statement.
       const bare = new RegExp(boundary + '(' + identifier + ')\\s*=\\s*$').exec(prefix);
       if (!bare) continue;
-      const declarations = [...source.matchAll(new RegExp(
-        '(?:var|let|const)\\s+' + escapeRegex(bare[1]!) + '[,;=]',
-        'g',
-      ))];
-      if (declarations.length !== 1) continue;
+      if ((declarationCounts.get(bare[1]!) ?? 0) !== 1) continue;
       derived = bare[1]!;
     }
     // Qualification: this occurrence is the selected topology only when its
     // binding carries exactly one helper and both consumers in either grammar.
-    const helpers = countMatches(helperRegex(derived!)) + countMatches(markedHelperRegex(derived!));
-    const consumers = countMatches(consumerRegex(derived!)) + countMatches(markedConsumerRegex(derived!));
+    const helpers = (freshHelperCounts.get(derived!) ?? 0) + (markedHelperCounts.get(derived!) ?? 0);
+    const consumers = (freshConsumerCounts.get(derived!) ?? 0) + (markedConsumerCounts.get(derived!) ?? 0);
     if (helpers !== 1 || consumers !== 2) continue;
     occurrenceCount += 1;
     binding = derived;
