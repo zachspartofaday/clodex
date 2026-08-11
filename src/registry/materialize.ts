@@ -47,6 +47,12 @@ export interface MaterializeOptions {
 function normalizedEndpointUrl(rawUrl: string): string | null {
   try {
     const parsed = new URL(rawUrl.trim());
+    const serializedUrl = parsed.href;
+    const queryDelimiter = serializedUrl.indexOf('?');
+    if (queryDelimiter !== -1) {
+      const fragmentDelimiter = serializedUrl.indexOf('#');
+      if (fragmentDelimiter === -1 || queryDelimiter < fragmentDelimiter) return null;
+    }
     const userInfo = parsed.username || parsed.password
       ? `${parsed.username}${parsed.password ? `:${parsed.password}` : ''}@`
       : '';

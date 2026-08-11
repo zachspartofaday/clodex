@@ -585,7 +585,7 @@ describe('materializeRegistry', () => {
       enabled: true,
       authRef: 'keyring:provider:equivalent-openai',
       authType: 'api',
-      api: { npm: '@ai-sdk/openai', url: 'https://API.EXAMPLE.com:443/v1/?tenant=shared' },
+      api: { npm: '@ai-sdk/openai', url: 'https://API.EXAMPLE.com:443/v1/' },
       addedAt: '2026-06-09T00:00:00.000Z',
       modelsCache: {
         fetchedAt: '2026-06-09T00:00:00.000Z',
@@ -595,7 +595,7 @@ describe('materializeRegistry', () => {
           upstreamModelId: 'equivalent-model',
           modelFormat: 'openai',
           npm: '@ai-sdk/openai',
-          apiUrl: 'https://api.example.com/v1?tenant=shared',
+          apiUrl: 'https://api.example.com/v1',
         }],
       },
     });
@@ -603,7 +603,118 @@ describe('materializeRegistry', () => {
     const locals = materializeRegistry(registry, () => 'sentinel-authorization-value');
 
     expect(locals).toHaveLength(1);
-    expect(locals[0]?.models[0]?.apiBaseUrl).toBe('https://api.example.com/v1?tenant=shared');
+    expect(locals[0]?.models[0]?.apiBaseUrl).toBe('https://api.example.com/v1');
+  });
+
+  it.each([
+    {
+      name: 'provider-only query',
+      providerQuery: '?tenant=provider-secret',
+      modelQuery: '',
+      secrets: ['provider-secret'],
+    },
+    {
+      name: 'model-only query',
+      providerQuery: '',
+      modelQuery: '?tenant=model-secret',
+      secrets: ['model-secret'],
+    },
+    {
+      name: 'identical queries on both',
+      providerQuery: '?tenant=shared-secret',
+      modelQuery: '?tenant=shared-secret',
+      secrets: ['shared-secret'],
+    },
+    {
+      name: 'bare query delimiter',
+      providerQuery: '',
+      modelQuery: '?',
+      secrets: ['?'],
+    },
+  ])('fails closed on query-bearing OpenAI endpoints before authorization-bearing traffic for $name', async ({ providerQuery, modelQuery, secrets }) => {
+    const authorizationHeaders: string[] = [];
+    let requestCount = 0;
+    const unintendedHost = createServer((req, res) => {
+      requestCount += 1;
+      const authorization = req.headers.authorization;
+      if (authorization) authorizationHeaders.push(authorization);
+      res.writeHead(200, { 'Content-Type': 'application/json' });
+      res.end('{}');
+    });
+    await new Promise<void>(resolve => unintendedHost.listen(0, '127.0.0.1', resolve));
+    const address = unintendedHost.address();
+    if (!address || typeof address === 'string') throw new Error('Expected TCP listener');
+
+    const registry = emptyRegistry();
+    registry.providers.push({
+      id: 'query-openai',
+      templateId: 'query-openai',
+      name: 'Query OpenAI',
+      enabled: true,
+      authRef: 'keyring:provider:query-openai',
+      authType: 'api',
+      api: { npm: '@ai-sdk/openai', url: `https://provider.example/v1${providerQuery}` },
+      addedAt: '2026-06-09T00:00:00.000Z',
+      modelsCache: {
+        fetchedAt: '2026-06-09T00:00:00.000Z',
+        models: [{
+          id: 'query-model',
+          name: 'Query Model',
+          upstreamModelId: 'query-model',
+          modelFormat: 'openai',
+          npm: '@ai-sdk/openai',
+          apiUrl: `http://127.0.0.1:${address.port}/v1${modelQuery}`,
+        }],
+      },
+    });
+
+    try {
+      let thrown: unknown;
+      try {
+        materializeRegistry(registry, () => 'sentinel-authorization-value');
+      } catch (error) {
+        thrown = error;
+      }
+
+      expect(thrown).toBeInstanceOf(Error);
+      const message = (thrown as Error).message;
+      expect(message).toMatch(/query-openai.*query-model.*endpoint.*does not match.*provider endpoint/i);
+      for (const secret of secrets) expect(message).not.toContain(secret);
+      expect(requestCount).toBe(0);
+      expect(authorizationHeaders).toEqual([]);
+    } finally {
+      await new Promise<void>((resolve, reject) => unintendedHost.close(error => error ? reject(error) : resolve()));
+    }
+  });
+
+  it('accepts equivalent OpenAI endpoints when only fragments differ, including ? inside fragment text', () => {
+    const registry = emptyRegistry();
+    registry.providers.push({
+      id: 'fragment-openai',
+      templateId: 'fragment-openai',
+      name: 'Fragment OpenAI',
+      enabled: true,
+      authRef: 'keyring:provider:fragment-openai',
+      authType: 'api',
+      api: { npm: '@ai-sdk/openai', url: 'https://API.EXAMPLE.com:443/v1/#provider-frag?note=1' },
+      addedAt: '2026-06-09T00:00:00.000Z',
+      modelsCache: {
+        fetchedAt: '2026-06-09T00:00:00.000Z',
+        models: [{
+          id: 'fragment-model',
+          name: 'Fragment Model',
+          upstreamModelId: 'fragment-model',
+          modelFormat: 'openai',
+          npm: '@ai-sdk/openai',
+          apiUrl: 'https://api.example.com/v1#model-frag',
+        }],
+      },
+    });
+
+    const locals = materializeRegistry(registry, () => 'sentinel-authorization-value');
+
+    expect(locals).toHaveLength(1);
+    expect(locals[0]?.models[0]?.apiBaseUrl).toBe('https://api.example.com/v1#model-frag');
   });
 
   it.each([
