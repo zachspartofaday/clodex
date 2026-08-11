@@ -1288,6 +1288,39 @@ describe('writeAnthropicStream', () => {
     await expect(writeAnthropicStream(parts() as any, 'm', () => {})).rejects.toBe(upstreamError);
   });
 
+  it('does not complete truncated tool input when an SDK stream error terminates the response', async () => {
+    const upstreamError = { statusCode: 500, message: 'Upstream stream failed' };
+    let raw = '';
+    async function* parts() {
+      yield { type: 'start' };
+      yield { type: 'tool-input-start', id: 'call_1', toolName: 'Bash' };
+      yield { type: 'tool-input-delta', id: 'call_1', delta: '{"command":"cd /x\\nrg -' };
+      yield { type: 'error', error: upstreamError };
+    }
+
+    await expect(writeAnthropicStream(parts() as any, 'm', chunk => { raw += chunk; }))
+      .rejects.toBe(upstreamError);
+    expect(raw).toContain('"type":"tool_use"');
+    expect(raw).not.toContain('"type":"input_json_delta"');
+    expect(raw).not.toContain('event: content_block_stop');
+  });
+
+  it('completes valid buffered tool input before propagating an SDK stream error', async () => {
+    const upstreamError = { statusCode: 500, message: 'Upstream stream failed' };
+    let raw = '';
+    async function* parts() {
+      yield { type: 'start' };
+      yield { type: 'tool-input-start', id: 'call_1', toolName: 'Bash' };
+      yield { type: 'tool-input-delta', id: 'call_1', delta: '{"command":"pwd"}' };
+      yield { type: 'error', error: upstreamError };
+    }
+
+    await expect(writeAnthropicStream(parts() as any, 'm', chunk => { raw += chunk; }))
+      .rejects.toBe(upstreamError);
+    expect(raw).toContain('"type":"input_json_delta"');
+    expect(raw).toContain('event: content_block_stop');
+  });
+
   it('reports every SDK stream part to the lifecycle observer', async () => {
     const observed: string[] = [];
     async function* parts() {
@@ -1486,6 +1519,24 @@ describe('writeAnthropicStream', () => {
     expect(toolInputFromEvents(events)).toEqual({ path: 'x' });
     // The block must still be closed after the late flush.
     const start = events.find(e => e.event === 'content_block_start')!;
+    expect(events.some(e => e.event === 'content_block_stop' && e.data.index === start.data.index)).toBe(true);
+  });
+
+  it('emits malformed buffered tool input when an error-free stream ends', async () => {
+    const malformed = '{"path":"/repo';
+    const { events } = await collect([
+      { type: 'start' },
+      { type: 'tool-input-start', id: 'call_1', toolName: 'Read' },
+      { type: 'tool-input-delta', id: 'call_1', delta: malformed },
+      { type: 'finish', finishReason: 'stop' },
+    ]);
+    const start = events.find(e => e.event === 'content_block_start')!;
+    expect(events.some(e => (
+      e.event === 'content_block_delta'
+      && e.data.index === start.data.index
+      && e.data.delta.type === 'input_json_delta'
+      && e.data.delta.partial_json === malformed
+    ))).toBe(true);
     expect(events.some(e => e.event === 'content_block_stop' && e.data.index === start.data.index)).toBe(true);
   });
 
