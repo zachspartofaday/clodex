@@ -226,6 +226,13 @@ describe('refreshProviderModels', () => {
         url: 'https://refresh-user:refresh-pass@93.184.216.34/v1',
         secrets: ['refresh-user', 'refresh-pass'],
       },
+      { npm, name: 'empty userinfo', url: 'https://@93.184.216.34/v1', secrets: [] },
+      {
+        npm,
+        name: 'empty username and password',
+        url: 'https://:@93.184.216.34/v1',
+        secrets: [],
+      },
       { npm, name: 'repeated trailing separators', url: 'https://93.184.216.34/v1//', secrets: [] },
     ]),
   )('rejects a route-modifying $npm $name before credential-bearing model discovery', async ({ npm, url, secrets }) => {

@@ -631,6 +631,8 @@ describe('createLanguageModel', () => {
         baseURL: 'https://factory-user:factory-pass@api.example.com/v1',
         secrets: ['factory-user', 'factory-pass'],
       },
+      { baseURL: 'https://@api.example.com/v1', secrets: [] },
+      { baseURL: 'https://:@api.example.com/v1', secrets: [] },
       { baseURL: 'https://api.example.com/v1//', secrets: [] },
       { baseURL: 'ftp://api.example.com/v1', secrets: [] },
     ];

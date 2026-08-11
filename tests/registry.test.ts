@@ -736,6 +736,12 @@ describe('materializeRegistry', () => {
       secrets: ['provider-user', 'provider-pass', 'model-user', 'model-pass'],
     },
     {
+      name: 'empty userinfo mismatch',
+      providerUrl: 'https://@api.example.com/v1',
+      modelUrl: 'https://:@api.example.com/v1',
+      secrets: [],
+    },
+    {
       name: 'identical fragments',
       providerUrl: 'https://api.example.com/v1#shared-fragment-secret',
       modelUrl: 'https://api.example.com/v1#shared-fragment-secret',
@@ -810,10 +816,22 @@ describe('materializeRegistry', () => {
       secrets: ['compatible-provider-secret'],
     },
     {
+      name: 'provider-only empty userinfo',
+      providerUrl: 'https://@api.example.com/v1',
+      modelUrl: undefined,
+      secrets: [],
+    },
+    {
       name: 'model fragment',
       providerUrl: 'https://api.example.com/v1',
       modelUrl: 'https://api.example.com/v1#compatible-model-secret',
       secrets: ['compatible-model-secret'],
+    },
+    {
+      name: 'model-only empty username and password',
+      providerUrl: 'https://api.example.com/v1',
+      modelUrl: 'https://:@api.example.com/v1',
+      secrets: [],
     },
     {
       name: 'bare provider fragment',

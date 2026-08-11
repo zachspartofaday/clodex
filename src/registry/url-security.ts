@@ -158,6 +158,13 @@ export async function validateCustomEndpointUrl(
  */
 export function canonicalOpenAiBaseUrl(rawUrl: string): string | null {
   const trimmed = rawUrl.trim();
+  const schemeEnd = trimmed.indexOf(':');
+  let rawAuthority = '';
+  if (schemeEnd >= 0) {
+    rawAuthority = trimmed.slice(schemeEnd + 1).replace(/^[\\/]+/, '');
+    const authorityEnd = rawAuthority.search(/[\\/]/);
+    if (authorityEnd >= 0) rawAuthority = rawAuthority.slice(0, authorityEnd);
+  }
   if (trimmed.includes('?') || trimmed.includes('#')) return null;
 
   let parsed: URL;
@@ -168,7 +175,8 @@ export function canonicalOpenAiBaseUrl(rawUrl: string): string | null {
   }
 
   if (parsed.protocol !== 'http:' && parsed.protocol !== 'https:') return null;
-  if (parsed.username || parsed.password) return null;
+  // URL parsing erases empty userinfo, so inspect the raw authority too.
+  if (rawAuthority.includes('@') || parsed.username || parsed.password) return null;
 
   let pathname = parsed.pathname;
   if (pathname.endsWith('/')) pathname = pathname.slice(0, -1);

@@ -225,6 +225,8 @@ describe('custom endpoint credential lifecycle', () => {
       baseUrl: 'https://custom-user:custom-pass@93.184.216.34/v1',
       secrets: ['custom-user', 'custom-pass'],
     },
+    { name: 'empty userinfo', baseUrl: 'https://@93.184.216.34/v1', secrets: [] },
+    { name: 'empty username and password', baseUrl: 'https://:@93.184.216.34/v1', secrets: [] },
     { name: 'repeated trailing separators', baseUrl: 'https://93.184.216.34/v1//', secrets: [] },
   ])('rejects a route-modifying OpenAI $name before validation, discovery, or credential mutation', async ({ baseUrl, secrets }) => {
     const result = await addCustomEndpointProvider({ ...endpointInput, baseUrl });
