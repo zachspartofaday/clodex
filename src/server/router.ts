@@ -69,6 +69,13 @@ import {
 } from '../model-aliases.js';
 import { routeUnavailableMessage } from '../route-unavailable.js';
 import { transformOpenAiCompatibleRequestBody } from '../model-runtime-compatibility.js';
+import {
+  DEFAULT_UNSUPPORTED_EFFORT_POLICY,
+  EffortResolutionError,
+  nativeEffortLevel,
+  resolveRequestEffort,
+  type UnsupportedEffortPolicy,
+} from '../effort-policy.js';
 
 export interface ServerOptions {
   host: string;
@@ -92,6 +99,8 @@ export interface ServerOptions {
   inferenceLogPath?: string;
   /** Opt-in request-envelope and WebSocket head-decision diagnostics. */
   webSocketDiagnosticsLogPath?: string;
+  /** Global behavior for an explicit effort the target model cannot run. */
+  effortPolicy?: UnsupportedEffortPolicy;
 }
 
 export interface ServerHandle {
@@ -426,21 +435,30 @@ async function handleAnthropicMessages(
       plog(`tools truncated: ${toolCount} → ${npmMaxTools} (provider limit)`);
     }
     const openAiOAuth = isOpenAiOAuthRoute(model);
-    const params = sdkTranslateRequest(body as unknown as AnthropicRequest, model.npm!, {
-      defaultEffort: anthropicEffortFromRequest(body as AnthropicRequest) ? undefined : model.defaultEffort,
-      openAiOAuth,
-      claudeSessionId,
-      reasoningMetadata: {
-        providerId: model.providerId,
-        apiBaseUrl: model.apiBaseUrl,
-        supportedParameters: model.supportedParameters,
-        reasoning: model.reasoning,
-        interleavedReasoningField: model.interleavedReasoningField,
-        compatibility: model.compatibility,
-        upstreamModelId: upstreamModelId(model),
-      },
-      maxTools: npmMaxTools,
-    });
+    let params: ReturnType<typeof sdkTranslateRequest>;
+    try {
+      params = sdkTranslateRequest(body as unknown as AnthropicRequest, model.npm!, {
+        defaultEffort: anthropicEffortFromRequest(body as AnthropicRequest) ? undefined : model.defaultEffort,
+        openAiOAuth,
+        claudeSessionId,
+        effortPolicy: options.effortPolicy,
+        reasoningMetadata: {
+          providerId: model.providerId,
+          apiBaseUrl: model.apiBaseUrl,
+          supportedParameters: model.supportedParameters,
+          reasoning: model.reasoning,
+          interleavedReasoningField: model.interleavedReasoningField,
+          compatibility: model.compatibility,
+          effortProfile: model.effortProfile,
+          upstreamModelId: upstreamModelId(model),
+        },
+        maxTools: npmMaxTools,
+      });
+    } catch (err) {
+      if (!(err instanceof EffortResolutionError)) throw err;
+      sendJson(res, err.statusCode, { error: { message: err.message } });
+      return;
+    }
     const clientWantsStream = Boolean(body.stream);
     // Use the display name in the response model field when masking is on — Claude
     // Desktop shows the response model field in its status bar chip, so this surfaces
@@ -653,6 +671,51 @@ async function handleAnthropicCountTokens(
   });
 }
 
+/**
+ * Apply the global effort policy to a body about to be forwarded directly.
+ *
+ * Two spellings can arrive here. A client speaking clodex's global vocabulary
+ * gets its level resolved against the model's executable ladder and rewritten to
+ * the resolved level, which the reviewed wire map then translates exactly as it
+ * does on the SDK path. A client that already wrote the upstream's own value is
+ * left alone: the generator guarantees a one-to-one mapping, so recognising that
+ * value is unambiguous, and re-resolving it would translate the request twice.
+ */
+function applyDirectEffortPolicy(
+  body: JsonBody,
+  model: ServerModelInfo,
+  policy: UnsupportedEffortPolicy | undefined,
+): JsonBody {
+  const profile = model.effortProfile;
+  if (!profile) return body;
+  const requested = openAiEffort(body);
+
+  // Top-level spelling keeps its existing precedence when both are present.
+  // Strip both representations before either native forwarding or policy
+  // resolution so no conflicting nested value can survive the final body.
+  const normalized: JsonBody = { ...body };
+  delete normalized.reasoning_effort;
+  if (normalized.reasoning && typeof normalized.reasoning === 'object' && !Array.isArray(normalized.reasoning)) {
+    const { effort: _effort, ...rest } = normalized.reasoning as Record<string, unknown>;
+    if (Object.keys(rest).length > 0) normalized.reasoning = rest;
+    else delete normalized.reasoning;
+  }
+
+  if (requested !== undefined && nativeEffortLevel(profile, requested) !== undefined) {
+    normalized.reasoning_effort = requested;
+    return normalized;
+  }
+
+  const resolution = resolveRequestEffort(
+    requested,
+    profile,
+    policy ?? DEFAULT_UNSUPPORTED_EFFORT_POLICY,
+  );
+  if (resolution === undefined) return normalized;
+  if (resolution.resolved !== undefined) normalized.reasoning_effort = resolution.resolved;
+  return normalized;
+}
+
 async function handleOpenAIChatCompletions(
   req: IncomingMessage,
   res: ServerResponse,
@@ -688,11 +751,22 @@ async function handleOpenAIChatCompletions(
       });
       return;
     }
+    // Resolve the global effort at this boundary, then let the SAME wire map the
+    // SDK path uses do the translation. Both paths therefore reach the upstream
+    // with identical bytes for the same requested level.
+    let policyBody: JsonBody;
+    try {
+      policyBody = applyDirectEffortPolicy(body, model, options.effortPolicy);
+    } catch (err) {
+      if (!(err instanceof EffortResolutionError)) throw err;
+      sendJson(res, err.statusCode, { error: { message: err.message } });
+      return;
+    }
     // The client may have addressed the model via a gateway alias or saved
     // short alias — the upstream API only knows its own wire id.
     const compatibleBody = model.compatibility
-      ? transformOpenAiCompatibleRequestBody(body, model.compatibility)
-      : body;
+      ? transformOpenAiCompatibleRequestBody(policyBody, model.compatibility)
+      : policyBody;
     const forwardBody = compatibleBody.model === upstreamModelId(model)
       ? compatibleBody
       : { ...compatibleBody, model: upstreamModelId(model) };

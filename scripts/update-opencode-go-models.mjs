@@ -40,6 +40,13 @@ const PROVIDER_ID = 'opencode-go';
 // own committed input, not something the invocation directory supplies.
 const MODELS_PATH = resolve('src/data/opencode-go-models.json');
 const CONSTANTS_PATH = resolve('src/data/opencode-go-models.ts');
+// The effort-profile table is generated ALONGSIDE the catalog rather than into
+// it. The catalog array is also this provider's template `staticModels`, and
+// those rows are persisted into `~/.clodex` model caches — putting a runtime
+// policy object there would make it persisted registry state that a stale cache
+// could carry forward. The profile table is imported directly and attached
+// after retained-identity projection instead, so it can never be stale.
+const EFFORT_PROFILES_PATH = resolve('src/data/opencode-go-effort-profiles.json');
 const SNAPSHOT_PATH = fileURLToPath(new URL('../src/data/opencode-go-cli-snapshot.json', import.meta.url));
 
 // ADVISORY cross-check, reached only by `--verify-ladders`, and never a
@@ -301,6 +308,12 @@ const PATCHES = Object.assign(Object.create(null), {
   },
 });
 
+// The global effort vocabulary, in ascending order. `off` and `none` are two
+// provider spellings of the same "do not reason" level; both stay in the
+// vocabulary because different gateways spell it differently, and the ORDER
+// here is the one the generated table is emitted in.
+const CANONICAL_EFFORT_LEVELS = ['off', 'none', 'minimal', 'low', 'medium', 'high', 'xhigh', 'max'];
+
 /** Provenance constants mirrored into the TypeScript data module. */
 const PROVENANCE_CONSTANTS = [
   ['OPENCODE_GO_SOURCE', meta => meta.sourceCommand],
@@ -329,12 +342,19 @@ const SNAPSHOT_CAPABILITY_KEYS = [
 ];
 const SNAPSHOT_MODALITY_KEYS = ['audio', 'image', 'pdf', 'text', 'video'];
 const SNAPSHOT_COST_KEYS = ['cache', 'experimentalOver200K', 'input', 'output', 'tiers'];
-const SNAPSHOT_VARIANT_KEYS = ['include', 'reasoningEffort', 'reasoningSummary', 'thinking'];
+const SNAPSHOT_REASONING_EFFORTS = ['none', 'minimal', 'low', 'medium', 'high', 'xhigh', 'max'];
+const SNAPSHOT_THINKING_TYPES = ['adaptive', 'disabled', 'enabled'];
 
 const HEX_64 = /^[0-9a-f]{64}$/;
 const HEX_40 = /^[0-9a-f]{40}$/;
 // eslint-disable-next-line no-control-regex
 const CONTROL_CHARS = /[\x00-\x1f\x7f]/;
+// Unicode Cc/Cf catches controls and invisible formatting characters that the
+// ASCII-only check cannot represent.
+const UNICODE_UNSAFE_CHARS = /[\p{Cc}\p{Cf}]/u;
+const SAFE_VARIANT_NAME = /^[a-z0-9][a-z0-9._-]{0,63}$/;
+const SENSITIVE_KEY = /(?:^|[_-])(authorization|auth|api[_-]?key|cookie|credential|password|secret|token)(?:$|[_-])/i;
+const DANGEROUS_KEYS = new Set(['__proto__', 'constructor', 'prototype']);
 
 function isPlainObject(value) {
   return typeof value === 'object' && value !== null && !Array.isArray(value);
@@ -352,6 +372,101 @@ function assertPrintable(where, value, errors) {
     return false;
   }
   return true;
+}
+
+function assertSafeTree(value, where, errors) {
+  if (typeof value === 'string') {
+    if (CONTROL_CHARS.test(value) || UNICODE_UNSAFE_CHARS.test(value)) {
+      errors.push(`${where}: contains a control or format character`);
+    }
+    return;
+  }
+  if (Array.isArray(value)) {
+    value.forEach((entry, index) => assertSafeTree(entry, `${where}[${index}]`, errors));
+    return;
+  }
+  if (!isPlainObject(value)) return;
+  for (const [key, entry] of Object.entries(value)) {
+    if (DANGEROUS_KEYS.has(key) || SENSITIVE_KEY.test(key)) {
+      errors.push(`${where}: contains forbidden key ${key}`);
+    }
+    if (CONTROL_CHARS.test(key) || UNICODE_UNSAFE_CHARS.test(key)) {
+      errors.push(`${where}: contains a control or format character key`);
+    }
+    assertSafeTree(entry, `${where}.${key}`, errors);
+  }
+}
+
+function assertRequiredKeys(where, value, required, errors) {
+  for (const key of required) {
+    if (!Object.hasOwn(value, key)) errors.push(`${where}: missing ${key}`);
+  }
+}
+
+function assertReasoningEffort(where, value, errors) {
+  if (assertPrintable(where, value, errors) && !SNAPSHOT_REASONING_EFFORTS.includes(value)) {
+    errors.push(`${where}: unsupported value ${JSON.stringify(value)}`);
+  }
+}
+
+function assertVariantSchema(where, variant, transport, errors) {
+  const hasReasoningEffort = Object.hasOwn(variant, 'reasoningEffort');
+  const hasThinking = Object.hasOwn(variant, 'thinking');
+  if (hasThinking && !isPlainObject(variant.thinking)) {
+    errors.push(`${where}.thinking: expected an object`);
+  }
+  if (hasReasoningEffort && hasThinking) {
+    errors.push(`${where}: reasoningEffort and thinking cannot both be declared`);
+  }
+
+  if (transport === 'openai-completions') {
+    const keys = ['reasoningEffort'];
+    assertKnownKeys(where, variant, keys, errors);
+    assertRequiredKeys(where, variant, keys, errors);
+    assertReasoningEffort(`${where}.reasoningEffort`, variant.reasoningEffort, errors);
+    return;
+  }
+
+  if (transport === 'anthropic-messages') {
+    assertKnownKeys(where, variant, ['thinking'], errors);
+    assertRequiredKeys(where, variant, ['thinking'], errors);
+    if (!isPlainObject(variant.thinking)) {
+      errors.push(`${where}.thinking: expected an object`);
+      return;
+    }
+    const thinkingWhere = `${where}.thinking`;
+    assertKnownKeys(thinkingWhere, variant.thinking, ['budgetTokens', 'type'], errors);
+    assertRequiredKeys(thinkingWhere, variant.thinking, ['type'], errors);
+    if (assertPrintable(`${thinkingWhere}.type`, variant.thinking.type, errors)
+      && !SNAPSHOT_THINKING_TYPES.includes(variant.thinking.type)) {
+      errors.push(`${thinkingWhere}.type: unsupported value ${JSON.stringify(variant.thinking.type)}`);
+    }
+    if (variant.thinking.type === 'enabled') {
+      const budget = variant.thinking.budgetTokens;
+      if (!Number.isInteger(budget) || budget <= 0 || budget > 10_000_000) {
+        errors.push(`${thinkingWhere}.budgetTokens: expected a positive integer <= 10000000, got ${JSON.stringify(budget)}`);
+      }
+    } else if (Object.hasOwn(variant.thinking, 'budgetTokens')) {
+      errors.push(`${thinkingWhere}.budgetTokens: only valid for enabled thinking`);
+    }
+    return;
+  }
+
+  const keys = ['include', 'reasoningEffort', 'reasoningSummary'];
+  assertKnownKeys(where, variant, keys, errors);
+  assertRequiredKeys(where, variant, keys, errors);
+  if (!Array.isArray(variant.include) || variant.include.length === 0) {
+    errors.push(`${where}.include: expected a non-empty array of printable strings`);
+  } else {
+    for (const [index, entry] of variant.include.entries()) {
+      assertPrintable(`${where}.include[${index}]`, entry, errors);
+    }
+  }
+  assertReasoningEffort(`${where}.reasoningEffort`, variant.reasoningEffort, errors);
+  if (assertPrintable(`${where}.reasoningSummary`, variant.reasoningSummary, errors)
+    && variant.reasoningSummary !== 'auto') {
+    errors.push(`${where}.reasoningSummary: unsupported value ${JSON.stringify(variant.reasoningSummary)}`);
+  }
 }
 
 function assertMoney(where, value, errors) {
@@ -372,6 +487,7 @@ function assertBooleanMap(where, value, allowed, errors) {
 }
 
 function assertMetaSchema(meta, errors) {
+  assertSafeTree(meta, '_meta', errors);
   if (!isPlainObject(meta)) {
     errors.push('_meta: expected an object');
     return;
@@ -405,6 +521,7 @@ function assertMetaSchema(meta, errors) {
 
 function assertModelSchema(model, index, seen, errors) {
   const where = `models[${index}]`;
+  assertSafeTree(model, where, errors);
   if (!isPlainObject(model)) {
     errors.push(`${where}: expected an object`);
     return;
@@ -500,8 +617,19 @@ function assertModelSchema(model, index, seen, errors) {
     if (!isPlainObject(model.variants)) errors.push(`${label}.variants: expected an object`);
     else {
       for (const [name, variant] of Object.entries(model.variants)) {
-        if (!isPlainObject(variant)) errors.push(`${label}.variants.${name}: expected an object`);
-        else assertKnownKeys(`${label}.variants.${name}`, variant, SNAPSHOT_VARIANT_KEYS, errors);
+        if (!SAFE_VARIANT_NAME.test(name)) {
+          errors.push(`${label}: unsafe variant name ${name}`);
+        }
+        if (!isPlainObject(variant)) {
+          errors.push(`${label}.variants.${name}: expected an object`);
+        } else {
+          assertVariantSchema(
+            `${label}.variants.${name}`,
+            variant,
+            SDK_TRANSPORTS[model.api?.npm],
+            errors,
+          );
+        }
       }
     }
   }
@@ -835,7 +963,195 @@ export function convertResolvedModels(models) {
     supported.push(toClodexModel(resolved));
   }
   if (supported.length === 0) throw new Error('resolver snapshot produced no supported models');
-  return { supported, unmapped, overrides, temperatureNotes };
+  const effortProfiles = buildEffortProfiles(models, supported);
+  return { supported, unmapped, overrides, temperatureNotes, effortProfiles };
+}
+
+function raiseEffortProfileErrors(errors) {
+  if (errors.length > 0) {
+    throw new Error(`OpenCode Go effort profiles failed validation:\n  ${errors.join('\n  ')}`);
+  }
+}
+
+/**
+ * Fail closed unless every reviewed effort map is a fixed point on its own output.
+ *
+ * Two request paths reach the same upstream. The SDK path maps a global level to
+ * its native value BEFORE the AI SDK serializes the body, and
+ * `transformOpenAiCompatibleRequestBody` then runs over that serialized body —
+ * so a map that also has an entry for one of its own outputs would translate the
+ * same request twice and send something neither path intended. The direct
+ * chat-completions forward has the mirror problem: a client may already spell
+ * the native value, and the two paths can only agree byte for byte if mapping an
+ * already-native value is a no-op.
+ *
+ * The injectivity half exists for the same reason from the other direction: if
+ * two global levels sent the same native value, an incoming native value could
+ * not be attributed back to one level, and the direct path would have to guess.
+ */
+export function assertEffortMapsIdempotent(patches = PATCHES) {
+  const errors = [];
+  for (const [id, patch] of Object.entries(patches)) {
+    const map = patch?.reasoningEffortMap;
+    if (map === undefined) continue;
+    if (!isPlainObject(map)) {
+      errors.push(`${id}: reasoningEffortMap must be an object`);
+      continue;
+    }
+    const levelByNative = new Map();
+    for (const [level, native] of Object.entries(map)) {
+      if (!CANONICAL_EFFORT_LEVELS.includes(level)) {
+        errors.push(`${id}: reasoningEffortMap key ${JSON.stringify(level)} is not a global effort level`);
+        continue;
+      }
+      if (native === null) continue;
+      if (typeof native !== 'string' || native.trim() === '') {
+        errors.push(`${id}: reasoningEffortMap.${level} must be null or a non-empty string`);
+        continue;
+      }
+      const claimed = levelByNative.get(native);
+      if (claimed !== undefined) {
+        errors.push(
+          `${id}: reasoningEffortMap sends ${JSON.stringify(native)} for both ${claimed} and ${level}, `
+          + 'so an already-native request value cannot be attributed to one level',
+        );
+        continue;
+      }
+      levelByNative.set(native, level);
+    }
+    for (const native of levelByNative.keys()) {
+      if (!Object.hasOwn(map, native)) continue;
+      if (map[native] !== native) {
+        errors.push(
+          `${id}: reasoningEffortMap is not idempotent — ${JSON.stringify(native)} is one of its own outputs `
+          + `but maps to ${JSON.stringify(map[native])}`,
+        );
+      }
+    }
+  }
+  raiseEffortProfileErrors(errors);
+  return true;
+}
+
+/** The reasoning representation one resolver variant advertises, if any. */
+function advertisedVariantRepresentation(variant) {
+  if (typeof variant?.reasoningEffort === 'string' && variant.reasoningEffort.trim() !== '') {
+    return { kind: 'reasoning-effort', value: variant.reasoningEffort };
+  }
+  if (isPlainObject(variant?.thinking)) {
+    return { kind: 'anthropic-thinking', thinking: sortKeysDeep(variant.thinking) };
+  }
+  return null;
+}
+
+/**
+ * Project executable effort profiles from the reviewed wire maps, using the
+ * resolver's advertised variants only as disagreement evidence.
+ *
+ * The two inputs answer different questions and only the validated map is
+ * authority. The snapshot says which reasoning variants OpenCode's own resolver
+ * advertises; `PATCHES` says what clodex has actually exercised on the wire for
+ * the route it runs. Every non-null reviewed map entry reaches the profile even
+ * when the snapshot does not advertise it; snapshot agreement and disagreement
+ * are recorded as cross-check evidence and can never widen or narrow the ladder.
+ *
+ * Both directions of disagreement are recorded rather than resolved:
+ * a variant the map cannot execute (deepseek-v4-flash advertises `low`, the
+ * reviewed map sends nothing for it), a variant whose representation the running
+ * transport cannot carry (the Qwen and MiniMax Anthropic thinking objects), and
+ * an executable level the snapshot does not advertise. Widening or narrowing on
+ * any of them needs live validation, which is a review decision, not this
+ * script's.
+ */
+export function buildEffortProfiles(snapshotModels, supported) {
+  assertEffortMapsIdempotent();
+  const bySnapshotId = new Map(snapshotModels.map(model => [model.id, model]));
+  const errors = [];
+  const profiles = [];
+  const disagreements = [];
+
+  for (const model of supported) {
+    const transport = TRANSPORTS[model.id];
+    const compatibility = model.compatibility ?? {};
+    const map = compatibility.reasoningEffortMap;
+    let levels;
+    if (compatibility.supportsReasoningEffort === false) {
+      // No clodex-operable effort control on this route at all. Distinct from an
+      // unsupported LEVEL: there is no ladder to round along or reject against.
+      levels = [];
+    } else if (isPlainObject(map)) {
+      levels = CANONICAL_EFFORT_LEVELS
+        .filter(level => Object.hasOwn(map, level) && map[level] !== null)
+        .map(level => ({ level, native: { kind: 'reasoning-effort', value: map[level] } }));
+    } else {
+      errors.push(
+        `${model.id}: has neither a reviewed reasoningEffortMap nor an explicit `
+        + 'supportsReasoningEffort: false, so no executable effort ladder can be stated',
+      );
+      continue;
+    }
+
+    const variants = bySnapshotId.get(model.id)?.variants ?? {};
+    const levelByNative = new Map(levels.map(entry => [entry.native.value, entry.level]));
+    const advertisedLevels = new Set();
+    for (const variant of Object.keys(variants).sort(compareCodeUnits)) {
+      const advertised = advertisedVariantRepresentation(variants[variant]);
+      if (advertised === null) {
+        disagreements.push({
+          modelId: model.id,
+          variant,
+          advertised: null,
+          reason: 'the resolver variant declares no reasoning representation this generator understands',
+        });
+        continue;
+      }
+      if (advertised.kind !== 'reasoning-effort') {
+        disagreements.push({
+          modelId: model.id,
+          variant,
+          advertised,
+          reason: `the reviewed ${transport} route carries no clodex-controlled Anthropic thinking representation`,
+        });
+        continue;
+      }
+      const level = levelByNative.get(advertised.value);
+      if (level === undefined) {
+        disagreements.push({
+          modelId: model.id,
+          variant,
+          advertised,
+          reason: 'the reviewed wire map sends this value for no global effort level',
+        });
+        continue;
+      }
+      advertisedLevels.add(level);
+    }
+
+    const unadvertised = levels.map(entry => entry.level).filter(level => !advertisedLevels.has(level));
+    if (unadvertised.length > 0) {
+      disagreements.push({
+        modelId: model.id,
+        variant: null,
+        advertised: null,
+        reason: `the reviewed wire map executes ${unadvertised.join('/')}, which the resolver snapshot does not advertise`,
+      });
+    }
+
+    profiles.push({
+      modelId: model.id,
+      transport,
+      // The resolver declares variants as opt-in request overlays and names no
+      // default among them, and `assertModelSchema` rejects any unknown model or
+      // variant key — so a capture that grew a default marker would fail the
+      // schema long before reaching here. Nothing else in this script is
+      // entitled to invent one, so the explicit answer is "none declared".
+      defaultLevel: null,
+      levels,
+    });
+  }
+
+  raiseEffortProfileErrors(errors);
+  return { schemaVersion: 1, provider: PROVIDER_ID, profiles, disagreements };
 }
 
 async function loadSnapshot() {
@@ -909,12 +1225,17 @@ function serializeCatalog(supported) {
   return `${JSON.stringify(supported, null, 2)}\n`;
 }
 
+function serializeEffortProfiles(table) {
+  return `${JSON.stringify(table, null, 2)}\n`;
+}
+
 /**
  * Offline verification that the committed generated files still say what the
- * committed snapshot says. Reads three files, writes none, and never reaches
- * the network — so it is safe to run anywhere the repo is checked out.
+ * committed snapshot says. Reads the snapshot plus all three generated files,
+ * writes none, and never reaches the network — so it is safe to run anywhere
+ * the repo is checked out.
  */
-async function check(snapshot, supported) {
+async function check(snapshot, supported, effortProfiles) {
   const failures = [];
   const committedText = await readFile(MODELS_PATH, 'utf8');
   const generatedText = serializeCatalog(supported);
@@ -937,6 +1258,11 @@ async function check(snapshot, supported) {
       + `${drifted.length > 0 ? ` (models: ${drifted.join(', ')})` : ''}`
       + `${committedIds.length !== generatedIds.length ? ` (committed ${committedIds.length} ids, snapshot yields ${generatedIds.length})` : ''}`,
     );
+  }
+
+  const committedProfiles = await readFile(EFFORT_PROFILES_PATH, 'utf8');
+  if (committedProfiles !== serializeEffortProfiles(effortProfiles)) {
+    failures.push(`${EFFORT_PROFILES_PATH} disagrees with the resolver snapshot and the reviewed wire maps`);
   }
 
   const constants = readProvenanceConstants(await readFile(CONSTANTS_PATH, 'utf8'));
@@ -1012,10 +1338,10 @@ export async function run(argv = []) {
   }
 
   const snapshot = await loadSnapshot();
-  const { supported, unmapped, overrides, temperatureNotes } = convertResolvedModels(snapshot.models);
+  const { supported, unmapped, overrides, temperatureNotes, effortProfiles } = convertResolvedModels(snapshot.models);
 
   if (values.check) {
-    await check(snapshot, supported);
+    await check(snapshot, supported, effortProfiles);
     console.log(
       `OpenCode Go catalog matches the committed resolver snapshot `
       + `(${supported.length} models, opencode ${snapshot._meta.openCodeVersion}).`,
@@ -1031,6 +1357,7 @@ export async function run(argv = []) {
   // then marks a catalog that is already on disk.
   const constants = await prepareSourceConstants(snapshot._meta);
   await writeFile(MODELS_PATH, serializeCatalog(supported));
+  await writeFile(EFFORT_PROFILES_PATH, serializeEffortProfiles(effortProfiles));
   await writeFile(CONSTANTS_PATH, constants.content);
 
   console.log(
@@ -1042,6 +1369,12 @@ export async function run(argv = []) {
   }
   for (const note of temperatureNotes) {
     console.log(`Temperature capability note — ${note}`);
+  }
+  for (const disagreement of effortProfiles.disagreements) {
+    const where = disagreement.variant === null
+      ? disagreement.modelId
+      : `${disagreement.modelId} variant ${disagreement.variant}`;
+    console.log(`Effort profile disagreement — ${where}: ${disagreement.reason}`);
   }
   for (const note of advisory.notes) {
     console.log(`Effort ladder note — ${note}`);

@@ -195,6 +195,14 @@ describe('parseArgs', () => {
       favoritesAlias: 'sol=clodex:openai-oauth:gpt-5.6-sol',
     });
     expect(parseArgs(['models', '--unalias', 'sol'])).toMatchObject({ favoritesUnalias: 'sol' });
+    expect(parseArgs(['models', '--effort-policy', 'up'])).toMatchObject({ effortPolicy: 'up' });
+    expect(parseArgs(['models', '--effort-policy=exact'])).toMatchObject({ effortPolicy: 'exact' });
+    expect(parseArgs(['models', '--effort-policy', 'nearest']).error)
+      .toBe('--effort-policy must be one of: provider-default, up, down, exact');
+    // Saving a policy is not a favorites edit, and combining the two would make
+    // the success message describe only one of them.
+    expect(parseArgs(['models', '--effort-policy', 'up', '--list']).error)
+      .toBe('--effort-policy cannot be combined with --list, --alias, or --unalias');
     expect(parseArgs(['models', '--agy'])).toMatchObject({ error: 'Unknown models option: --agy' });
   });
 
@@ -371,6 +379,53 @@ describe('main dispatch', () => {
     expect(log.mock.calls.flat().join('\n')).toContain('DRY RUN — would execute');
   });
 
+  it('shows the saved effort policy in a single-model endpoint dry run without launching', async () => {
+    vi.clearAllMocks();
+    const model = {
+      id: 'profiled-model',
+      name: 'Profiled Model',
+      family: 'profiled',
+      brand: 'Test',
+      modelFormat: 'openai' as const,
+      upstreamModelId: 'profiled-model',
+      npm: '@ai-sdk/openai-compatible',
+      effortProfile: {
+        modelId: 'profiled-model',
+        transport: 'openai-completions',
+        defaultLevel: null,
+        levels: [{ level: 'high' as const, native: { kind: 'reasoning-effort' as const, value: 'high' } }],
+      },
+    };
+    const provider = {
+      id: 'profiled-provider',
+      name: 'Profiled Provider',
+      apiKey: 'profiled-api-key',
+      authType: 'api' as const,
+      models: [model],
+    };
+    const catalog = Object.assign([provider], { blockedProviders: new Map() });
+    const log = vi.spyOn(console, 'log').mockImplementation(() => {});
+    vi.mocked(fetchProviderCatalog).mockResolvedValue(catalog);
+
+    try {
+      await expect(main(['models', '--effort-policy', 'exact'])).resolves.toBe(0);
+      const code = await main([
+        'claude',
+        '--endpoint',
+        '--dry-run',
+        '--provider', 'profiled-provider',
+        '--model', 'profiled-model',
+      ]);
+
+      expect(code).toBe(0);
+      expect(log.mock.calls.flat().join('\n')).toContain('  Effort policy: exact');
+      expect(startProxy).not.toHaveBeenCalled();
+      expect(launchClaude).not.toHaveBeenCalled();
+    } finally {
+      await main(['models', '--effort-policy', 'provider-default']);
+    }
+  });
+
   it('routes API-key Anthropic models without count_tokens support through the local estimator proxy', async () => {
     vi.clearAllMocks();
     const compatibility = { supportsCountTokens: false };
@@ -417,6 +472,8 @@ describe('main dispatch', () => {
         compatibility,
       }),
       'opencode-api-key',
+      // Every routed launch carries the startup effort-policy snapshot.
+      'provider-default',
     );
     expect(launchClaude).toHaveBeenCalledWith(
       expect.objectContaining({
@@ -521,6 +578,7 @@ describe('main dispatch', () => {
         headers: { 'Anthropic-Beta': 'cfg-a', 'X-Plan': 'coding' },
       }),
       'anthropic-api-key',
+      'provider-default',
     );
     const [childEnv] = vi.mocked(launchClaude).mock.calls[0]!;
     expect(childEnv).toMatchObject({
