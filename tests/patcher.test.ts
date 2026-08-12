@@ -2,8 +2,9 @@ import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
 import * as p from '@clack/prompts';
 import { createHash } from 'node:crypto';
 import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { createRequire } from 'node:module';
 import { tmpdir } from 'node:os';
-import { join } from 'node:path';
+import { dirname, join } from 'node:path';
 import {
   applyPatch,
   buildPatchModelConfig,
@@ -1152,21 +1153,31 @@ describe('tweakcc dependency patch', () => {
       new URL('../pnpm-workspace.yaml', import.meta.url),
       'utf8',
     );
+    const lockfile = readFileSync(
+      new URL('../pnpm-lock.yaml', import.meta.url),
+      'utf8',
+    );
     const patch = readFileSync(
       new URL('../patches/tweakcc@4.3.0.patch', import.meta.url),
       'utf8',
     );
+    const tweakccEntry = createRequire(import.meta.url).resolve('tweakcc');
+    const installedNativeModule = readFileSync(
+      join(dirname(dirname(tweakccEntry)), 'nativeInstallation-Bo_Crunz.mjs'),
+      'utf8',
+    );
 
     expect(packageJson.dependencies['tweakcc']).toBe('4.3.0');
-    expect(workspace).toContain('tweakcc@4.3.0: patches/tweakcc@4.3.0.patch');
+    expect(workspace.match(/  tweakcc@4\.3\.0: patches\/tweakcc@4\.3\.0\.patch/g)).toHaveLength(1);
+    expect(lockfile.match(
+      /  tweakcc@4\.3\.0:\n    hash: 9f4c832147f900c8308e842920a2796aa1e5841cf3a73c1f033ba96421c1d3bd\n    path: patches\/tweakcc@4\.3\.0\.patch/g,
+    )).toHaveLength(1);
+    expect(patch.match(/^\+.*e===`\/\$bunfs\/root\/cli`.*$/gm)).toHaveLength(1);
 
     // tweakcc does not export this selector. Execute the exact expression from
-    // the retained minified dependency patch so broad lookalikes are behavioral
-    // regressions, not merely review concerns about the patch text.
-    const addedSelectorLine = patch.split('\n').find(
-      line => line.startsWith('+') && line.includes('src/entrypoints/cli.js'),
-    );
-    const selectorMatch = addedSelectorLine?.match(
+    // the installed dependency so a missing/reverse-applied pnpm patch fails
+    // behaviorally rather than merely proving that the patch artifact exists.
+    const selectorMatch = installedNativeModule.match(
       /function [\w$]+\(([\w$]+)\)\{return ([^}]*src\/entrypoints\/cli\.js[^}]*)\}/,
     );
     expect(selectorMatch).toBeDefined();
