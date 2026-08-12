@@ -1166,6 +1166,107 @@ describe('server router', () => {
     });
   });
 
+  it('applies direct OpenAI model compatibility before forwarding Chat Completions', async () => {
+    const upstream = await startUpstream({
+      id: 'chatcmpl-compatible',
+      choices: [{ message: { content: 'compatible ok' }, finish_reason: 'stop' }],
+    });
+    handles.push(upstream);
+    const server = await startTestServer({
+      catalog: createGatewayModelCatalog([{
+        id: 'openai-compatible',
+        name: 'OpenAI Compatible',
+        isFree: false,
+        brand: 'Other',
+        providerId: 'ordinary',
+        sourceBackend: 'ordinary',
+        modelFormat: 'openai',
+        completionsUrl: `${upstream.baseUrl}/v1/chat/completions`,
+        compatibility: {
+          supportsStore: false,
+          maxTokensField: 'max_tokens',
+          supportsReasoningEffort: false,
+        },
+        upstreamModelId: 'upstream-compatible',
+      }]),
+    });
+
+    const body = {
+      model: 'openai-compatible',
+      messages: [{ role: 'user', content: 'hi' }],
+      store: true,
+      reasoning_effort: 'high',
+      max_completion_tokens: 100,
+      temperature: 0.2,
+    };
+    const response = await fetch(`${server.url}/openai/v1/chat/completions`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(body),
+    });
+
+    expect(response.status).toBe(200);
+    expect(upstream.requests[0]?.body).toEqual({
+      model: 'upstream-compatible',
+      messages: [{ role: 'user', content: 'hi' }],
+      max_tokens: 100,
+      temperature: 0.2,
+    });
+  });
+
+  it('omits disabled Kimi reasoning levels while forwarding direct Chat Completions', async () => {
+    const upstream = await startUpstream({
+      id: 'chatcmpl-kimi',
+      choices: [{ message: { content: 'kimi ok' }, finish_reason: 'stop' }],
+    });
+    handles.push(upstream);
+    const server = await startTestServer({
+      catalog: createGatewayModelCatalog([{
+        id: 'kimi-k3',
+        name: 'Kimi K3',
+        isFree: false,
+        brand: 'Other',
+        providerId: 'opencode-go',
+        sourceBackend: 'go',
+        modelFormat: 'openai',
+        completionsUrl: `${upstream.baseUrl}/v1/chat/completions`,
+        compatibility: {
+          reasoningEffortMap: {
+            off: null,
+            minimal: null,
+            low: null,
+            medium: null,
+            high: null,
+            xhigh: null,
+            max: 'max',
+          },
+          supportsTemperature: false,
+          supportsStore: false,
+          supportsDeveloperRole: false,
+          maxTokensField: 'max_tokens',
+        },
+        upstreamModelId: 'kimi-k3-upstream',
+      }]),
+    });
+
+    const body = {
+      model: 'kimi-k3',
+      messages: [{ role: 'user', content: 'hi' }],
+      reasoning_effort: 'high',
+    };
+    const response = await fetch(`${server.url}/openai/v1/chat/completions`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(body),
+    });
+
+    expect(response.status).toBe(200);
+    expect(upstream.requests[0]?.body).toEqual({
+      model: 'kimi-k3-upstream',
+      messages: body.messages,
+    });
+  });
+
   it('caches SDK language models per provider-qualified route, not just raw model id', async () => {
     const duplicateCatalog = createGatewayModelCatalog([
       {

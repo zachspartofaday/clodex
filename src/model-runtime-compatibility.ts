@@ -16,6 +16,8 @@ export interface ModelRuntimeCompatibility {
   requiresReasoningContentOnAssistantMessages?: boolean;
   /** Whether the upstream accepts the OpenAI `store` request field. */
   supportsStore?: boolean;
+  /** Whether the upstream accepts the Chat Completions `temperature` request field. */
+  supportsTemperature?: boolean;
   /** Whether the upstream accepts Chat Completions `developer` messages. */
   supportsDeveloperRole?: boolean;
   /** Output-token field accepted by the upstream Chat Completions endpoint. */
@@ -99,7 +101,25 @@ export function transformOpenAiCompatibleRequestBody(
 ): OpenAiCompatibleRequestBody {
   const transformed = { ...body };
 
+  const reasoningEffort = transformed.reasoning_effort;
+  const reasoningEffortMap = compatibility.reasoningEffortMap;
+  if (compatibility.supportsReasoningEffort === false) {
+    delete transformed.reasoning_effort;
+  } else if (
+    typeof reasoningEffort === 'string'
+    && reasoningEffortMap !== undefined
+    && Object.prototype.hasOwnProperty.call(reasoningEffortMap, reasoningEffort)
+  ) {
+    const mapped = reasoningEffortMap[reasoningEffort];
+    if (mapped === null) {
+      delete transformed.reasoning_effort;
+    } else {
+      transformed.reasoning_effort = mapped;
+    }
+  }
+
   if (compatibility.supportsStore === false) delete transformed.store;
+  if (compatibility.supportsTemperature === false) delete transformed.temperature;
   if (compatibility.supportsLongCacheRetention === false) {
     delete transformed.prompt_cache_retention;
     delete transformed.promptCacheRetention;

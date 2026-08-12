@@ -7,13 +7,75 @@ import { describe, expect, it } from 'vitest';
 import { buildOpenCodeGoModels } from '../src/data/opencode-go-models.js';
 
 /**
+ * The reviewed catalog, one row per model: id, wire format, resolver family,
+ * and the field the upstream streams reasoning in (undefined where the resolver
+ * reports none).
+ *
+ * A per-model table rather than a spot-check, because the generated file now
+ * carries resolver metadata: a regeneration that re-points a transport, drops a
+ * model, or adopts a field for the wrong entry should fail here with the id
+ * named. If you are here after `pnpm update:opencode-go`, read the diff and
+ * update this table on purpose — do not relax it.
+ */
+const REVIEWED_CATALOG: Array<[string, 'anthropic' | 'openai', string, string | undefined]> = [
+  ['deepseek-v4-flash', 'openai', 'deepseek-flash', 'reasoning_content'],
+  ['deepseek-v4-pro', 'openai', 'deepseek-thinking', 'reasoning_content'],
+  ['glm-5.1', 'openai', 'glm', 'reasoning_content'],
+  ['glm-5.2', 'openai', 'glm', 'reasoning_content'],
+  ['gpt-5.6-luna', 'openai', 'gpt-luna', undefined],
+  ['hy3', 'openai', 'Hy', undefined],
+  ['kimi-k2.6', 'openai', 'kimi-k2', 'reasoning_content'],
+  ['kimi-k2.7-code', 'openai', 'kimi-k2', 'reasoning_content'],
+  ['kimi-k3', 'openai', 'kimi-k3', 'reasoning_content'],
+  ['mimo-v2.5', 'openai', 'mimo-v2.5', 'reasoning_content'],
+  ['mimo-v2.5-pro', 'openai', 'mimo-v2.5-pro', 'reasoning_content'],
+  ['minimax-m2.7', 'openai', 'minimax-m2.7', undefined],
+  ['minimax-m3', 'anthropic', 'minimax-m3', undefined],
+  ['qwen3.6-plus', 'openai', 'qwen3.6', undefined],
+  ['qwen3.7-max', 'anthropic', 'qwen3.7-max', undefined],
+  ['qwen3.7-plus', 'anthropic', 'qwen3.7-plus', undefined],
+  ['qwen3.8-max', 'anthropic', 'qwen3.8-max', undefined],
+];
+
+/**
+ * The three models the pinned resolver routes differently from clodex. Each
+ * conserves the live-validated Chat Completions route; the updater's cross-check
+ * refuses to regenerate if any of these divergences changes shape, and this
+ * pins the catalog side of the same contract.
+ */
+const CONSERVED_TRANSPORT_OVERRIDES = ['gpt-5.6-luna', 'minimax-m2.7', 'qwen3.6-plus'];
+
+/**
  * Structural invariants over the WHOLE catalog, not a spot-check of two
  * entries. `buildOpenCodeGoModels()` blind-casts generated JSON, so a botched
  * regeneration would otherwise ship: these assertions are what stands between
- * a bad feed day and a broken base URL, SDK package, or effort ladder.
+ * a bad snapshot day and a broken base URL, SDK package, or effort ladder.
  */
 describe('opencode-go catalog invariants', () => {
   const models = buildOpenCodeGoModels();
+
+  it('carries exactly the reviewed models, transports, families, and reasoning fields', () => {
+    expect(models.map(model => model.id)).toEqual(REVIEWED_CATALOG.map(([id]) => id));
+    const byId = new Map(models.map(model => [model.id, model]));
+    for (const [id, modelFormat, family, interleavedReasoningField] of REVIEWED_CATALOG) {
+      const model = byId.get(id)!;
+      expect(model.modelFormat, id).toBe(modelFormat);
+      expect(model.family, id).toBe(family);
+      expect(model.interleavedReasoningField, id).toBe(interleavedReasoningField);
+      expect(model.upstreamModelId, id).toBe(id);
+    }
+  });
+
+  it('keeps the three reviewed transport overrides on Chat Completions', () => {
+    const byId = new Map(models.map(model => [model.id, model]));
+    for (const id of CONSERVED_TRANSPORT_OVERRIDES) {
+      expect(byId.get(id), id).toMatchObject({
+        modelFormat: 'openai',
+        npm: '@ai-sdk/openai-compatible',
+        apiUrl: 'https://opencode.ai/zen/go/v1',
+      });
+    }
+  });
 
   it('every entry routes to opencode.ai over https', () => {
     expect(models.length).toBeGreaterThan(0);
@@ -65,6 +127,16 @@ describe('opencode-go catalog invariants', () => {
     }
   });
 
+  it('marks exactly the two Kimi routes that reject temperature', () => {
+    const unsupported = models
+      .filter(model => model.compatibility?.supportsTemperature === false)
+      .map(model => model.id);
+
+    expect(unsupported).toEqual(['kimi-k2.7-code', 'kimi-k3']);
+    expect(models.find(model => model.id === 'gpt-5.6-luna')?.compatibility?.supportsTemperature)
+      .toBeUndefined();
+  });
+
   it('no entry maps an effort level to a value outside its own ladder', () => {
     // Guards the shape rather than the contents: a mapped value must be a
     // non-empty string, so a typo like `high: ''` cannot silently drop a level
@@ -78,7 +150,7 @@ describe('opencode-go catalog invariants', () => {
     }
   });
 
-  it('keeps prototype names unmapped while regenerating every reviewed model', () => {
+  it('keeps prototype names unmapped while regenerating every reviewed model under --verify-ladders', () => {
     const mappedIds = [
       'deepseek-v4-flash', 'deepseek-v4-pro', 'glm-5.1', 'glm-5.2', 'gpt-5.6-luna',
       'hy3', 'kimi-k2.6', 'kimi-k2.7-code', 'kimi-k3', 'mimo-v2.5', 'mimo-v2.5-pro',
@@ -122,7 +194,12 @@ describe('opencode-go catalog invariants', () => {
         join(workspace, 'src', 'data', 'opencode-go-models.ts'),
         "export const OPENCODE_GO_SOURCE_FETCHED_AT = 'before';\n",
       );
+      // The feed is reached only by the explicit advisory mode now that the
+      // default regeneration is offline, so the bootstrap hands the updater the
+      // argv a real `pnpm update:opencode-go -- --verify-ladders` would give it.
+      // Every assertion below is the one this test has always made.
       const childScript = [
+        `process.argv = [process.argv[0], ${JSON.stringify(updaterPath)}, '--verify-ladders'];`,
         'globalThis.fetch = async () => ({',
         '  ok: true,',
         '  json: async () => JSON.parse(process.env.CLODEX_TEST_FEED),',
