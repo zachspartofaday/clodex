@@ -110,11 +110,12 @@ function saveFavorites(
   favorites: Array<{ providerId: string; modelId: string }> = [
     { providerId: 'openai-oauth', modelId: 'gpt-5.6-sol' },
   ],
+  modelAliases = [{ name: 'sol', providerId: 'openai-oauth', modelId: 'gpt-5.6-sol' }],
 ): void {
   mkdirSync(clodexHome, { recursive: true });
   writeFileSync(join(clodexHome, 'config.json'), JSON.stringify({
     favoriteModels: favorites,
-    modelAliases: [{ name: 'sol', providerId: 'openai-oauth', modelId: 'gpt-5.6-sol' }],
+    modelAliases,
   }));
 }
 
@@ -744,7 +745,11 @@ describe('runPatchCommand patch exposure warning', () => {
     for (let n = 2; n <= 21; n++) {
       favorites.push({ providerId: 'openai-oauth', modelId: `gpt-5.6-sol-${n}` });
     }
-    saveFavorites(favorites);
+    saveFavorites(favorites, [{
+      name: 'late',
+      providerId: 'openai-oauth',
+      modelId: 'gpt-5.6-sol-21',
+    }]);
 
     expect(await runPatchCommand({})).toBe(0);
 
@@ -759,6 +764,9 @@ describe('runPatchCommand patch exposure warning', () => {
     expect(warning).toMatch(/Removing or reordering those entries reclaims positions/);
     // The 21st saved favorite is omitted from the patch and listed as skipped.
     expect(warning).toContain('  clodex:openai-oauth:gpt-5.6-sol-21');
+    expect(warning).toContain(
+      'Saved model alias "late" was not patched — target is outside the active Claude Code catalog.',
+    );
     expect(bundleOf(real)).toContain('"clodex:openai-oauth:gpt-5.6-sol-20"');
     expect(bundleOf(real)).not.toContain('clodex:openai-oauth:gpt-5.6-sol-21');
   });
