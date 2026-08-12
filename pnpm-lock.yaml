@@ -4,6 +4,11 @@ settings:
   autoInstallPeers: true
   excludeLinksFromLockfile: false
 
+patchedDependencies:
+  tweakcc@4.3.0:
+    hash: 9f4c832147f900c8308e842920a2796aa1e5841cf3a73c1f033ba96421c1d3bd
+    path: patches/tweakcc@4.3.0.patch
+
 importers:
 
   .:
@@ -46,7 +51,7 @@ importers:
         version: 1.1.1
       tweakcc:
         specifier: 4.3.0
-        version: 4.3.0
+        version: 4.3.0(patch_hash=9f4c832147f900c8308e842920a2796aa1e5841cf3a73c1f033ba96421c1d3bd)
       undici:
         specifier: 7.29.0
         version: 7.29.0
@@ -3364,7 +3369,7 @@ snapshots:
       - tsx
       - yaml
 
-  tweakcc@4.3.0:
+  tweakcc@4.3.0(patch_hash=9f4c832147f900c8308e842920a2796aa1e5841cf3a73c1f033ba96421c1d3bd):
     dependencies:
       chalk: 5.6.2
       cli-spinners: 3.4.0

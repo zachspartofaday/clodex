@@ -2,8 +2,9 @@ import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
 import * as p from '@clack/prompts';
 import { createHash } from 'node:crypto';
 import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { createRequire } from 'node:module';
 import { tmpdir } from 'node:os';
-import { join } from 'node:path';
+import { dirname, join } from 'node:path';
 import {
   applyPatch,
   buildPatchModelConfig,
@@ -1140,6 +1141,58 @@ describe('PATCH_TRANSFORMS_VERSION', () => {
       version: 8,
       digest: '5b0e315bbade58f6702c166dc9d75a2f8bbc11a324c890a4f42d5ad2e069c54c',
     });
+  });
+});
+
+describe('tweakcc dependency patch', () => {
+  it('keeps tweakcc 4.3.0 patched for only the exact Bun root CLI module', () => {
+    const packageJson = JSON.parse(
+      readFileSync(new URL('../package.json', import.meta.url), 'utf8'),
+    ) as { dependencies: Record<string, string> };
+    const workspace = readFileSync(
+      new URL('../pnpm-workspace.yaml', import.meta.url),
+      'utf8',
+    );
+    const lockfile = readFileSync(
+      new URL('../pnpm-lock.yaml', import.meta.url),
+      'utf8',
+    );
+    const patch = readFileSync(
+      new URL('../patches/tweakcc@4.3.0.patch', import.meta.url),
+      'utf8',
+    );
+    const tweakccEntry = createRequire(import.meta.url).resolve('tweakcc');
+    const installedNativeModule = readFileSync(
+      join(dirname(dirname(tweakccEntry)), 'nativeInstallation-Bo_Crunz.mjs'),
+      'utf8',
+    );
+
+    expect(packageJson.dependencies['tweakcc']).toBe('4.3.0');
+    expect(workspace.match(/  tweakcc@4\.3\.0: patches\/tweakcc@4\.3\.0\.patch/g)).toHaveLength(1);
+    expect(lockfile.match(
+      /  tweakcc@4\.3\.0:\n    hash: 9f4c832147f900c8308e842920a2796aa1e5841cf3a73c1f033ba96421c1d3bd\n    path: patches\/tweakcc@4\.3\.0\.patch/g,
+    )).toHaveLength(1);
+    expect(patch.match(/^\+.*e===`\/\$bunfs\/root\/cli`.*$/gm)).toHaveLength(1);
+
+    // tweakcc does not export this selector. Execute the exact expression from
+    // the installed dependency so a missing/reverse-applied pnpm patch fails
+    // behaviorally rather than merely proving that the patch artifact exists.
+    const selectorMatch = installedNativeModule.match(
+      /function [\w$]+\(([\w$]+)\)\{return ([^}]*src\/entrypoints\/cli\.js[^}]*)\}/,
+    );
+    expect(selectorMatch).toBeDefined();
+    const selector = new Function(
+      selectorMatch![1]!,
+      `return ${selectorMatch![2]!};`,
+    ) as (moduleName: string) => boolean;
+
+    expect(selector('/$bunfs/root/cli')).toBe(true);
+    expect(selector('/src/entrypoints/cli.js')).toBe(true);
+    expect(selector('/opt/$bunfs/root/cli')).toBe(false);
+    expect(selector('$bunfs/root/cli')).toBe(false);
+    expect(selector('/$bunfs/root/cli.exe')).toBe(false);
+    expect(selector('\\$bunfs\\root\\cli')).toBe(false);
+    expect(selector('/cli')).toBe(false);
   });
 });
 
