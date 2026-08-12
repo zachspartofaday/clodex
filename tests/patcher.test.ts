@@ -1143,6 +1143,48 @@ describe('PATCH_TRANSFORMS_VERSION', () => {
   });
 });
 
+describe('tweakcc dependency patch', () => {
+  it('keeps tweakcc 4.3.0 patched for only the exact Bun root CLI module', () => {
+    const packageJson = JSON.parse(
+      readFileSync(new URL('../package.json', import.meta.url), 'utf8'),
+    ) as { dependencies: Record<string, string> };
+    const workspace = readFileSync(
+      new URL('../pnpm-workspace.yaml', import.meta.url),
+      'utf8',
+    );
+    const patch = readFileSync(
+      new URL('../patches/tweakcc@4.3.0.patch', import.meta.url),
+      'utf8',
+    );
+
+    expect(packageJson.dependencies['tweakcc']).toBe('4.3.0');
+    expect(workspace).toContain('tweakcc@4.3.0: patches/tweakcc@4.3.0.patch');
+
+    // tweakcc does not export this selector. Execute the exact expression from
+    // the retained minified dependency patch so broad lookalikes are behavioral
+    // regressions, not merely review concerns about the patch text.
+    const addedSelectorLine = patch.split('\n').find(
+      line => line.startsWith('+') && line.includes('src/entrypoints/cli.js'),
+    );
+    const selectorMatch = addedSelectorLine?.match(
+      /function [\w$]+\(([\w$]+)\)\{return ([^}]*src\/entrypoints\/cli\.js[^}]*)\}/,
+    );
+    expect(selectorMatch).toBeDefined();
+    const selector = new Function(
+      selectorMatch![1]!,
+      `return ${selectorMatch![2]!};`,
+    ) as (moduleName: string) => boolean;
+
+    expect(selector('/$bunfs/root/cli')).toBe(true);
+    expect(selector('/src/entrypoints/cli.js')).toBe(true);
+    expect(selector('/opt/$bunfs/root/cli')).toBe(false);
+    expect(selector('$bunfs/root/cli')).toBe(false);
+    expect(selector('/$bunfs/root/cli.exe')).toBe(false);
+    expect(selector('\\$bunfs\\root\\cli')).toBe(false);
+    expect(selector('/cli')).toBe(false);
+  });
+});
+
 describe('evaluatePatchState', () => {
   const manifest: PatchManifest = {
     binaryPath: '/opt/claude/claude',
