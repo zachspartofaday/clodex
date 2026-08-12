@@ -279,11 +279,19 @@ describe('runServerCommand', () => {
         + '  "Orbit" — conflicting targets\n'
         + '  "ORBIT" — conflicting targets\n'
         + '  "default" — reserved client name\n'
-        + '  "ArChIvEd" — target unavailable\n'
-        + '  "ARCHIVED" — target unavailable\n'
+        + '  "ArChIvEd" — target is unavailable or unsupported\n'
+        + '  "ARCHIVED" — target is unavailable or unsupported\n'
         + '  "CLAUDE-TEST" — conflicts with a catalog model id',
       );
       expect(state.startServerOptions.aliasNames).toEqual(new Set(['active']));
+      expect(state.startServerOptions.modelAliasRejections).toEqual([
+        { alias: state.modelAliases[1], reason: 'conflicting-targets' },
+        { alias: state.modelAliases[2], reason: 'conflicting-targets' },
+        { alias: state.modelAliases[3], reason: 'reserved-name' },
+        { alias: state.modelAliases[4], reason: 'target-unavailable' },
+        { alias: state.modelAliases[5], reason: 'target-unavailable' },
+        { alias: state.modelAliases[6], reason: 'catalog-id-collision' },
+      ]);
       expect(state.startServerOptions.catalog.get('active')).toMatchObject({
         id: 'claude-test',
         providerId: 'zen',
@@ -304,6 +312,10 @@ describe('runServerCommand', () => {
         modelId: `model-${index + 1}`,
       })),
     ];
+    state.modelAliases = [
+      { name: 'missing', providerId: 'missing', modelId: 'model-1' },
+      { name: 'later', providerId: 'missing', modelId: 'model-20' },
+    ];
     const warn = vi.spyOn(p.log, 'warn').mockImplementation(() => {});
 
     try {
@@ -320,6 +332,11 @@ describe('runServerCommand', () => {
         + 'entries reclaims positions. Skipped entries were preserved:\n'
         + '  clodex:missing:model-20\n'
         + '  clodex:missing:model-21',
+      );
+      expect(warn).toHaveBeenCalledWith(
+        '2 saved model aliases inactive. Saved entries were preserved.\n'
+        + '  "missing" — target is unavailable or unsupported\n'
+        + '  "later" — target is outside the active Claude Code catalog',
       );
     } finally {
       warn.mockRestore();

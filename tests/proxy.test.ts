@@ -354,6 +354,58 @@ describe('catalog model aliases', () => {
     }
   });
 
+  it('renders distinct structured reasons for capacity and unavailable alias targets', async () => {
+    const route: ProxyRoute = {
+      aliasId: 'clodex:test:default-model',
+      realModelId: 'default-model',
+      displayName: 'Default Model',
+      upstreamUrl: '',
+      apiKey: 'provider-key',
+      modelFormat: 'anthropic',
+      providerId: 'test-provider',
+    };
+    const fetchMock = vi.fn(async () => new Response('{}', { status: 200 }));
+    vi.stubGlobal('fetch', fetchMock);
+    const handle = await startProxyCatalog(
+      [route],
+      route.aliasId,
+      false,
+      undefined,
+      undefined,
+      undefined,
+      [
+        { name: 'later', rejectionReason: 'target-not-exposed' },
+        { name: 'missing', rejectionReason: 'target-unavailable' },
+      ],
+    );
+
+    try {
+      const capacity = await postToProxy(handle.port, handle.token, {
+        model: 'later',
+        max_tokens: 100,
+        messages: [{ role: 'user', content: 'hi' }],
+        stream: false,
+      });
+      const unavailable = await postToProxy(handle.port, handle.token, {
+        model: 'missing',
+        max_tokens: 100,
+        messages: [{ role: 'user', content: 'hi' }],
+        stream: false,
+      });
+
+      expect(JSON.parse(capacity.body).error.message).toContain(
+        'target is outside the active Claude Code catalog',
+      );
+      expect(JSON.parse(unavailable.body).error.message).toContain(
+        'target is unavailable or unsupported',
+      );
+      expect(fetchMock).not.toHaveBeenCalled();
+    } finally {
+      handle.close();
+      vi.unstubAllGlobals();
+    }
+  });
+
   it('rejects unresolved canonical ids when model aliases are not configured', async () => {
     const route: ProxyRoute = {
       aliasId: 'clodex:test:default-model',
@@ -445,6 +497,52 @@ describe('catalog model aliases', () => {
       expect(message).toContain('orbit');
       expect(message).toMatch(/conflict/i);
       expect(message).not.toContain('clodex patch');
+      expect(fetchMock).not.toHaveBeenCalled();
+    } finally {
+      handle.close();
+      vi.unstubAllGlobals();
+    }
+  });
+
+  it('rejects every case-equivalent spelling of a configured rejected alias without using the default route', async () => {
+    const defaultRoute: ProxyRoute = {
+      aliasId: 'clodex:test:default-model',
+      realModelId: 'default-model',
+      displayName: 'Default Model',
+      upstreamUrl: 'https://default.example',
+      apiKey: 'provider-key',
+      modelFormat: 'anthropic',
+      providerId: 'test-provider',
+    };
+    const modelAliases = resolveCatalogModelAliases([
+      { name: 'DeFaUlT', providerId: 'test-provider', modelId: 'default-model' },
+    ], () => defaultRoute);
+    const fetchMock = vi.fn(async () => new Response('{}', { status: 200 }));
+    vi.stubGlobal('fetch', fetchMock);
+    const handle = await startProxyCatalog(
+      [defaultRoute],
+      defaultRoute.aliasId,
+      false,
+      undefined,
+      undefined,
+      undefined,
+      modelAliases,
+    );
+
+    try {
+      for (const path of ['/v1/messages', '/v1/messages/count_tokens']) {
+        const response = await postToProxy(handle.port, handle.token, {
+          model: 'DEFAULT',
+          max_tokens: 100,
+          messages: [{ role: 'user', content: 'hi' }],
+          stream: false,
+        }, undefined, path);
+
+        expect(response.status, path).toBe(400);
+        expect(JSON.parse(response.body).error.message).toBe(
+          "Clodex model route 'DEFAULT' is unavailable: reserved client name. Run `clodex models --list` to inspect saved routes and aliases.",
+        );
+      }
       expect(fetchMock).not.toHaveBeenCalled();
     } finally {
       handle.close();

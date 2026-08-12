@@ -20,7 +20,6 @@ import {
 } from '../trace-log.js';
 import { removeAnthropicProxyBypass } from '../wrapper-env.js';
 import {
-  canonicalModelAliasName,
   describeModelAliasRejection,
   normalizeModelAliases,
 } from '../model-aliases.js';
@@ -40,9 +39,11 @@ export async function loadHttpProxyRoutes(): Promise<LoadedHttpProxyRoutes> {
       unsupported: [],
       capacitySkippedFavorites: [],
       aliases: [],
-      unavailableAliases: [
-        ...normalizedAliases.rejected,
-        ...normalizedAliases.accepted.flatMap(({ sources }) => sources),
+      unavailableAliasRejections: [
+        ...normalizedAliases.rejections,
+        ...normalizedAliases.accepted.flatMap(({ sources }) => (
+          sources.map(alias => ({ alias, reason: 'target-not-favorite' as const }))
+        )),
       ],
       favoriteCount: 0,
     };
@@ -121,19 +122,15 @@ export function reportSkippedHttpProxyFavorites(loaded: LoadedHttpProxyRoutes): 
         .join('\n'),
     );
   }
-  if (loaded.unavailableAliases.length > 0) {
-    const normalizedAliases = normalizeModelAliases(loaded.unavailableAliases);
-    const reasonByAlias = new Map(
-      normalizedAliases.rejections.map(rejection => [
-        rejection.alias,
-        describeModelAliasRejection(rejection.reason),
-      ]),
-    );
+  if (loaded.unavailableAliasRejections.length > 0) {
     p.log.warn(
-      `${loaded.unavailableAliases.length} model alias${loaded.unavailableAliases.length === 1 ? '' : 'es'} skipped. `
+      `${loaded.unavailableAliasRejections.length} model alias${loaded.unavailableAliasRejections.length === 1 ? '' : 'es'} skipped. `
       + 'Saved entries were preserved.\n'
-      + loaded.unavailableAliases
-        .map(alias => `  ${JSON.stringify(alias.name)} — ${reasonByAlias.get(alias) ?? 'target unavailable'}`)
+      + loaded.unavailableAliasRejections
+        .map(rejection => (
+          `  ${JSON.stringify(rejection.alias.name)} — `
+          + describeModelAliasRejection(rejection.reason)
+        ))
         .join('\n'),
     );
   }
@@ -152,14 +149,7 @@ export function buildConfiguredHttpProxyOptions(
     port,
     routes: loaded.routes,
     modelAliases: loaded.aliases,
-    reservedModelIds: [...new Set([
-      ...loaded.aliases.flatMap(alias => alias.sourceNames ?? []),
-      ...loaded.unavailableAliases.map(alias => alias.name),
-    ].flatMap(name => {
-      const trimmedName = name.trim();
-      const canonicalName = canonicalModelAliasName(name);
-      return [name, trimmedName, canonicalName].filter(Boolean);
-    }))],
+    modelAliasRejections: loaded.unavailableAliasRejections,
     debug,
     debugLogPath,
     inferenceLogPath,
