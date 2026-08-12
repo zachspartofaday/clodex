@@ -2,27 +2,57 @@ import { Readable, Transform } from 'node:stream';
 import { StringDecoder } from 'node:string_decoder';
 import type { ServerResponse } from 'node:http';
 import { sanitizeCredential } from './server/auth.js';
-import { CLAUDE_CODE_USER_AGENT } from './oauth/claude-identity.js';
+import {
+  ANTHROPIC_BETA_HEADER,
+  isAnthropicBetaHeaderName,
+  isRouteOwnedCredentialHeaderName,
+  resolveOutboundBeta,
+  type AnthropicCapabilityRequest,
+  type AnthropicCapabilityRouteFacts,
+} from './anthropic-beta-policy.js';
 import { isCredentialBearingHeader } from './credential-headers.js';
 
+/**
+ * Build the headers for a routed Anthropic-format upstream request.
+ *
+ * This is the final routed boundary, so it RECOMPUTES the beta set here: from
+ * the provider's CONFIGURED headers, plus — only when `capability` is supplied —
+ * the capability tokens this exact destination, route and body earn under
+ * `anthropic-beta-policy`. The inbound client beta is one input to those
+ * predicates and never a value to forward, so an arbitrary client beta still
+ * cannot reach an upstream from here, and neither can a capability token whose
+ * predicate is false. The credential scheme (api key, OAuth bearer, anonymous)
+ * is unchanged, and no native-client identity is synthesized — clodex ships no
+ * supported producer of native Claude credentials whose lineage such an
+ * identity could represent.
+ *
+ * When the route owns the credential it owns it OUTRIGHT: every configured
+ * spelling of `authorization` and `x-api-key` is removed before the route's own
+ * canonical credential is added, so a configured value can never be appended
+ * alongside it. Ordinary configured headers are untouched.
+ */
 export function anthropicUpstreamHeaders(
   apiKey: string,
   stream = false,
-  inboundBeta?: string,
   authType?: 'api' | 'oauth' | 'none',
-  claudeCodeSessionId?: string,
   extraHeaders?: Record<string, string>,
+  capability?: AnthropicCapabilityRequest,
 ): Record<string, string> {
   const key = sanitizeCredential(apiKey) ?? apiKey.trim();
   const resolvedAuthType = authType ?? 'api';
   const isOAuth = resolvedAuthType === 'oauth';
-  const forwardedExtraHeaders = resolvedAuthType === 'none'
-    ? Object.fromEntries(
-        Object.entries(extraHeaders ?? {}).filter(
-          ([name]) => !isCredentialBearingHeader(name),
-        ),
-      )
-    : extraHeaders;
+  const outboundBeta = resolveOutboundBeta(extraHeaders, capability);
+  // Configured beta spellings are re-emitted once, normalized, under the
+  // canonical name. Passing them through as well would leave two case-variant
+  // keys on one request, which fetch appends into a single merged header — the
+  // same failure the route-owned credential names are dropped to avoid.
+  const forwardedExtraHeaders = Object.fromEntries(
+    Object.entries(extraHeaders ?? {}).filter(([name]) =>
+      !isAnthropicBetaHeaderName(name)
+      && !isRouteOwnedCredentialHeaderName(name)
+      && (resolvedAuthType !== 'none' || !isCredentialBearingHeader(name)),
+    ),
+  );
   const headers: Record<string, string> = {
     ...forwardedExtraHeaders,
     'Content-Type': 'application/json',
@@ -33,12 +63,10 @@ export function anthropicUpstreamHeaders(
           Authorization: `Bearer ${key}`,
           ...(isOAuth ? {} : { 'x-api-key': key }),
         }),
-    ...(isOAuth ? { 'User-Agent': CLAUDE_CODE_USER_AGENT, 'x-app': 'cli' } : {}),
-    ...(isOAuth && claudeCodeSessionId ? { 'X-Claude-Code-Session-Id': claudeCodeSessionId } : {}),
     ...(stream ? { Accept: 'text/event-stream' } : {}),
   };
-  if (inboundBeta) {
-    headers['anthropic-beta'] = inboundBeta;
+  if (outboundBeta.source !== 'none') {
+    headers[ANTHROPIC_BETA_HEADER] = outboundBeta.value;
   }
   return headers;
 }
@@ -97,11 +125,31 @@ export async function fetchWithOAuthRetry<TResponse extends {
 
 /** Relay an Anthropic /v1/messages response (JSON or SSE) to the client. */
 export interface RelayAnthropicOptions {
-  inboundBeta?: string;
   authType?: 'api' | 'oauth' | 'none';
   log?: (message: string) => void;
-  claudeCodeSessionId?: string;
+  /**
+   * The provider's configured static headers. Explicit operator authority, and
+   * the only channel through which an arbitrary `Anthropic-Beta` can reach an
+   * upstream. There is deliberately no session-identity option.
+   */
   extraHeaders?: Record<string, string>;
+  /**
+   * Route facts for capability-beta admission on an Anthropic-protocol route.
+   *
+   * "Anthropic-protocol" names the wire format, not the host: a third-party
+   * provider clodex forwards to over the Anthropic Messages/count_tokens
+   * endpoints is included on purpose, because those routes serve the same
+   * beta-gated request shapes.
+   *
+   * Supplying this does NOT allow anything: it hands the policy the inbound
+   * tokens and the route's own advertised id/window so the boundary can decide.
+   * The destination URL and the exact forwarded body are taken from what this
+   * relay is actually sending, not from the caller, and the whole set is
+   * recomputed on every attempt including the OAuth-refresh retry. Omit it on a
+   * translated route — one this relay sends in another wire format — to keep
+   * the configured-only behaviour.
+   */
+  capability?: AnthropicCapabilityRouteFacts;
   refreshToken?: (rejectedAccessToken: string) => Promise<string | null>;
   onTokenRefreshed?: (token: string) => void;
   onUpstreamError?: (statusCode: number, body: string) => void;
@@ -195,10 +243,11 @@ export async function relayAnthropicMessages(
     headers: anthropicUpstreamHeaders(
       key,
       clientWantsStream,
-      options.inboundBeta,
       options.authType,
-      options.claudeCodeSessionId,
       options.extraHeaders,
+      options.capability
+        ? { ...options.capability, url: messagesUrl, body }
+        : undefined,
     ),
     body: JSON.stringify(body),
     signal: options.signal,

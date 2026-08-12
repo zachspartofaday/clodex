@@ -32,11 +32,10 @@ import {
   UpstreamUnreachableError,
 } from './upstream-forward.js';
 import {
-  CLAUDE_CODE_CLI_VERSION,
-  injectClaudeCodeBillingSystemLine,
-  injectClaudeIdentity,
-  selectBetaFlags,
-} from './oauth/claude-identity.js';
+  normalizeBetaTokens,
+  resolveCapabilityBetaTokens,
+  resolveNativeIdentitySuppression,
+} from './anthropic-beta-policy.js';
 import { createLanguageModel, isSdkMigratedNpm, maxToolsForNpm } from './provider-factory.js';
 import { randomUUID } from 'node:crypto';
 import {
@@ -509,17 +508,32 @@ export async function startProxyCatalog(
           return;
         }
 
-        const betaHeaderRaw = req.headers['anthropic-beta'];
-        const inboundBeta = Array.isArray(betaHeaderRaw) ? betaHeaderRaw.join(',') : betaHeaderRaw;
         const forwardBody = { ...anthropicBody, model: route.realModelId };
         const targetUrl = `${upstreamUrl}/v1/messages/count_tokens`;
-        const isOAuth = routeAuthType === 'oauth';
+        // The client beta arrives as non-authoritative context (possibly
+        // duplicated across the internal adapter hop); the relay recomputes the
+        // outbound set from the configured headers plus whatever this exact
+        // count_tokens request earns, and drops everything else.
+        const clientBeta = normalizeBetaTokens(req.headers['anthropic-beta']);
+        const suppression = resolveNativeIdentitySuppression(upstreamUrl);
+        const capability = {
+          clientBeta,
+          requestedModelId: typeof originalModel === 'string' ? originalModel : undefined,
+          advertisedModelId: route.aliasId,
+          advertisedContextWindow: route.contextWindow,
+        };
+        plog(() =>
+          `anthropic token-count: model=${route.realModelId}, auth=${routeAuthType}, `
+          + `native-identity=suppressed(${suppression.reason}), `
+          + `client-beta=${clientBeta.length}, `
+          + `capability-beta=${resolveCapabilityBetaTokens({ ...capability, url: targetUrl, body: forwardBody }).join('|') || 'none'}`,
+        );
         try {
           await relayAnthropicMessages(res, targetUrl, forwardBody, apiKey, false, {
-            inboundBeta,
             authType: routeAuthType,
             log: message => plog(message),
             extraHeaders: route.headers,
+            capability,
             refreshToken: route.refreshToken,
             onTokenRefreshed: refreshed => { route.apiKey = refreshed; },
             signal: clientAbort.signal,
@@ -542,34 +556,33 @@ export async function startProxyCatalog(
       // Forward raw Anthropic body (with real model id) directly to the upstream.
       // No translation needed — the upstream speaks Anthropic natively.
       if (route.modelFormat === 'anthropic') {
-        const betaHeaderRaw = req.headers['anthropic-beta'];
-        const inboundBeta = Array.isArray(betaHeaderRaw) ? betaHeaderRaw.join(',') : betaHeaderRaw;
         const forwardBody = { ...anthropicBody, model: route.realModelId };
         const targetUrl = `${upstreamUrl}/v1/messages`;
-        const isOAuth = routeAuthType === 'oauth';
-
-        let effectiveBeta = inboundBeta;
-        let claudeCodeSessionId: string | undefined;
-        if (isOAuth) {
-          // Identity injection and beta selection for Claude Code OAuth.
-          const seed = route.providerId ?? route.realModelId;
-          const identity = injectClaudeIdentity(forwardBody, route.providerData, seed);
-          if (route.providerId === 'claude-code') injectClaudeCodeBillingSystemLine(forwardBody);
-          claudeCodeSessionId = identity.sessionId;
-          effectiveBeta = selectBetaFlags(forwardBody, route.realModelId, inboundBeta);
-          plog(() => `anthropic-oauth: model=${route.realModelId}, beta=${effectiveBeta}`);
-          plog(() => `anthropic-oauth headers: user-agent=claude-cli/${CLAUDE_CODE_CLI_VERSION} x-app=cli session-header=${claudeCodeSessionId ? 'set' : 'missing'}`);
-        } else {
-          plog(() => `anthropic-passthrough: model=${route.realModelId}, stream=${clientWantsStream}`);
-        }
+        // The request body is forwarded as the client wrote it: no metadata
+        // user identity and no billing system line. Both asserted a native
+        // Claude lineage that no supported clodex producer can establish, and
+        // the route's provider id or auth type is a label, not proof of one.
+        const clientBeta = normalizeBetaTokens(req.headers['anthropic-beta']);
+        const suppression = resolveNativeIdentitySuppression(upstreamUrl);
+        const capability = {
+          clientBeta,
+          requestedModelId: typeof originalModel === 'string' ? originalModel : undefined,
+          advertisedModelId: route.aliasId,
+          advertisedContextWindow: route.contextWindow,
+        };
+        plog(() =>
+          `anthropic-passthrough: model=${route.realModelId}, stream=${clientWantsStream}, `
+          + `auth=${routeAuthType}, native-identity=suppressed(${suppression.reason}), `
+          + `client-beta=${clientBeta.length}, `
+          + `capability-beta=${resolveCapabilityBetaTokens({ ...capability, url: targetUrl, body: forwardBody }).join('|') || 'none'}`,
+        );
 
         try {
           await relayAnthropicMessages(res, targetUrl, forwardBody, apiKey, clientWantsStream, {
-            inboundBeta: effectiveBeta,
             authType: routeAuthType,
             log: message => plog(message),
-            claudeCodeSessionId,
             extraHeaders: route.headers,
+            capability,
             refreshToken: route.refreshToken,
             onTokenRefreshed: refreshed => { route.apiKey = refreshed; },
             signal: clientAbort.signal,

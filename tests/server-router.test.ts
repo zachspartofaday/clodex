@@ -1787,3 +1787,331 @@ describe('anthropic count_tokens', () => {
     expect(response.status).toBe(401);
   });
 });
+
+describe('endpoint-mode Anthropic beta and identity are negative-only', () => {
+  /** Upstream that records the full header map of every request it receives. */
+  async function startHeaderCapturingUpstream(body: unknown): Promise<{
+    baseUrl: string;
+    requests: Array<{ url: string; headers: Record<string, string | string[] | undefined>; body: any }>;
+    close: () => Promise<void>;
+  }> {
+    const requests: Array<{ url: string; headers: Record<string, string | string[] | undefined>; body: any }> = [];
+    const server = createServer(async (req, res) => {
+      requests.push({ url: req.url ?? '', headers: req.headers, body: await readRequestBody(req) });
+      res.writeHead(200, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify(body));
+    });
+    await new Promise<void>(resolve => server.listen(0, '127.0.0.1', resolve));
+    const address = server.address();
+    if (!address || typeof address === 'string') throw new Error('missing upstream address');
+    return {
+      baseUrl: `http://127.0.0.1:${address.port}`,
+      requests,
+      close: () => new Promise<void>((resolve, reject) =>
+        server.close(err => (err ? reject(err) : resolve()))),
+    };
+  }
+
+  function expectNoNativeIdentity(headers: Record<string, string | string[] | undefined>): void {
+    for (const name of ['x-app', 'x-claude-code-session-id']) {
+      expect(headers[name]).toBeUndefined();
+    }
+    // The HTTP client's own UA is expected; a simulated native-client UA is not.
+    expect(String(headers['user-agent'] ?? '')).not.toContain('claude');
+  }
+
+  it.each([
+    ['/anthropic/v1/messages', '/v1/messages'],
+    ['/anthropic/v1/messages/count_tokens', '/v1/messages/count_tokens'],
+  ])('drops the client beta and synthesizes nothing on %s', async (endpoint, upstreamPath) => {
+    const upstream = await startHeaderCapturingUpstream({
+      id: 'msg-negative', type: 'message', role: 'assistant',
+      model: 'claude-oauth', content: [], input_tokens: 3,
+    });
+    handles.push(upstream);
+    vi.mocked(resolveProviderCredential).mockResolvedValue('current-oauth-token');
+    const server = await startTestServer({
+      catalog: createGatewayModelCatalog([{
+        ...model('claude-oauth', 'anthropic', 'oauth-provider', { baseUrl: upstream.baseUrl }),
+        // Every tempting label, at the endpoint boundary this time.
+        providerId: 'claude-code',
+        authType: 'oauth',
+        authRef: TEST_HELPER_REF,
+        apiKey: 'launch-token',
+        providerData: { cliUserID: 'a'.repeat(64), nativeClaude: true },
+      }]),
+    });
+
+    const response = await fetch(`${server.url}${endpoint}`, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        'anthropic-beta': 'client-alpha,client-beta',
+      },
+      body: JSON.stringify({
+        model: 'claude-oauth',
+        system: 'You are helpful.',
+        messages: [{ role: 'user', content: 'hi' }],
+      }),
+    });
+
+    expect(response.status).toBe(200);
+    const sent = upstream.requests[0]!;
+    // Destination and count routing conserved.
+    expect(sent.url).toBe(upstreamPath);
+    expect(sent.headers.authorization).toBe('Bearer current-oauth-token');
+    expect(sent.headers['x-api-key']).toBeUndefined();
+    // Negative: no client beta, no synthesized identity, verbatim body.
+    expect(sent.headers['anthropic-beta']).toBeUndefined();
+    expectNoNativeIdentity(sent.headers);
+    expect(sent.body.system).toBe('You are helpful.');
+    expect(sent.body).not.toHaveProperty('metadata');
+    expect(JSON.stringify(sent.body)).not.toContain('x-anthropic-billing-header');
+  });
+
+  it('emits the configured beta and echoes the requested model on the endpoint path', async () => {
+    const upstream = await startHeaderCapturingUpstream({
+      id: 'msg-cfg', type: 'message', role: 'assistant',
+      model: 'upstream-real-id', content: [],
+    });
+    handles.push(upstream);
+    const server = await startTestServer({
+      catalog: createGatewayModelCatalog([{
+        ...model('claude-cfg', 'anthropic', 'zen', { baseUrl: upstream.baseUrl }),
+        upstreamModelId: 'upstream-real-id',
+        headers: { 'Anthropic-Beta': 'cfg-a, cfg-b', 'anthropic-beta': 'cfg-b', 'X-Plan': 'coding' },
+      }]),
+    });
+
+    const response = await fetch(`${server.url}/anthropic/v1/messages`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', 'anthropic-beta': 'client-alpha' },
+      body: JSON.stringify({ model: 'claude-cfg', messages: [{ role: 'user', content: 'hi' }] }),
+    });
+
+    expect(response.status).toBe(200);
+    const sent = upstream.requests[0]!;
+    expect(sent.headers['anthropic-beta']).toBe('cfg-a,cfg-b');
+    expect(sent.headers['x-plan']).toBe('coding');
+    expectNoNativeIdentity(sent.headers);
+    // Response-model echo conserved: the client sees the id it asked for.
+    expect((await response.json() as { model: string }).model).toBe('claude-cfg');
+    expect(sent.body.model).toBe('upstream-real-id');
+  });
+
+  // ── Capability betas: earned per request, never allowlisted ──────────────
+  const ONE_M_BETA = 'context-1m-2025-08-07';
+  const TOOL_SEARCH_FIRST_PARTY = 'advanced-tool-use-2025-11-20';
+  const TOOL_SEARCH_GATEWAY = 'tool-search-tool-2025-10-19';
+  const TOOL_SEARCH_TOOLS = [
+    { type: 'tool_search_tool_regex_20251119', name: 'tool_search_tool_regex' },
+  ];
+
+  it.each([
+    ['/anthropic/v1/messages', '/v1/messages'],
+    ['/anthropic/v1/messages/count_tokens', '/v1/messages/count_tokens'],
+  ])('carries the earned [1m] and tool-search betas on %s', async (endpoint, upstreamPath) => {
+    const upstream = await startHeaderCapturingUpstream({
+      id: 'msg-cap', type: 'message', role: 'assistant',
+      model: 'claude-cap', content: [], input_tokens: 3,
+    });
+    handles.push(upstream);
+    const server = await startTestServer({
+      catalog: createGatewayModelCatalog([{
+        ...model('claude-cap[1m]', 'anthropic', 'zen', { baseUrl: upstream.baseUrl }),
+        contextWindow: 1_000_000,
+      }]),
+    });
+
+    const response = await fetch(`${server.url}${endpoint}`, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        'anthropic-beta': `${ONE_M_BETA},${TOOL_SEARCH_FIRST_PARTY},client-alpha`,
+      },
+      body: JSON.stringify({
+        model: 'claude-cap[1m]',
+        messages: [{ role: 'user', content: 'hi' }],
+        tools: TOOL_SEARCH_TOOLS,
+      }),
+    });
+
+    expect(response.status).toBe(200);
+    const sent = upstream.requests[0]!;
+    expect(sent.url).toBe(upstreamPath);
+    expect(sent.headers['anthropic-beta'])
+      .toBe(`${ONE_M_BETA},${TOOL_SEARCH_FIRST_PARTY}`);
+    // The arbitrary token riding alongside is still refused, and nothing else
+    // about the negative-only contract changed.
+    expect(String(sent.headers['anthropic-beta'])).not.toContain('client-alpha');
+    expectNoNativeIdentity(sent.headers);
+    // The wire model still drops the [1m] surface marker.
+    expect(sent.body.model).toBe('claude-cap');
+  });
+
+  it.each([
+    // Setup adapted (was `undefined`): with no configured window this id
+    // resolves to 1M through the same heuristic the advertisement surface uses,
+    // so the route DID advertise 1M and the old fixture only refused because
+    // the predicate resolved the window differently than advertisement did. An
+    // explicit 200K makes the label true again and keeps the property — the
+    // window decides, not the `[1m]` spelling. The admitted direction is
+    // covered by "carries the earned [1m] beta from the advertised id alone".
+    ['the route does not advertise 1M', 'claude-cap[1m]', 200_000],
+    ['the request is not on the [1m] surface', 'claude-cap', 1_000_000],
+  ])('refuses the [1m] beta when %s', async (_label, modelId, contextWindow) => {
+    const upstream = await startHeaderCapturingUpstream({
+      id: 'msg-neg', type: 'message', role: 'assistant', model: modelId, content: [],
+    });
+    handles.push(upstream);
+    const server = await startTestServer({
+      catalog: createGatewayModelCatalog([{
+        ...model(modelId, 'anthropic', 'zen', { baseUrl: upstream.baseUrl }),
+        ...(contextWindow === undefined ? {} : { contextWindow }),
+      }]),
+    });
+
+    const response = await fetch(`${server.url}/anthropic/v1/messages`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', 'anthropic-beta': ONE_M_BETA },
+      body: JSON.stringify({ model: modelId, messages: [{ role: 'user', content: 'hi' }] }),
+    });
+
+    expect(response.status).toBe(200);
+    expect(upstream.requests[0]!.headers['anthropic-beta']).toBeUndefined();
+  });
+
+  it('carries the earned [1m] beta from the advertised id alone', async () => {
+    // No configured context window: the id is the only evidence, and the
+    // predicate must read it exactly as the advertisement surface does.
+    const upstream = await startHeaderCapturingUpstream({
+      id: 'msg-idonly', type: 'message', role: 'assistant', model: 'claude-idonly', content: [],
+    });
+    handles.push(upstream);
+    const server = await startTestServer({
+      catalog: createGatewayModelCatalog([
+        model('claude-idonly[1m]', 'anthropic', 'zen', { baseUrl: upstream.baseUrl }),
+      ]),
+    });
+
+    const response = await fetch(`${server.url}/anthropic/v1/messages`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', 'anthropic-beta': ONE_M_BETA },
+      body: JSON.stringify({ model: 'claude-idonly[1m]', messages: [{ role: 'user', content: 'hi' }] }),
+    });
+
+    expect(response.status).toBe(200);
+    expect(upstream.requests[0]!.headers['anthropic-beta']).toBe(ONE_M_BETA);
+  });
+
+  it('refuses both tool-search betas for an ordinary tool request', async () => {
+    const upstream = await startHeaderCapturingUpstream({
+      id: 'msg-ord', type: 'message', role: 'assistant', model: 'claude-ord', content: [],
+    });
+    handles.push(upstream);
+    const server = await startTestServer({
+      catalog: createGatewayModelCatalog([
+        model('claude-ord', 'anthropic', 'zen', { baseUrl: upstream.baseUrl }),
+      ]),
+    });
+
+    const response = await fetch(`${server.url}/anthropic/v1/messages`, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        'anthropic-beta': `${TOOL_SEARCH_FIRST_PARTY},${TOOL_SEARCH_GATEWAY}`,
+      },
+      body: JSON.stringify({
+        model: 'claude-ord',
+        messages: [{ role: 'user', content: 'hi' }],
+        tools: [{ name: 'Read', description: 'read', input_schema: { type: 'object' } }],
+      }),
+    });
+
+    expect(response.status).toBe(200);
+    expect(upstream.requests[0]!.headers['anthropic-beta']).toBeUndefined();
+  });
+
+  it('unions the configured beta with the earned capability, configured first', async () => {
+    const upstream = await startHeaderCapturingUpstream({
+      id: 'msg-union', type: 'message', role: 'assistant', model: 'claude-union', content: [],
+    });
+    handles.push(upstream);
+    const server = await startTestServer({
+      catalog: createGatewayModelCatalog([{
+        ...model('claude-union[1m]', 'anthropic', 'zen', { baseUrl: upstream.baseUrl }),
+        contextWindow: 1_000_000,
+        headers: { 'Anthropic-Beta': 'cfg-a, cfg-b', 'X-Plan': 'coding' },
+      }]),
+    });
+
+    const response = await fetch(`${server.url}/anthropic/v1/messages`, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        'anthropic-beta': `${ONE_M_BETA},client-alpha`,
+      },
+      body: JSON.stringify({
+        model: 'claude-union[1m]',
+        messages: [{ role: 'user', content: 'hi' }],
+      }),
+    });
+
+    expect(response.status).toBe(200);
+    const sent = upstream.requests[0]!;
+    expect(sent.headers['anthropic-beta']).toBe(`cfg-a,cfg-b,${ONE_M_BETA}`);
+    expect(sent.headers['x-plan']).toBe('coding');
+  });
+
+  it('keeps direct OpenAI chat completions negative', async () => {
+    const upstream = await startHeaderCapturingUpstream({
+      id: 'chatcmpl-negative',
+      choices: [{ message: { content: 'ok' }, finish_reason: 'stop' }],
+    });
+    handles.push(upstream);
+    const server = await startTestServer({
+      catalog: createGatewayModelCatalog([
+        model('openai-direct', 'openai', 'go', {
+          completionsUrl: `${upstream.baseUrl}/v1/chat/completions`,
+        }),
+      ]),
+    });
+
+    const response = await fetch(`${server.url}/openai/v1/chat/completions`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', 'anthropic-beta': 'client-alpha' },
+      body: JSON.stringify({ model: 'openai-direct', messages: [{ role: 'user', content: 'hi' }] }),
+    });
+
+    expect(response.status).toBe(200);
+    const sent = upstream.requests[0]!;
+    expect(sent.headers['anthropic-beta']).toBeUndefined();
+    expectNoNativeIdentity(sent.headers);
+  });
+
+  it('never wires providerData into SDK creation for an OpenAI-ingress Anthropic model', async () => {
+    vi.mocked(resolveProviderCredential).mockResolvedValue('current-oauth-token');
+    const server = await startTestServer({
+      catalog: createGatewayModelCatalog([{
+        ...model('claude-sdk', 'anthropic', 'oauth-provider', { baseUrl: 'https://api.anthropic.com' }),
+        npm: '@ai-sdk/anthropic',
+        providerId: 'claude-code',
+        authType: 'oauth',
+        authRef: TEST_HELPER_REF,
+        providerData: { cliUserID: 'a'.repeat(64), nativeClaude: true },
+      }]),
+    });
+
+    await fetch(`${server.url}/openai/v1/chat/completions`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ model: 'claude-sdk', messages: [{ role: 'user', content: 'hi' }] }),
+    });
+
+    for (const [spec] of vi.mocked(createLanguageModel).mock.calls) {
+      expect(spec).not.toHaveProperty('providerData');
+      expect(JSON.stringify(spec)).not.toContain('cliUserID');
+      expect(JSON.stringify(spec)).not.toContain('nativeClaude');
+    }
+  });
+});
