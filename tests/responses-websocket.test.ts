@@ -1861,6 +1861,44 @@ describe('createResponsesWebSocketFetch', () => {
     await readAll(second);
   });
 
+  it('continues when non-PDF Read.pages was sanitized from the echoed arguments', async () => {
+    const input = [{ role: 'user', content: [{ type: 'input_text', text: 'read it back' }] }];
+    const wsFetch = createResponsesWebSocketFetch(WS_URL, undefined, { accountId: 'acct-read-pages' });
+    const first = await wsFetch('https://x', {
+      method: 'POST', headers: {}, body: JSON.stringify(sessionPayload(input)),
+    });
+    const socket = lastSocket();
+    socket.emit('open');
+    socket.emit('message', Buffer.from(JSON.stringify({
+      type: 'response.created', response: { id: 'resp_pages' },
+    })));
+    socket.emit('message', Buffer.from(JSON.stringify({
+      type: 'response.output_item.done', output_index: 0,
+      item: {
+        type: 'function_call', call_id: 'call_p', name: 'Read',
+        arguments: '{"file_path":"file.ts","pages":"1"}',
+      },
+    })));
+    socket.emit('message', Buffer.from(JSON.stringify({
+      type: 'response.completed', response: { id: 'resp_pages' },
+    })));
+    await readAll(first);
+
+    const echoedCall = {
+      type: 'function_call', call_id: 'call_p', name: 'Read',
+      arguments: '{"file_path":"file.ts"}',
+    };
+    const toolOutput = { type: 'function_call_output', call_id: 'call_p', output: 'contents' };
+    const second = await wsFetch('https://x', {
+      method: 'POST', headers: {}, body: JSON.stringify(sessionPayload([...input, echoedCall, toolOutput])),
+    });
+    const sent = JSON.parse(socket.send.mock.calls[1]![0] as string);
+    expect(sent.previous_response_id).toBe('resp_pages');
+    expect(sent.input).toEqual([toolOutput]);
+    emitTextResponse(socket, 'resp_pages_done', 'done');
+    await readAll(second);
+  });
+
   it('continues when a non-required empty array was sanitized from the echoed arguments', async () => {
     const tools = [{
       type: 'function', name: 'WebSearch',
@@ -2649,6 +2687,26 @@ describe('createResponsesWebSocketFetch', () => {
     } finally {
       release();
     }
+  });
+
+  it('warns when Read.pages filler differs for a known non-PDF path', async () => {
+    const { stderr, diagnostics } = await runToolArgumentMismatch({
+      accountId: 'acct-tool-gap-read-pages',
+      responseId: 'resp_tool_gap_read_pages',
+      upstreamCall: {
+        type: 'function_call', id: 'fc_read', call_id: 'call_read', name: 'Read',
+        arguments: '{"file_path":"/repo/file.swift"}', status: 'completed',
+      },
+      echoedCall: {
+        type: 'function_call', call_id: 'call_read', name: 'Read',
+        arguments: '{"file_path":"/repo/file.swift","pages":"1-3"}',
+      },
+    });
+
+    expect(stderr.join('')).toContain('filler-strip rule is applied');
+    expect(stderr.join('')).toContain('Read');
+    expect(firstHeadMismatch(diagnostics))
+      .toMatchObject({ toolArgumentNormalizationGap: { tool: 'Read', equalAfterStrip: true } });
   });
 
   it('reports a repeated tool-argument gap once rather than on every turn', async () => {
