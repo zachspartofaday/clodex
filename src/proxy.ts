@@ -67,6 +67,7 @@ import { resolveContextWindow } from './context-window.js';
 import { listenTcpServer } from './listener-ready.js';
 import type { ModelRuntimeCompatibility } from './model-runtime-compatibility.js';
 import type { EffortProfile, UnsupportedEffortPolicy } from './effort-policy.js';
+import type { AnthropicAuthMode } from './anthropic-auth-mode.js';
 
 type ProxyLog = (message: string | (() => string)) => void;
 
@@ -269,6 +270,8 @@ export interface ProxyRoute {
   preferWebSockets?: boolean;
   /** Provider-neutral per-model wire quirks. */
   compatibility?: ModelRuntimeCompatibility;
+  /** Positive provenance for a non-default Anthropic upstream auth envelope. */
+  anthropicAuthMode?: AnthropicAuthMode;
   /** Runtime-only: the reviewed effort levels this model can actually run. */
   effortProfile?: EffortProfile;
   /** Static headers sent on every upstream request (e.g. a plan/auth-tracking header a custom endpoint requires). */
@@ -550,6 +553,7 @@ export async function startProxyCatalog(
         try {
           await relayAnthropicMessages(res, targetUrl, forwardBody, apiKey, false, {
             authType: routeAuthType,
+            anthropicAuthMode: route.anthropicAuthMode,
             log: message => plog(message),
             extraHeaders: route.headers,
             capability,
@@ -599,6 +603,7 @@ export async function startProxyCatalog(
         try {
           await relayAnthropicMessages(res, targetUrl, forwardBody, apiKey, clientWantsStream, {
             authType: routeAuthType,
+            anthropicAuthMode: route.anthropicAuthMode,
             log: message => plog(message),
             extraHeaders: route.headers,
             capability,

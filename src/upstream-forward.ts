@@ -11,6 +11,10 @@ import {
   type AnthropicCapabilityRouteFacts,
 } from './anthropic-beta-policy.js';
 import { isCredentialBearingHeader } from './credential-headers.js';
+import {
+  ANTHROPIC_X_API_KEY_ONLY_AUTH_MODE,
+  type AnthropicAuthMode,
+} from './anthropic-auth-mode.js';
 
 /**
  * Build the headers for a routed Anthropic-format upstream request.
@@ -37,6 +41,7 @@ export function anthropicUpstreamHeaders(
   authType?: 'api' | 'oauth' | 'none',
   extraHeaders?: Record<string, string>,
   capability?: AnthropicCapabilityRequest,
+  anthropicAuthMode?: AnthropicAuthMode,
 ): Record<string, string> {
   const key = sanitizeCredential(apiKey) ?? apiKey.trim();
   const resolvedAuthType = authType ?? 'api';
@@ -57,12 +62,16 @@ export function anthropicUpstreamHeaders(
     ...forwardedExtraHeaders,
     'Content-Type': 'application/json',
     'anthropic-version': '2023-06-01',
+    // Anonymous sends no credential; OAuth is bearer-only; an API key defaults
+    // to the historical dual envelope, and drops the redundant Authorization
+    // copy only for a route whose template PROVED an x-api-key-only contract.
     ...(resolvedAuthType === 'none'
       ? {}
-      : {
-          Authorization: `Bearer ${key}`,
-          ...(isOAuth ? {} : { 'x-api-key': key }),
-        }),
+      : isOAuth
+        ? { Authorization: `Bearer ${key}` }
+        : anthropicAuthMode === ANTHROPIC_X_API_KEY_ONLY_AUTH_MODE
+          ? { 'x-api-key': key }
+          : { Authorization: `Bearer ${key}`, 'x-api-key': key }),
     ...(stream ? { Accept: 'text/event-stream' } : {}),
   };
   if (outboundBeta.source !== 'none') {
@@ -126,6 +135,8 @@ export async function fetchWithOAuthRetry<TResponse extends {
 /** Relay an Anthropic /v1/messages response (JSON or SSE) to the client. */
 export interface RelayAnthropicOptions {
   authType?: 'api' | 'oauth' | 'none';
+  /** Positive provenance for a non-default Anthropic upstream auth envelope. */
+  anthropicAuthMode?: AnthropicAuthMode;
   log?: (message: string) => void;
   /**
    * The provider's configured static headers. Explicit operator authority, and
@@ -248,6 +259,7 @@ export async function relayAnthropicMessages(
       options.capability
         ? { ...options.capability, url: messagesUrl, body }
         : undefined,
+      options.anthropicAuthMode,
     ),
     body: JSON.stringify(body),
     signal: options.signal,

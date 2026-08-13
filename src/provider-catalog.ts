@@ -404,6 +404,7 @@ export function localProvidersToServerModels(localProviders: LocalProvider[]): S
       useResponsesLite: model.useResponsesLite,
       preferWebSockets: model.preferWebSockets,
       compatibility: model.compatibility,
+      anthropicAuthMode: model.anthropicAuthMode,
       effortProfile: model.effortProfile,
       headers: provider.headers,
       providerData: provider.providerData,

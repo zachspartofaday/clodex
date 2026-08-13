@@ -8,6 +8,7 @@ import type { FreeStatus } from '../free-models.js';
 import type { ModelAlias } from '../types.js';
 import type { EffortProfile } from '../effort-policy.js';
 import type { ModelRuntimeCompatibility } from '../model-runtime-compatibility.js';
+import type { AnthropicAuthMode } from '../anthropic-auth-mode.js';
 
 export interface GatewayModelOptions {
   maskGatewayIds?: boolean;
@@ -50,6 +51,8 @@ export interface ServerModelInfo {
   preferWebSockets?: boolean;
   /** Provider-neutral per-model wire quirks. */
   compatibility?: ModelRuntimeCompatibility;
+  /** Positive provenance for a non-default Anthropic upstream auth envelope. */
+  anthropicAuthMode?: AnthropicAuthMode;
   /** Runtime-only: the reviewed effort levels this model can actually run. */
   effortProfile?: EffortProfile;
   /** Fallback reasoning effort when the client omits output_config.effort. */

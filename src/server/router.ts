@@ -378,6 +378,7 @@ async function handleAnthropicMessages(
     );
     await relayAnthropicMessages(res, messagesUrl, forwardBody, apiKey, clientWantsStream, {
       authType,
+      anthropicAuthMode: model.anthropicAuthMode,
       log: message => plog(message),
       extraHeaders: model.headers,
       capability,
@@ -663,6 +664,7 @@ async function handleAnthropicCountTokens(
   );
   await relayAnthropicMessages(res, countTokensUrl, forwardBody, apiKey, false, {
     authType,
+    anthropicAuthMode: model.anthropicAuthMode,
     log: message => plog(message),
     extraHeaders: model.headers,
     capability,

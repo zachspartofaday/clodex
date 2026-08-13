@@ -11,6 +11,7 @@ import {
   classifyAnthropicDestination,
   resolveNativeIdentitySuppression,
 } from '../src/anthropic-beta-policy.js';
+import { cachedModelToLocal } from '../src/registry/materialize.js';
 import * as env from '../src/env.js';
 import { modelAliasTarget } from '../src/model-aliases.js';
 import type { ModelInfo } from '../src/types.js';
@@ -369,6 +370,40 @@ describe('localModelToRoute', () => {
       aliasId: 'anthropic-openai__gpt-5.5-fast[1m]',
       realModelId: 'gpt-5.5',
     });
+  });
+
+  it('carries Anthropic auth-mode provenance from the registry through to the route', () => {
+    const cached = {
+      id: 'claude-sonnet-4-5',
+      name: 'Claude Sonnet 4.5',
+      family: 'claude',
+      brand: 'Claude',
+      modelFormat: 'anthropic' as const,
+      npm: '@ai-sdk/anthropic',
+    };
+    const registryProvider = (templateId: string) => ({
+      id: 'gateway',
+      name: 'Gateway',
+      templateId,
+      api: { npm: '@ai-sdk/anthropic', url: 'https://gateway.example/v1' },
+      models: [cached],
+    });
+
+    const anthropicModel = cachedModelToLocal(cached as never, registryProvider('custom-anthropic') as never);
+    expect(anthropicModel?.anthropicAuthMode).toBe('x-api-key-only');
+    const openaiModel = cachedModelToLocal(cached as never, registryProvider('custom-openai') as never);
+    expect(openaiModel?.anthropicAuthMode).toBeUndefined();
+
+    const provider: LocalProvider = {
+      id: 'gateway',
+      name: 'Gateway',
+      apiKey: 'gateway-key',
+      models: [anthropicModel!],
+    };
+    expect(localModelToRoute(provider, anthropicModel!)?.anthropicAuthMode).toBe('x-api-key-only');
+    expect(
+      localModelToRoute({ ...provider, models: [openaiModel!] }, openaiModel!)?.anthropicAuthMode,
+    ).toBeUndefined();
   });
 
   it('preserves OAuth provider data and exact credential references for catalog routes', async () => {

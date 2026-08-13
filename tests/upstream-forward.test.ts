@@ -8,6 +8,10 @@ import {
   relayAnthropicMessages,
 } from '../src/upstream-forward.js';
 import {
+  ANTHROPIC_X_API_KEY_ONLY_AUTH_MODE,
+  resolveAnthropicAuthMode,
+} from '../src/anthropic-auth-mode.js';
+import {
   CONTEXT_1M_BETA,
   TOOL_SEARCH_BETAS,
   classifyAnthropicCapabilityEndpoint,
@@ -70,6 +74,60 @@ describe('anthropicUpstreamHeaders', () => {
       'x-api-key': 'secret-key',
       'anthropic-version': '2023-06-01',
     });
+  });
+
+  it('applies x-api-key-only mode to API keys without changing OAuth or anonymous auth', () => {
+    const apiHeaders = anthropicUpstreamHeaders(
+      'secret-key', false, 'api', undefined, undefined, ANTHROPIC_X_API_KEY_ONLY_AUTH_MODE,
+    );
+    expect(apiHeaders['x-api-key']).toBe('secret-key');
+    expect(apiHeaders).not.toHaveProperty('Authorization');
+
+    const oauthHeaders = anthropicUpstreamHeaders(
+      'oauth-token', false, 'oauth', undefined, undefined, ANTHROPIC_X_API_KEY_ONLY_AUTH_MODE,
+    );
+    expect(oauthHeaders.Authorization).toBe('Bearer oauth-token');
+    expect(oauthHeaders).not.toHaveProperty('x-api-key');
+
+    const anonymousHeaders = anthropicUpstreamHeaders(
+      '', false, 'none', undefined, undefined, ANTHROPIC_X_API_KEY_ONLY_AUTH_MODE,
+    );
+    expect(anonymousHeaders).not.toHaveProperty('Authorization');
+    expect(anonymousHeaders).not.toHaveProperty('x-api-key');
+
+    // Absence of the mode preserves the historical dual envelope exactly.
+    expect(anthropicUpstreamHeaders('secret-key', false, 'api')).toMatchObject({
+      Authorization: 'Bearer secret-key',
+      'x-api-key': 'secret-key',
+    });
+  });
+
+  it('keeps the route credential authoritative under x-api-key-only mode', () => {
+    // A configured credential spelling is still route-owned and dropped; the
+    // narrowed envelope must not become a way to inject one.
+    const headers = anthropicUpstreamHeaders(
+      'route-key',
+      false,
+      'api',
+      { Authorization: 'Bearer configured-token', 'X-Api-Key': 'configured-key', 'X-Plan': 'coding' },
+      undefined,
+      ANTHROPIC_X_API_KEY_ONLY_AUTH_MODE,
+    );
+    expect(headers['x-api-key']).toBe('route-key');
+    expect(headers).not.toHaveProperty('Authorization');
+    expect(headers).not.toHaveProperty('X-Api-Key');
+    expect(headers['X-Plan']).toBe('coding');
+    expect(JSON.stringify(headers)).not.toContain('configured-token');
+    expect(JSON.stringify(headers)).not.toContain('configured-key');
+  });
+
+  it('derives x-api-key-only from Anthropic template provenance only', () => {
+    for (const templateId of ['custom-anthropic', 'anthropic']) {
+      expect(resolveAnthropicAuthMode({ templateId })).toBe(ANTHROPIC_X_API_KEY_ONLY_AUTH_MODE);
+    }
+    for (const templateId of ['custom-openai', 'openai', 'opencode-go', 'meta-ai', 'openai-oauth']) {
+      expect(resolveAnthropicAuthMode({ templateId })).toBeUndefined();
+    }
   });
 
   it('adds stream accept header when requested', () => {

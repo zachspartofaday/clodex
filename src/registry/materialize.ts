@@ -17,6 +17,7 @@ import {
 import { classifyFreeStatus, isFreeStatus } from '../free-models.js';
 import { openCodeGoEffortProfile } from '../data/opencode-go-effort-profiles.js';
 import { OAUTH_ACCOUNT_ENV } from '../oauth-account-selection.js';
+import { resolveAnthropicAuthMode } from '../anthropic-auth-mode.js';
 
 export { OAUTH_ACCOUNT_ENV } from '../oauth-account-selection.js';
 
@@ -119,6 +120,7 @@ export function cachedModelToLocal(
     preferWebSockets: cached.preferWebSockets,
     modalities: cached.modalities,
     compatibility: cached.compatibility,
+    anthropicAuthMode: resolveAnthropicAuthMode(provider),
     // Attached from the generated authority by retained IDENTITY, after the
     // template projection above has already decided which rows this provider
     // really owns. Deriving it from the persisted cache row instead would let a

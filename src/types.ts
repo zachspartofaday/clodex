@@ -3,6 +3,7 @@
 import type { FreeStatus } from './free-models.js';
 import type { EffortProfile, UnsupportedEffortPolicy } from './effort-policy.js';
 import type { ModelRuntimeCompatibility } from './model-runtime-compatibility.js';
+import type { AnthropicAuthMode } from './anthropic-auth-mode.js';
 
 export type ModelFormat = 'anthropic' | 'openai' | 'unsupported';
 
@@ -48,6 +49,12 @@ export interface LocalProviderModel {
   modalities?: ('text' | 'image')[];
   /** Provider-neutral per-model wire quirks. */
   compatibility?: ModelRuntimeCompatibility;
+  /**
+   * Positive provenance for a non-default Anthropic upstream auth envelope.
+   * Read only on the Anthropic-passthrough path; absence keeps every other
+   * consumer's outbound headers byte-identical.
+   */
+  anthropicAuthMode?: AnthropicAuthMode;
   /**
    * Runtime-only: the reviewed effort levels this model can actually run.
    * Attached from the generated authority after retained-identity projection,
