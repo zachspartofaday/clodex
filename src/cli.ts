@@ -729,6 +729,55 @@ interface FavoritesCommandOptions {
   effortPolicy?: UnsupportedEffortPolicy;
 }
 
+const effortPolicyOptions: Array<{
+  value: UnsupportedEffortPolicy;
+  label: string;
+  hint: string;
+}> = [
+  {
+    value: 'provider-default',
+    label: 'Provider default',
+    hint: 'omit an unsupported effort and let the provider choose',
+  },
+  {
+    value: 'up',
+    label: 'Round up',
+    hint: 'use the nearest supported effort above the request',
+  },
+  {
+    value: 'down',
+    label: 'Round down',
+    hint: 'use the nearest supported effort below the request',
+  },
+  {
+    value: 'exact',
+    label: 'Exact only',
+    hint: 'reject requests whose effort is unsupported',
+  },
+];
+
+function effortPolicyLabel(policy: UnsupportedEffortPolicy): string {
+  return effortPolicyOptions.find(option => option.value === policy)?.label ?? policy;
+}
+
+/**
+ * Interactive equivalent of `clodex models --effort-policy <mode>`. Writes only
+ * on a real change, because the policy is a startup snapshot: a no-op rewrite
+ * would still print a restart notice that nothing needs.
+ */
+async function runEffortPolicyConfigurator(): Promise<void> {
+  const current = loadPreferences().effortPolicy ?? DEFAULT_UNSUPPORTED_EFFORT_POLICY;
+  const selected = await p.select<UnsupportedEffortPolicy>({
+    message: 'Unsupported worker effort policy',
+    options: effortPolicyOptions,
+    initialValue: current,
+  });
+  if (p.isCancel(selected) || selected === current) return;
+  savePreferences({ effortPolicy: selected });
+  p.log.success(`Global unsupported-effort policy changed to ${effortPolicyLabel(selected)}.`);
+  p.log.info('Running clodex processes keep their startup policy snapshot; restart them to apply this change.');
+}
+
 /**
  * Interactive alias configurator inside `clodex models`: list saved aliases,
  * re-point one at a different favorite, add, or remove — the picker
@@ -1075,6 +1124,12 @@ export async function runModelsCommand(opts: FavoritesCommandOptions = {}): Prom
         ? 'Remove a favorite first to make room'
         : `${allProviders.length} provider${allProviders.length !== 1 ? 's' : ''} available`,
     });
+    const currentEffortPolicy = loadPreferences().effortPolicy ?? DEFAULT_UNSUPPORTED_EFFORT_POLICY;
+    options.push({
+      value: '__effort_policy__',
+      label: `Unsupported effort policy: ${effortPolicyLabel(currentEffortPolicy)}`,
+      hint: 'global policy for unsupported worker-assigned effort',
+    });
     const aliasCount = (loadPreferences().modelAliases ?? []).length;
     options.push({
       value: '__aliases__',
@@ -1094,6 +1149,11 @@ export async function runModelsCommand(opts: FavoritesCommandOptions = {}): Prom
     });
 
     if (p.isCancel(choice) || choice === '__done__') break;
+
+    if (choice === '__effort_policy__') {
+      await runEffortPolicyConfigurator();
+      continue;
+    }
 
     if (choice === '__aliases__') {
       if (favoritesDirty) {
