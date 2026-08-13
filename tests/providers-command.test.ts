@@ -1015,13 +1015,13 @@ describe('providers add menu', () => {
     vi.restoreAllMocks();
   });
 
-  it('offers ChatGPT OAuth followed by OpenAI and OpenCode Go API keys', async () => {
+  it('offers ChatGPT OAuth followed by the API-key templates in name order', async () => {
     selectMock.mockResolvedValue('noop');
 
     await runProvidersAdd();
 
     const options = selectMock.mock.calls[0]?.[0].options.map((option: { value: string }) => option.value);
-    expect(options).toEqual(['oauth', 'api:openai', 'api:opencode-go']);
+    expect(options).toEqual(['oauth', 'api:meta-ai', 'api:openai', 'api:opencode-go']);
   });
 
   it('adds OpenCode Go through the shared API-key flow', async () => {
@@ -1058,7 +1058,7 @@ describe('providers add menu', () => {
     await expect(runProvidersAdd()).resolves.toBe(0);
 
     const options = selectMock.mock.calls[0]?.[0].options.map((option: { value: string }) => option.value);
-    expect(options).toEqual(['oauth', 'api:openai']);
+    expect(options).toEqual(['oauth', 'api:meta-ai', 'api:openai']);
     expect(passwordMock).not.toHaveBeenCalled();
     expect(addTemplateMock).not.toHaveBeenCalled();
   });
@@ -1105,7 +1105,7 @@ describe('providers add menu', () => {
     await expect(runProvidersAdd()).resolves.toBe(0);
 
     const options = selectMock.mock.calls[0]?.[0].options.map((option: { value: string }) => option.value);
-    expect(options).toEqual(['oauth', 'api:openai', 'api:opencode-go']);
+    expect(options).toEqual(['oauth', 'api:meta-ai', 'api:openai', 'api:opencode-go']);
   });
 
   it('reports pending cleanup after an API-key provider is committed', async () => {

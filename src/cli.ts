@@ -369,7 +369,7 @@ export function parseArgs(args: string[]): ParsedArgs {
 
 export function rootHelpText(): string {
   return `${pc.bold('clodex')} v${VERSION}
-Bridge Claude Code to OpenAI and OpenCode Go models.
+Bridge Claude Code to OpenAI, OpenCode Go, and Meta AI models.
 
 ${pc.bold('Usage:')}
   clodex claude [options] [claude-flags]
@@ -440,6 +440,7 @@ ${pc.bold('Providers:')}
   openai         OpenAI API key (platform.openai.com)
   openai-oauth   ChatGPT/Codex plan OAuth — sign in with clodex providers auth openai
   opencode-go    OpenCode Go API key — add with clodex providers add
+  meta-ai        Meta AI Model API key — add with clodex providers add
 
 ${pc.bold('Model switching:')}
   Run clodex models to save favorites (max ${MAX_FAVORITES}; up to ${MAX_MODEL_CATALOG} exposed).
