@@ -199,10 +199,10 @@ const CAPACITY_SKIPPED_FAVORITE = {
   modelId: 'gpt-5.6-sol',
 };
 
-const UNPATCHED_WARNING = 'Claude Code is unpatched: aliases, favorites, context windows/auto-compaction, '
-  + 'and effort metadata are not patched. Repair with `clodex patch`; rollback with `clodex patch --restore`.';
-const STALE_WARNING = 'Claude Code has a stale patch: aliases, favorites, context windows/auto-compaction, '
-  + 'and effort metadata are not patched. Repair with `clodex patch`; rollback with `clodex patch --restore`.';
+const UNPATCHED_WARNING = 'Claude Code\'s clodex patch is not installed, so aliases, favorites, context windows/auto-compaction, '
+  + 'and effort metadata are not patched. Run `clodex patch` to repair or `clodex patch --restore` to roll back.';
+const STALE_WARNING = 'Claude Code\'s clodex patch is stale, so aliases, favorites, context windows/auto-compaction, '
+  + 'and effort metadata are not patched. Run `clodex patch` to repair or `clodex patch --restore` to roll back.';
 
 function saveDroppedCapacityWindow(): void {
   mkdirSync(clodexHome, { recursive: true });
