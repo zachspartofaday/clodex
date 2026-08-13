@@ -1010,9 +1010,11 @@ export async function runPatchCommand(opts: {
 // ── Launch-time check ───────────────────────────────────────────────────────
 
 function describeLaunchPatchDegradation(state: Exclude<PatchState, 'current'>): string {
-  const status = state === 'unpatched' ? 'Claude Code is unpatched' : 'Claude Code has a stale patch';
-  return `${status}: aliases, favorites, context windows/auto-compaction, and effort metadata are not patched. `
-    + 'Repair with `clodex patch`; rollback with `clodex patch --restore`.';
+  return state === 'unpatched'
+    ? 'Claude Code\'s clodex patch is not installed, so aliases, favorites, context windows/auto-compaction, '
+      + 'and effort metadata are not patched. Run `clodex patch` to repair or `clodex patch --restore` to roll back.'
+    : 'Claude Code\'s clodex patch is stale, so aliases, favorites, context windows/auto-compaction, '
+      + 'and effort metadata are not patched. Run `clodex patch` to repair or `clodex patch --restore` to roll back.';
 }
 
 /**
