@@ -39,7 +39,9 @@ capabilities/defaults, and child-command network isolation.
   same enum, so injecting canonical ids made `model: sol` fail with InputValidationError — and
   collapsing same-target names to whichever was saved last made every other name fail the same way.
   Favorites with no alias fall back to their canonical id as the identity (enum + validator +
-  context map only; no resolver case, no picker entry).
+  context map only; no resolver case, no picker entry). Alias lists fail closed when the list shape
+  or a member is malformed, or when one normalized name is claimed more than once within or across
+  entries; no later entry silently replaces the first target.
 - **PATCH 6 (alias resolver switch) maps every alias to ITSELF.** One case per alias, so several
   same-target names each resolve to themselves. Each case must exist — the switch's
   `default:` returns null — but resolving to the canonical id would make Claude Code send one name
