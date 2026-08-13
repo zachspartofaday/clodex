@@ -1334,6 +1334,33 @@ describe('writeAnthropicStream', () => {
     expect(toolInputFromEvents(events)).toEqual({ file_path: '/repo/file.json' });
   });
 
+  it.each([null, undefined])('sanitizes complete buffered Read input when parsed input is %s', async (parsedInput) => {
+    const buffered = { file_path: '/repo/file.json', offset: null, pages: '1' };
+    const { events } = await collect([
+      { type: 'start' },
+      { type: 'tool-input-start', id: 'call_read', toolName: 'Read' },
+      { type: 'tool-input-delta', id: 'call_read', delta: JSON.stringify(buffered) },
+      { type: 'tool-input-end', id: 'call_read' },
+      { type: 'tool-call', toolCallId: 'call_read', toolName: 'Read', input: parsedInput },
+      { type: 'finish', finishReason: 'tool-calls' },
+    ], 'm', undefined, readTools);
+    expect(toolInputFromEvents(events)).toEqual({ file_path: '/repo/file.json' });
+  });
+
+  it('emits malformed buffered JSON bytes exactly once when parsed input is absent', async () => {
+    const partial = '{"file_path":"/repo/file.json","pages":';
+    const { events } = await collect([
+      { type: 'start' },
+      { type: 'tool-input-start', id: 'call_read', toolName: 'Read' },
+      { type: 'tool-input-delta', id: 'call_read', delta: partial },
+      { type: 'tool-input-end', id: 'call_read' },
+      { type: 'finish', finishReason: 'stop' },
+    ], 'm', undefined, readTools);
+    expect(events
+      .filter(e => e.event === 'content_block_delta' && e.data.delta.type === 'input_json_delta')
+      .map(e => e.data.delta.partial_json)).toEqual([partial]);
+  });
+
   it('strips non-PDF Read.pages from a non-streamed tool call', async () => {
     const { events } = await collect([
       { type: 'start' },

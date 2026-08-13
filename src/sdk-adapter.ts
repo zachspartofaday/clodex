@@ -760,6 +760,26 @@ export async function writeAnthropicStream(
   // can be sanitized once the SDK's parsed `tool-call` part arrives.
   const toolJsonBuffer = new Map<string, string>();
   const flushedTools = new Set<string>();
+  const bufferedToolInput = (id: string): string | undefined => {
+    const buffered = toolJsonBuffer.get(id);
+    let json = buffered;
+    const toolName = toolNameById.get(id);
+    if (buffered && toolName) {
+      try {
+        const parsed = JSON.parse(buffered) as unknown;
+        if (parsed && typeof parsed === 'object' && !Array.isArray(parsed)) {
+          json = JSON.stringify(sanitizeToolInput(
+            parsed as Record<string, unknown>,
+            requiredProps.get(toolName),
+            toolName,
+          ));
+        }
+      } catch {
+        // Preserve malformed/partial JSON exactly; the client owns its error.
+      }
+    }
+    return json;
+  };
   let openToolId: string | null = null;
   let finishReason = 'end_turn';
   let usage: AnthropicUsage = {
@@ -799,23 +819,7 @@ export async function writeAnthropicStream(
     // and sanitize complete buffered JSON when possible; malformed or partial
     // JSON still passes through unchanged so the deltas are not lost.
     if (openType === 'tool' && openToolId !== null && !flushedTools.has(openToolId)) {
-      const buffered = toolJsonBuffer.get(openToolId);
-      let json = buffered;
-      const toolName = toolNameById.get(openToolId);
-      if (buffered && toolName) {
-        try {
-          const parsed = JSON.parse(buffered) as unknown;
-          if (parsed && typeof parsed === 'object' && !Array.isArray(parsed)) {
-            json = JSON.stringify(sanitizeToolInput(
-              parsed as Record<string, unknown>,
-              requiredProps.get(toolName),
-              toolName,
-            ));
-          }
-        } catch {
-          // Preserve malformed/partial JSON exactly; the client owns its error.
-        }
-      }
+      const json = bufferedToolInput(openToolId);
       if (json) {
         emit('content_block_delta', {
           type: 'content_block_delta', index: blockIndex,
@@ -903,7 +907,7 @@ export async function writeAnthropicStream(
           if (!flushedTools.has(id)) {
             const json = part.input !== undefined && part.input !== null
               ? JSON.stringify(sanitizeToolInput(part.input as Record<string, unknown>, requiredProps.get(part.toolName ?? ''), part.toolName))
-              : (toolJsonBuffer.get(id) ?? '');
+              : (bufferedToolInput(id) ?? '');
             if (json) {
               emit('content_block_delta', {
                 type: 'content_block_delta', index: idToBlock.get(id) ?? blockIndex,
