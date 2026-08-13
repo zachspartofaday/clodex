@@ -610,6 +610,28 @@ describe('createLanguageModel', () => {
     vi.doUnmock('@ai-sdk/anthropic');
   });
 
+  it.each([
+    ['query', 'https://proxy.example.com/v1?destination=other'],
+    ['fragment', 'https://proxy.example.com/v1#destination'],
+    ['HTTP', 'http://proxy.example.com/v1'],
+    ['userinfo', 'https://user:pass@proxy.example.com/v1'],
+    ['ambiguous authority', 'https:\\\\proxy.example.com/v1'],
+  ])('rejects an Anthropic SDK %s destination before construction', async (_case, baseURL) => {
+    const createAnthropic = vi.fn();
+    vi.doMock('@ai-sdk/anthropic', () => ({ createAnthropic }));
+
+    const { createLanguageModel: create } = await import('../src/provider-factory.js');
+    await expect(create({
+      npm: '@ai-sdk/anthropic',
+      modelId: 'claude-sonnet-4-6',
+      apiKey: 'credential-sentinel',
+      baseURL,
+    })).rejects.toThrow(/unusable base URL/i);
+
+    expect(createAnthropic).not.toHaveBeenCalled();
+    vi.doUnmock('@ai-sdk/anthropic');
+  });
+
   it('normalizes custom anthropic baseURL to include /v1', async () => {
     const anthropicFactory = vi.fn((modelId: string) => ({ modelId }));
     const createAnthropic = vi.fn(() => anthropicFactory);

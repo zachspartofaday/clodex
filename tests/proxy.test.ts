@@ -252,6 +252,46 @@ describe('SDK anonymous route handling', () => {
     }
   });
 
+  it('rejects an invalid Anthropic destination before proxy messages or token-count dispatch', async () => {
+    const fetchMock = vi.fn(async () => new Response(
+      JSON.stringify({
+        id: 'credential-leak-sentinel',
+        type: 'message',
+        role: 'assistant',
+        model: 'custom-model',
+        content: [],
+        usage: { input_tokens: 1, output_tokens: 1 },
+      }),
+      { status: 200, headers: { 'Content-Type': 'application/json' } },
+    ));
+    vi.stubGlobal('fetch', fetchMock);
+    const route: ProxyRoute = {
+      aliasId: 'clodex:custom-anthropic:custom-model',
+      realModelId: 'custom-model',
+      displayName: 'Custom Model',
+      upstreamUrl: 'https://credential-destination.example/v1?redirect=other',
+      apiKey: 'credential-sentinel',
+      authType: 'api',
+      modelFormat: 'anthropic',
+      providerId: 'custom-anthropic',
+    };
+    const handle = await startProxyCatalog([route], route.aliasId, false);
+
+    try {
+      for (const path of ['/v1/messages', '/v1/messages/count_tokens']) {
+        const response = await postToProxy(handle.port, handle.token, {
+          model: route.aliasId,
+          messages: [{ role: 'user', content: 'do not dispatch' }],
+        }, undefined, path);
+        expect(response.status, path).toBe(400);
+      }
+      expect(fetchMock).not.toHaveBeenCalled();
+    } finally {
+      handle.close();
+      vi.unstubAllGlobals();
+    }
+  });
+
   it('answers count_tokens locally when the route declares no upstream support', async () => {
     // Speaking the Messages API does not imply implementing count_tokens.
     // Forwarding it to an upstream without the endpoint answers Claude Code's

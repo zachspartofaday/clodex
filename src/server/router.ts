@@ -69,6 +69,7 @@ import {
 } from '../model-aliases.js';
 import { routeUnavailableMessage } from '../route-unavailable.js';
 import { transformOpenAiCompatibleRequestBody } from '../model-runtime-compatibility.js';
+import { canonicalAnthropicBaseUrl } from '../registry/url-security.js';
 import {
   DEFAULT_UNSUPPORTED_EFFORT_POLICY,
   EffortResolutionError,
@@ -316,15 +317,16 @@ async function handleAnthropicMessages(
   plog(() => `anthropic-messages model=${body.model} format=${model.modelFormat} npm=${model.npm ?? 'none'} stream=${body.stream}`);
 
   if (model.modelFormat === 'anthropic') {
-    if (model.baseUrl && !/^https?:\/\//i.test(model.baseUrl)) {
-      sendJson(res, 400, { error: { message: `Invalid provider baseUrl: must be http:// or https://` } });
-      return;
-    }
     if (!model.baseUrl) {
       sendJson(res, 400, { error: { message: `Model ${model.id} has no Anthropic baseUrl configured` } });
       return;
     }
-    const messagesUrl = `${model.baseUrl}/v1/messages`;
+    const baseUrl = canonicalAnthropicBaseUrl(model.baseUrl);
+    if (baseUrl === null) {
+      sendJson(res, 400, { error: { message: 'Invalid provider baseUrl: must be an unambiguous HTTPS URL without query, fragment, or userinfo' } });
+      return;
+    }
+    const messagesUrl = `${baseUrl}/v1/messages`;
     let apiKey: string;
     try {
       apiKey = await resolveModelApiKey(model, options.apiKey);
@@ -355,7 +357,7 @@ async function handleAnthropicMessages(
     // headers plus whichever capability tokens this exact destination, route and
     // body earn. Everything else the client asked for is dropped there.
     const clientBeta = normalizeBetaTokens(req.headers['anthropic-beta']);
-    const suppression = resolveNativeIdentitySuppression(model.baseUrl);
+    const suppression = resolveNativeIdentitySuppression(baseUrl);
     const capability = {
       clientBeta,
       requestedModelId: typeof body.model === 'string' ? body.model : undefined,
@@ -613,12 +615,13 @@ async function handleAnthropicCountTokens(
     return;
   }
 
-  if (model.baseUrl && !/^https?:\/\//i.test(model.baseUrl)) {
-    sendJson(res, 400, { error: { message: `Invalid provider baseUrl: must be http:// or https://` } });
-    return;
-  }
   if (!model.baseUrl) {
     sendJson(res, 400, { error: { message: `Model ${model.id} has no Anthropic baseUrl configured` } });
+    return;
+  }
+  const baseUrl = canonicalAnthropicBaseUrl(model.baseUrl);
+  if (baseUrl === null) {
+    sendJson(res, 400, { error: { message: 'Invalid provider baseUrl: must be an unambiguous HTTPS URL without query, fragment, or userinfo' } });
     return;
   }
 
@@ -641,7 +644,7 @@ async function handleAnthropicCountTokens(
   // message it precedes is, so omitting it here would make the count disagree
   // with the request it is sizing.
   const clientBeta = normalizeBetaTokens(req.headers['anthropic-beta']);
-  const suppression = resolveNativeIdentitySuppression(model.baseUrl);
+  const suppression = resolveNativeIdentitySuppression(baseUrl);
   const capability = {
     clientBeta,
     requestedModelId: typeof body.model === 'string' ? body.model : undefined,
@@ -656,7 +659,7 @@ async function handleAnthropicCountTokens(
       )
     : undefined;
 
-  const countTokensUrl = `${model.baseUrl}/v1/messages/count_tokens`;
+  const countTokensUrl = `${baseUrl}/v1/messages/count_tokens`;
   plog(() =>
     `anthropic-count-tokens → ${countTokensUrl} oauth=${isOAuth} `
     + `native-identity=suppressed(${suppression.reason}) client-beta=${clientBeta.length} `

@@ -18,6 +18,7 @@ import { classifyFreeStatus, isFreeStatus } from '../free-models.js';
 import { openCodeGoEffortProfile } from '../data/opencode-go-effort-profiles.js';
 import { OAUTH_ACCOUNT_ENV } from '../oauth-account-selection.js';
 import { resolveAnthropicAuthMode } from '../anthropic-auth-mode.js';
+import { canonicalAnthropicBaseUrl } from './url-security.js';
 
 export { OAUTH_ACCOUNT_ENV } from '../oauth-account-selection.js';
 
@@ -30,10 +31,8 @@ export function resolveEndpoint(
 ): { format: 'anthropic' | 'openai'; baseUrl?: string; completionsUrl?: string } | null {
   if (!npm) return null;
   if (npm === '@ai-sdk/anthropic') {
-    return {
-      format: 'anthropic',
-      baseUrl: (apiUrl || 'https://api.anthropic.com').replace(/\/v1\/?$/, ''),
-    };
+    const baseUrl = canonicalAnthropicBaseUrl(apiUrl || 'https://api.anthropic.com');
+    return baseUrl === null ? null : { format: 'anthropic', baseUrl };
   }
   if (npm === '@ai-sdk/openai-compatible') {
     if (!apiUrl) return null;
@@ -69,10 +68,14 @@ function resolveMaterializedApiUrl(
   provider: RegistryProvider,
   npm: string,
 ): string | null {
-  if (!isRetainedOpenCodeGoProvider(provider)) {
-    return cached.apiUrl ?? provider.api.url ?? '';
+  if (isRetainedOpenCodeGoProvider(provider)) {
+    return openCodeGoPinnedApiUrl(npm);
   }
-  return openCodeGoPinnedApiUrl(npm);
+  // An Anthropic model's provider owns the credential destination. Cached rows
+  // may select a package, but imported, migrated, or hand-edited model metadata
+  // cannot redirect the provider credential away from that authority.
+  if (npm === '@ai-sdk/anthropic') return provider.api.url ?? '';
+  return cached.apiUrl ?? provider.api.url ?? '';
 }
 
 export function cachedModelToLocal(
@@ -107,7 +110,7 @@ export function cachedModelToLocal(
     baseUrl: endpoint.baseUrl,
     completionsUrl: endpoint.completionsUrl,
     npm: npm || undefined,
-    apiBaseUrl: apiUrl || undefined,
+    apiBaseUrl: endpoint.format === 'anthropic' ? endpoint.baseUrl : (apiUrl || undefined),
     cost: cached.cost,
     isFree: isFreeStatus(freeStatus),
     freeStatus,

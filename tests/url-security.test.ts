@@ -1,5 +1,9 @@
 import { describe, it, expect, vi, afterEach } from 'vitest';
-import { canonicalOpenAiBaseUrl, validateCustomEndpointUrl } from '../src/registry/url-security.js';
+import {
+  canonicalAnthropicBaseUrl,
+  canonicalOpenAiBaseUrl,
+  validateCustomEndpointUrl,
+} from '../src/registry/url-security.js';
 
 describe('validateCustomEndpointUrl', () => {
   afterEach(() => {
@@ -103,5 +107,58 @@ describe('canonicalOpenAiBaseUrl', () => {
 
   it('rejects two or more terminal separators', () => {
     expect(canonicalOpenAiBaseUrl('https://api.openai.com/v1//')).toBeNull();
+  });
+});
+
+describe('canonicalAnthropicBaseUrl', () => {
+  it('preserves legitimate HTTPS custom paths and removes the SDK-owned v1 suffix', () => {
+    expect(canonicalAnthropicBaseUrl('https://gateway.example/anthropic')).toBe(
+      'https://gateway.example/anthropic',
+    );
+    expect(canonicalAnthropicBaseUrl('  https://GATEWAY.example:443/anthropic/v1/  ')).toBe(
+      'https://gateway.example/anthropic',
+    );
+    expect(canonicalAnthropicBaseUrl('https://gateway.example/')).toBe('https://gateway.example');
+  });
+
+  it('rejects every non-HTTPS or ambiguous authority form', () => {
+    for (const raw of [
+      'http://gateway.example/v1',
+      'ftp://gateway.example/v1',
+      'https:/gateway.example/v1',
+      'https:gateway.example/v1',
+      'https:\\\\gateway.example/v1',
+      'https:////gateway.example/v1',
+      'not a url',
+    ]) {
+      expect(canonicalAnthropicBaseUrl(raw), raw).toBeNull();
+    }
+  });
+
+  it('rejects query, fragment, and every userinfo spelling', () => {
+    for (const raw of [
+      'https://gateway.example/v1?next=evil',
+      'https://gateway.example/v1#evil',
+      'https://user@gateway.example/v1',
+      'https://user:pass@gateway.example/v1',
+      'https://:pass@gateway.example/v1',
+      'https://user:@gateway.example/v1',
+      'https://@gateway.example/v1',
+      'https://:@gateway.example/v1',
+    ]) {
+      expect(canonicalAnthropicBaseUrl(raw), raw).toBeNull();
+    }
+  });
+
+  it('keeps percent-encoded delimiters as pathname data', () => {
+    expect(canonicalAnthropicBaseUrl('https://gateway.example/v1%3Fx')).toBe(
+      'https://gateway.example/v1%3Fx',
+    );
+    expect(canonicalAnthropicBaseUrl('https://gateway.example/v1%23x')).toBe(
+      'https://gateway.example/v1%23x',
+    );
+    expect(canonicalAnthropicBaseUrl('https://gateway.example/v1%40x')).toBe(
+      'https://gateway.example/v1%40x',
+    );
   });
 });

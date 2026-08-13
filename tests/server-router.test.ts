@@ -1,5 +1,7 @@
 import { createServer, type Server } from 'node:http';
-import { afterEach, describe, expect, it, vi } from 'vitest';
+import { createServer as createHttpsServer } from 'node:https';
+import { afterAll, afterEach, beforeAll, describe, expect, it, vi } from 'vitest';
+import { Agent, getGlobalDispatcher, setGlobalDispatcher } from 'undici';
 import { APICallError } from 'ai';
 import { mkdtempSync, readFileSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
@@ -10,8 +12,31 @@ import { createLanguageModel } from '../src/provider-factory.js';
 import { generateAnthropicResponse, streamAnthropicResponse } from '../src/sdk-adapter.js';
 import { generateOpenAiResponse, streamOpenAiResponse } from '../src/openai-adapter.js';
 import { resolveProviderCredential } from '../src/env.js';
+import { ensureHttpProxyCertificates, type HttpProxyCertificates } from '../src/http-proxy/ca.js';
 
 const TEST_HELPER_REF = `helper:v1:${'a'.repeat(64)}:oauth:provider:oauth-provider`;
+const upstreamTlsHome = mkdtempSync(join(tmpdir(), 'clodex-server-router-tls-'));
+const previousDispatcher = getGlobalDispatcher();
+const upstreamDispatcher = new Agent({ connect: { rejectUnauthorized: false } });
+let upstreamCertificates: HttpProxyCertificates;
+
+beforeAll(() => {
+  const previousHome = process.env.CLODEX_HOME;
+  process.env.CLODEX_HOME = upstreamTlsHome;
+  try {
+    upstreamCertificates = ensureHttpProxyCertificates();
+  } finally {
+    if (previousHome === undefined) delete process.env.CLODEX_HOME;
+    else process.env.CLODEX_HOME = previousHome;
+  }
+  setGlobalDispatcher(upstreamDispatcher);
+});
+
+afterAll(async () => {
+  setGlobalDispatcher(previousDispatcher);
+  await upstreamDispatcher.close();
+  rmSync(upstreamTlsHome, { recursive: true, force: true });
+});
 
 vi.mock('../src/env.js', async importOriginal => {
   const actual = await importOriginal<typeof import('../src/env.js')>();
@@ -79,7 +104,10 @@ async function readRequestBody(req: Parameters<typeof createServer>[0] extends (
 
 async function startUpstream(responseBody: any): Promise<{ baseUrl: string; requests: UpstreamRequest[]; close: () => Promise<void> }> {
   const requests: UpstreamRequest[] = [];
-  const server = createServer(async (req, res) => {
+  const server = createHttpsServer({
+    cert: upstreamCertificates.serverCert,
+    key: upstreamCertificates.serverKey,
+  }, async (req, res) => {
     requests.push({
       method: req.method ?? '',
       url: req.url ?? '',
@@ -104,7 +132,7 @@ async function startUpstream(responseBody: any): Promise<{ baseUrl: string; requ
   if (!address || typeof address === 'string') throw new Error('missing upstream address');
 
   return {
-    baseUrl: `http://127.0.0.1:${address.port}`,
+    baseUrl: `https://127.0.0.1:${address.port}`,
     requests,
     close: () => new Promise<void>((resolve, reject) => server.close(err => (err ? reject(err) : resolve()))),
   };
@@ -114,7 +142,10 @@ async function startSequencedUpstream(
   responses: Array<{ status: number; body: unknown }>,
 ): Promise<{ baseUrl: string; requests: UpstreamRequest[]; close: () => Promise<void> }> {
   const requests: UpstreamRequest[] = [];
-  const server = createServer(async (req, res) => {
+  const server = createHttpsServer({
+    cert: upstreamCertificates.serverCert,
+    key: upstreamCertificates.serverKey,
+  }, async (req, res) => {
     requests.push({
       method: req.method ?? '',
       url: req.url ?? '',
@@ -132,7 +163,7 @@ async function startSequencedUpstream(
   const address = server.address();
   if (!address || typeof address === 'string') throw new Error('missing upstream address');
   return {
-    baseUrl: `http://127.0.0.1:${address.port}`,
+    baseUrl: `https://127.0.0.1:${address.port}`,
     requests,
     close: () => new Promise<void>((resolve, reject) =>
       server.close(err => (err ? reject(err) : resolve()))),
@@ -366,6 +397,31 @@ describe('server router', () => {
       headers: { 'x-api-key': 'secret' },
     });
     expect(right.status).toBe(200);
+  });
+
+  it('rejects an invalid Anthropic destination before endpoint messages or token-count dispatch', async () => {
+    const upstream = await startUpstream({ type: 'message', model: 'credential-leak-sentinel' });
+    handles.push(upstream);
+    const server = await startTestServer({
+      catalog: createGatewayModelCatalog([
+        model('invalid-native', 'anthropic', 'custom-anthropic', {
+          baseUrl: `${upstream.baseUrl}?redirect=other`,
+        }),
+      ]),
+    });
+
+    for (const path of ['/anthropic/v1/messages', '/anthropic/v1/messages/count_tokens']) {
+      const response = await fetch(`${server.url}${path}`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          model: 'invalid-native',
+          messages: [{ role: 'user', content: 'do not dispatch' }],
+        }),
+      });
+      expect(response.status, path).toBe(400);
+    }
+    expect(upstream.requests).toHaveLength(0);
   });
 
   it('forwards Anthropic-native messages to the backend v1/messages endpoint with the real API key', async () => {
@@ -1796,7 +1852,10 @@ describe('endpoint-mode Anthropic beta and identity are negative-only', () => {
     close: () => Promise<void>;
   }> {
     const requests: Array<{ url: string; headers: Record<string, string | string[] | undefined>; body: any }> = [];
-    const server = createServer(async (req, res) => {
+    const server = createHttpsServer({
+      cert: upstreamCertificates.serverCert,
+      key: upstreamCertificates.serverKey,
+    }, async (req, res) => {
       requests.push({ url: req.url ?? '', headers: req.headers, body: await readRequestBody(req) });
       res.writeHead(200, { 'Content-Type': 'application/json' });
       res.end(JSON.stringify(body));
@@ -1805,7 +1864,7 @@ describe('endpoint-mode Anthropic beta and identity are negative-only', () => {
     const address = server.address();
     if (!address || typeof address === 'string') throw new Error('missing upstream address');
     return {
-      baseUrl: `http://127.0.0.1:${address.port}`,
+      baseUrl: `https://127.0.0.1:${address.port}`,
       requests,
       close: () => new Promise<void>((resolve, reject) =>
         server.close(err => (err ? reject(err) : resolve()))),

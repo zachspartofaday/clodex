@@ -16,7 +16,10 @@ import {
   resolveOutboundBeta,
 } from './anthropic-beta-policy.js';
 import { isCredentialBearingHeader } from './credential-headers.js';
-import { canonicalOpenAiBaseUrl } from './registry/url-security.js';
+import {
+  canonicalAnthropicBaseUrl,
+  canonicalOpenAiBaseUrl,
+} from './registry/url-security.js';
 import type { EffortProfile } from './effort-policy.js';
 import {
   transformOpenAiCompatibleRequestBody,
@@ -306,8 +309,14 @@ export async function createLanguageModel(spec: ProviderModelSpec): Promise<Lang
   // Registry stores root URL (no /v1) for GET /v1/models discovery — passing it here
   // makes the SDK call https://api.anthropic.com/messages → 404.
   if (npm === '@ai-sdk/anthropic') {
+    const root = baseURL ? canonicalAnthropicBaseUrl(baseURL) : '';
+    if (root === null) {
+      throw new Error(
+        `Provider ${spec.providerId ?? 'anthropic'} has an unusable base URL. `
+        + 'It must be an unambiguous HTTPS URL with no query string, fragment, or embedded credentials.',
+      );
+    }
     const { createAnthropic } = await import('@ai-sdk/anthropic');
-    const root = baseURL?.replace(/\/v1\/?$/, '').replace(/\/$/, '');
     // OAuth keeps its Bearer credential scheme (authToken, never apiKey) and
     // gains no synthesized native-client identity: a `claude-code` provider id
     // is a route label, not proof of credential lineage, and clodex has no
@@ -326,7 +335,7 @@ export async function createLanguageModel(spec: ProviderModelSpec): Promise<Lang
     if (!root || root === 'https://api.anthropic.com') {
       return createAnthropic(anthropicOptions)(modelId);
     }
-    const sdkBase = baseURL!.endsWith('/v1') ? baseURL : `${root}/v1`;
+    const sdkBase = `${root}/v1`;
     return createAnthropic({ ...anthropicOptions, baseURL: sdkBase })(modelId);
   }
   let model: LanguageModel;

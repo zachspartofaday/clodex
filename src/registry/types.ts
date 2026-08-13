@@ -74,7 +74,7 @@ export interface CachedModel {
   modelFormat: 'anthropic' | 'openai' | 'cloud-code';
   /** Per-model override — wins over provider-level api.npm */
   npm?: string;
-  /** Per-model override — wins over provider-level api.url */
+  /** Per-model override — wins over provider-level api.url except for credential-bearing Anthropic routes. */
   apiUrl?: string;
   sourceBackend?: string;
   /** Provider-reported request parameters, e.g. OpenRouter supported_parameters. */

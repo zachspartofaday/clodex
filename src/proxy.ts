@@ -68,6 +68,7 @@ import { listenTcpServer } from './listener-ready.js';
 import type { ModelRuntimeCompatibility } from './model-runtime-compatibility.js';
 import type { EffortProfile, UnsupportedEffortPolicy } from './effort-policy.js';
 import type { AnthropicAuthMode } from './anthropic-auth-mode.js';
+import { canonicalAnthropicBaseUrl } from './registry/url-security.js';
 
 type ProxyLog = (message: string | (() => string)) => void;
 
@@ -496,6 +497,20 @@ export async function startProxyCatalog(
         return;
       }
 
+      let upstreamUrl = route.upstreamUrl;
+      if (route.modelFormat === 'anthropic') {
+        const canonicalBaseUrl = canonicalAnthropicBaseUrl(upstreamUrl);
+        if (canonicalBaseUrl === null) {
+          anthropicError(
+            res,
+            400,
+            'Invalid provider baseUrl: must be an unambiguous HTTPS URL without query, fragment, or userinfo',
+          );
+          return;
+        }
+        upstreamUrl = canonicalBaseUrl;
+      }
+
       let apiKey = route.apiKey;
       if (route.authType === 'oauth' && route.refreshToken) {
         try {
@@ -511,7 +526,6 @@ export async function startProxyCatalog(
           return;
         }
       }
-      const upstreamUrl = route.upstreamUrl;
       const routeAuthType = route.authType ?? 'api';
 
       // Record the tier clodex resolved for this route before dispatch. This is

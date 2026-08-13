@@ -148,32 +148,22 @@ export async function validateCustomEndpointUrl(
 }
 
 /**
- * Canonicalize an OpenAI base URL for the exact @ai-sdk/openai and
- * @ai-sdk/openai-compatible packages. Returns null (fail closed) when the URL
- * carries a literal query/fragment delimiter, is not http:/https:, embeds
- * userinfo, or has two or more terminal separators. Percent-encoded
- * delimiters (%3F, %23, %40) stay pathname data. Host and default port are
- * canonicalized by URL parsing. A bare root ("/") collapses to an empty path.
- * Pure function — no async or global SSRF behavior change.
- *
- * This is separate from `validateCustomEndpointUrl` on purpose. That guard runs
- * when a URL is ADDED or refreshed and answers "may this host be reached at
- * all"; this one runs where a stored URL BECOMES a live credential destination
- * and answers "is this exactly the address it claims to be". Registry state can
- * reach the factory without ever passing the add-time guard — imports,
- * migrations, template defaults, or a hand-edited registry file — so the
- * destination seam cannot assume normalization already happened.
+ * Canonicalize the address where a stored provider URL becomes a live
+ * credential destination. The raw authority check rejects forms URL parsing
+ * repairs or erases (backslash separators and empty userinfo), while encoded
+ * delimiters remain ordinary pathname data.
  */
-export function canonicalOpenAiBaseUrl(rawUrl: string): string | null {
+function canonicalCredentialBaseUrl(
+  rawUrl: string,
+  allowedProtocols: ReadonlySet<string>,
+): string | null {
   const trimmed = rawUrl.trim();
-  const schemeEnd = trimmed.indexOf(':');
-  let rawAuthority = '';
-  if (schemeEnd >= 0) {
-    rawAuthority = trimmed.slice(schemeEnd + 1).replace(/^[\\/]+/, '');
-    const authorityEnd = rawAuthority.search(/[\\/]/);
-    if (authorityEnd >= 0) rawAuthority = rawAuthority.slice(0, authorityEnd);
-  }
-  if (trimmed.includes('?') || trimmed.includes('#')) return null;
+  if (trimmed.includes('?') || trimmed.includes('#') || /[\\\s]/.test(trimmed)) return null;
+
+  const authorityMatch = /^([a-z][a-z\d+.-]*):\/\/([^/]+)(\/.*)?$/i.exec(trimmed);
+  if (!authorityMatch) return null;
+  const rawAuthority = authorityMatch[2]!;
+  if (rawAuthority.includes('@')) return null;
 
   let parsed: URL;
   try {
@@ -182,13 +172,31 @@ export function canonicalOpenAiBaseUrl(rawUrl: string): string | null {
     return null;
   }
 
-  if (parsed.protocol !== 'http:' && parsed.protocol !== 'https:') return null;
-  // URL parsing erases empty userinfo, so inspect the raw authority too.
-  if (rawAuthority.includes('@') || parsed.username || parsed.password) return null;
+  if (!allowedProtocols.has(parsed.protocol)) return null;
+  if (!parsed.hostname || parsed.username || parsed.password) return null;
 
   let pathname = parsed.pathname;
   if (pathname.endsWith('/')) pathname = pathname.slice(0, -1);
   if (pathname.endsWith('/')) return null;
 
   return `${parsed.protocol}//${parsed.host}${pathname}`;
+}
+
+const OPENAI_DESTINATION_PROTOCOLS = new Set(['http:', 'https:']);
+const ANTHROPIC_DESTINATION_PROTOCOLS = new Set(['https:']);
+
+/**
+ * Canonicalize an OpenAI base URL for the exact @ai-sdk/openai and
+ * @ai-sdk/openai-compatible packages. HTTP remains available for explicitly
+ * approved local OpenAI-compatible endpoints.
+ */
+export function canonicalOpenAiBaseUrl(rawUrl: string): string | null {
+  return canonicalCredentialBaseUrl(rawUrl, OPENAI_DESTINATION_PROTOCOLS);
+}
+
+/** Canonicalize an Anthropic base URL and remove the SDK-owned terminal /v1. */
+export function canonicalAnthropicBaseUrl(rawUrl: string): string | null {
+  const canonical = canonicalCredentialBaseUrl(rawUrl, ANTHROPIC_DESTINATION_PROTOCOLS);
+  if (canonical === null) return null;
+  return canonical.replace(/\/v1$/, '');
 }

@@ -399,6 +399,30 @@ describe('registry io', () => {
 });
 
 describe('materializeRegistry', () => {
+  function customAnthropicProvider(providerUrl: string, cachedUrl?: string) {
+    return {
+      id: 'custom-anthropic-test',
+      templateId: 'custom-anthropic',
+      name: 'Custom Anthropic Test',
+      enabled: true,
+      authRef: 'keyring:provider:custom-anthropic-test',
+      authType: 'api' as const,
+      api: { npm: '@ai-sdk/anthropic', url: providerUrl },
+      addedAt: '2026-08-13T00:00:00.000Z',
+      modelsCache: {
+        fetchedAt: '2026-08-13T00:00:00.000Z',
+        models: [{
+          id: 'custom-model',
+          name: 'Custom Model',
+          upstreamModelId: 'custom-model',
+          modelFormat: 'anthropic' as const,
+          npm: '@ai-sdk/anthropic',
+          ...(cachedUrl === undefined ? {} : { apiUrl: cachedUrl }),
+        }],
+      },
+    };
+  }
+
   it('materializes enabled providers with credentials and models', () => {
     const registry = emptyRegistry();
     registry.providers.push({
@@ -645,6 +669,36 @@ describe('materializeRegistry', () => {
       isFree: true,
       freeStatus: 'free_provider',
     });
+  });
+
+  it('uses the custom Anthropic provider authority instead of a stored model override', () => {
+    const registry = emptyRegistry();
+    registry.providers.push(customAnthropicProvider(
+      'https://provider-authority.example/anthropic/v1/',
+      'https://stored-model-override.example/v1',
+    ));
+
+    const model = materializeRegistry(registry, () => 'credential-sentinel')[0]?.models[0];
+
+    expect(model?.apiBaseUrl).toBe('https://provider-authority.example/anthropic');
+    expect(model?.baseUrl).toBe('https://provider-authority.example/anthropic');
+  });
+
+  it.each([
+    ['query', 'https://provider.example/v1?destination=other'],
+    ['fragment', 'https://provider.example/v1#destination'],
+    ['HTTP', 'http://provider.example/v1'],
+    ['username', 'https://user@provider.example/v1'],
+    ['password', 'https://user:pass@provider.example/v1'],
+    ['empty username', 'https://@provider.example/v1'],
+    ['empty username and password', 'https://:@provider.example/v1'],
+    ['ambiguous authority', 'https:\\\\provider.example/v1'],
+    ['malformed authority', 'https:////provider.example/v1'],
+  ])('drops a custom Anthropic model with a %s destination', (_case, providerUrl) => {
+    const registry = emptyRegistry();
+    registry.providers.push(customAnthropicProvider(providerUrl));
+
+    expect(materializeRegistry(registry, () => 'credential-sentinel')).toEqual([]);
   });
 
   it('pins OpenCode OpenAI-compatible models to the reviewed completions authority', () => {
