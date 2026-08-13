@@ -1,5 +1,5 @@
 import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
-import { tweakccRecognizesModuleName } from '../src/bun-entry-module.js';
+import { entryModuleShimName, tweakccRecognizesModuleName } from '../src/bun-entry-module.js';
 import {
   buildFakeNativeClaude,
   MACHO_MAGIC,
@@ -830,6 +830,26 @@ describe('PATCH_TRANSFORMS_VERSION', () => {
 });
 
 describe('tweakcc dependency patch', () => {
+  /*
+   * tweakcc does not export its module selector, so the only way to test the one that
+   * will actually run is to lift the expression out of the installed dependency. The
+   * test below builds this inline as part of what it asserts; this copy exists so the
+   * composition test can reach the same selector without retargeting that test's
+   * assertions.
+   */
+  const loadInstalledTweakccSelector = (): ((moduleName: string) => boolean) => {
+    const tweakccEntry = createRequire(import.meta.url).resolve('tweakcc');
+    const installedNativeModule = readFileSync(
+      join(dirname(dirname(tweakccEntry)), 'nativeInstallation-Bo_Crunz.mjs'),
+      'utf8',
+    );
+    const match = installedNativeModule.match(
+      /function [\w$]+\(([\w$]+)\)\{return ([^}]*src\/entrypoints\/cli\.js[^}]*)\}/,
+    );
+    if (!match) throw new Error('could not locate tweakcc module selector in the installed dependency');
+    return new Function(match[1]!, `return ${match[2]!};`) as (moduleName: string) => boolean;
+  };
+
   it('keeps tweakcc 4.3.0 patched for only the exact Bun root CLI module', () => {
     const packageJson = JSON.parse(
       readFileSync(new URL('../package.json', import.meta.url), 'utf8'),
@@ -878,6 +898,51 @@ describe('tweakcc dependency patch', () => {
     expect(selector('/$bunfs/root/cli.exe')).toBe(false);
     expect(selector('\\$bunfs\\root\\cli')).toBe(false);
     expect(selector('/cli')).toBe(false);
+  });
+
+  /*
+   * Two independent mechanisms reached this tree from different parents and both
+   * target the SAME renamed entry module: the pnpm patch above widens tweakcc's own
+   * selector, and `src/bun-entry-module.ts` renames the module to a stand-in tweakcc
+   * already accepts. Each parent's tests pin its own mechanism, and nothing pinned
+   * the RELATION between them — which is the only thing the merge actually created.
+   *
+   * Both directions of that relation are load-bearing, and each is silently
+   * breakable while every other test stays green.
+   */
+  it('keeps the shim selector mirror a strict subset of the installed selector', () => {
+    const installedSelector = loadInstalledTweakccSelector();
+
+    // Direction 1: the mirror must NOT learn the patched name. Adding it here to
+    // "resync the mirror" would look like tidying and would disable the shim on the
+    // exact binaries it exists for, leaving nothing to patch them if the pnpm patch
+    // is ever missing, reverse-applied, or dropped by a dependency bump.
+    expect(tweakccRecognizesModuleName('/$bunfs/root/cli')).toBe(false);
+    expect(installedSelector('/$bunfs/root/cli')).toBe(true);
+
+    // Direction 2: everything the mirror accepts, the installed selector must accept
+    // too. A subset is safe because the worst case is a redundant shim round trip; a
+    // name in the mirror but NOT in the real selector would make `readContent` throw
+    // on a binary the shim just reported as needing no help.
+    for (const name of [
+      '/claude',
+      'claude',
+      '/claude.exe',
+      'claude.exe',
+      '/src/entrypoints/cli.js',
+      'src/entrypoints/cli.js',
+    ]) {
+      expect([name, tweakccRecognizesModuleName(name)]).toEqual([name, true]);
+      expect([name, installedSelector(name)]).toEqual([name, true]);
+    }
+
+    // The composition itself: the stand-in the shim actually writes has to be
+    // readable by the INSTALLED tweakcc, not merely by our mirror of it. Only the
+    // mirror was ever asserted to accept it, so a patch that narrowed the real
+    // selector would break patching with every existing test still green.
+    const standIn = entryModuleShimName('/$bunfs/root/cli'.length);
+    expect(standIn).toBe('/clodex--/claude');
+    expect(installedSelector(standIn!)).toBe(true);
   });
 });
 
