@@ -40,7 +40,7 @@ import {
  * hash of the transform inputs to force that decision to be made rather than
  * forgotten.
  */
-export const PATCH_TRANSFORMS_VERSION = 8;
+export const PATCH_TRANSFORMS_VERSION = 9;
 
 export interface PatchScriptModelEntry {
   /** Ordered native identities for this model, in saved alias order. */
@@ -422,17 +422,25 @@ export function applyClodexPatches(source: string, config: PatchScriptModelConfi
       '(\\?\\[[\\w$]+,r\\]:\\[r\\];for\\(let [\\w$]+ of [\\w$]+\\)[\\w$]+\\(e,[\\w$]+,t\\);)'
       + '((?:' + pickerInjection + ')*)',
     );
-    const classifyPickerSuffix = (suffix: string): { missing: string[]; duplicate: string[] } => {
+    const pickerEntryForAlias = (alias: string): string =>
+      '{value:' + q(alias)
+      + ',label:' + q(alias.charAt(0).toUpperCase() + alias.slice(1))
+      + ',description:' + q(displayFor(alias, ALIAS_TO_ID[alias]!))
+      + '}';
+    const classifyPickerSuffix = (suffix: string): { missing: string[]; invalid: string[] } => {
       const missing: string[] = [];
-      const duplicate: string[] = [];
+      const invalid: string[] = [];
       for (const a of ALIASES) {
-        const count = suffix.match(
+        const valueOccurrences = suffix.match(
           new RegExp('\\{value:' + reEsc(q(a)) + '(?=,label:)', 'g'),
         )?.length ?? 0;
-        if (count === 0) missing.push(a);
-        else if (count > 1) duplicate.push(a);
+        const entryOccurrences = suffix.match(
+          new RegExp(reEsc(pickerEntryForAlias(a)), 'g'),
+        )?.length ?? 0;
+        if (valueOccurrences === 0) missing.push(a);
+        else if (valueOccurrences !== 1 || entryOccurrences !== 1) invalid.push(a);
       }
-      return { missing, duplicate };
+      return { missing, invalid };
     };
     const pickerMatches = js.match(new RegExp(pickerRegex.source, 'g'));
     const pickerMatch = pickerMatches?.length === 1 ? pickerRegex.exec(js) : undefined;
@@ -441,23 +449,15 @@ export function applyClodexPatches(source: string, config: PatchScriptModelConfi
       : undefined;
     if (ALIASES.length === 0) {
       log('SKIP', 'PATCH 5: model picker options', 'no aliases configured');
-    } else if (pickerClassification?.duplicate.length) {
-      log('FAIL', 'PATCH 5: model picker options', 'duplicate target-owned picker entries');
+    } else if (pickerClassification?.invalid.length) {
+      log('FAIL', 'PATCH 5: model picker options', 'invalid target-owned picker entries');
     } else {
       applyOnce(
         'PATCH 5: model picker options',
         pickerRegex,
         (_m, anchor, suffix) => {
           const { missing } = classifyPickerSuffix(suffix ?? '');
-          const entries = missing
-            .map(
-              // value = the alias (the name the user types and the binary sends);
-              // description = the real model label, e.g. "GPT-5.6 Sol (OpenAI (ChatGPT))".
-              // (tweakcc's writeContent round-trips utf8 faithfully — verified — so the
-              // old adhoc-patch ASCII-only constraint no longer applies.)
-              (a) => '{value:' + q(a) + ',label:' + q(a.charAt(0).toUpperCase() + a.slice(1)) + ',description:' + q(displayFor(a, ALIAS_TO_ID[a]!)) + '}'
-            )
-            .join(',');
+          const entries = missing.map(pickerEntryForAlias).join(',');
           const inject = missing.length
             ? '[' + entries + '].forEach(function(_o){if(!e.some(function(_i){return _i.value===_o.value}))e.push(_o)});'
             : '';

@@ -809,8 +809,8 @@ describe('PATCH_TRANSFORMS_VERSION', () => {
       .join('\n');
     const digest = createHash('sha256').update(source).digest('hex');
     expect({ version: PATCH_TRANSFORMS_VERSION, digest }).toEqual({
-      version: 8,
-      digest: '125a4f90afcf04765b9aa25394edb595cbfd4ccad803c6bdbdc4dad6a55ecf7a',
+      version: 9,
+      digest: '47990fe9c9f4f0d6b33b491e999fd81932ac05bd2c7303b4a06b2e7ce3e93bbf',
     });
   });
 });
@@ -2245,7 +2245,7 @@ describe('patch script identity naming', () => {
       );
     const config = {
       'clodex:test:local': { alias: 'local', display: 'Local' },
-      'clodex:test:darwin': { alias: 'darwin', display: 'Darwin' },
+      'clodex:test:darwin': { alias: 'darwin', display: 'Existing "Darwin" \\ path' },
       'clodex:test:invalid': { alias: 'invalid_type', display: 'Invalid type' },
     };
 
@@ -2334,9 +2334,52 @@ describe('patch script identity naming', () => {
     expect(result.results.find(result => result.name === 'PATCH 5: model picker options')).toEqual({
       status: 'FAIL',
       name: 'PATCH 5: model picker options',
-      extra: 'duplicate target-owned picker entries',
+      extra: 'invalid target-owned picker entries',
     });
     expect(result.content.match(/value:"local",label:"Local"/g)).toHaveLength(2);
+  });
+
+  it.each([
+    ['CLAUDE_FIXTURE', 'wrong-label-only', CLAUDE_FIXTURE, '{value:"local",label:"Wrong",description:"Local"}'],
+    ['CLAUDE_FIXTURE', 'wrong-description-only', CLAUDE_FIXTURE, '{value:"local",label:"Local",description:"Wrong"}'],
+    ['CLAUDE_FIXTURE', 'both-wrong', CLAUDE_FIXTURE, '{value:"local",label:"Wrong",description:"Wrong"}'],
+    ['CLAUDE_FIXTURE_228', 'wrong-label-only', CLAUDE_FIXTURE_228, '{value:"local",label:"Wrong",description:"Local"}'],
+    ['CLAUDE_FIXTURE_228', 'wrong-description-only', CLAUDE_FIXTURE_228, '{value:"local",label:"Local",description:"Wrong"}'],
+    ['CLAUDE_FIXTURE_228', 'both-wrong', CLAUDE_FIXTURE_228, '{value:"local",label:"Wrong",description:"Wrong"}'],
+  ] as const)('reports optional PATCH 5 FAIL for %s %s target-owned entries', (_fixtureName, _mutation, fixture, wrongEntry) => {
+    const config = { 'clodex:test:local': { alias: 'local', display: 'Local' } };
+    const expectedEntry = '{value:"local",label:"Local",description:"Local"}';
+    const pickerBlock = '[' + wrongEntry + '].forEach(function(_o){if(!e.some(function(_i){return _i.value===_o.value}))e.push(_o)});';
+    const source = fixture.replace('Dlh(e,i,t);return e}', 'Dlh(e,i,t);' + pickerBlock + 'return e}');
+    const result = applyClodexPatches(source, config);
+
+    expect(result.results.find(result => result.name === 'PATCH 5: model picker options')).toEqual({
+      status: 'FAIL',
+      name: 'PATCH 5: model picker options',
+      extra: 'invalid target-owned picker entries',
+    });
+    expect(result.content.split(expectedEntry)).toHaveLength(1);
+    expect(result.content.split(wrongEntry)).toHaveLength(2);
+    expect(result.content).toContain(pickerBlock);
+  });
+
+  it('reports optional PATCH 5 FAIL when exact and wrong entries share a target value', () => {
+    const config = { 'clodex:test:local': { alias: 'local', display: 'Local' } };
+    const exactBlock = '[{value:"local",label:"Local",description:"Local"}].forEach(function(_o){if(!e.some(function(_i){return _i.value===_o.value}))e.push(_o)});';
+    const wrongBlock = '[{value:"local",label:"Wrong",description:"Local"}].forEach(function(_o){if(!e.some(function(_i){return _i.value===_o.value}))e.push(_o)});';
+    const source = CLAUDE_FIXTURE.replace(
+      'Dlh(e,i,t);return e}',
+      'Dlh(e,i,t);' + exactBlock + wrongBlock + 'return e}',
+    );
+
+    const result = applyClodexPatches(source, config);
+    expect(result.results.find(result => result.name === 'PATCH 5: model picker options')).toEqual({
+      status: 'FAIL',
+      name: 'PATCH 5: model picker options',
+      extra: 'invalid target-owned picker entries',
+    });
+    expect(result.content).toContain(exactBlock + wrongBlock);
+    expect(result.content.match(/value:"local"/g)).toHaveLength(2);
   });
 
   it('reports PATCH 5/6 SKIP when every configured target entry is already present', () => {
