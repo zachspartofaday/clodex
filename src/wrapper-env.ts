@@ -105,7 +105,10 @@ export function computeWrapperEnv(
   if (marker) {
     const marked = `http://127.0.0.1:${marker[1]}`;
     for (const name of PROXY_ENV_VARS) {
-      if (env[name] === marked) delete env[name];
+      if (env[name] === marked) {
+        delete env[name];
+        delete baseline[name];
+      }
     }
   }
   delete env[SESSION_PROXY_ENV];

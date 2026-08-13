@@ -375,6 +375,52 @@ describe('computeWrapperEnv', () => {
     expect(env['CLODEX_SESSION_PROXY']).toBeUndefined();
   });
 
+  it.each([
+    { mode: 'proxy' as const, priorContract: undefined },
+    { mode: 'proxy' as const, priorContract: 'not-json' },
+    { mode: 'endpoint' as const, priorContract: undefined },
+    { mode: 'endpoint' as const, priorContract: 'not-json' },
+  ])('does not snapshot a dead listener into a fresh $mode contract with a $priorContract prior contract', ({ mode, priorContract }) => {
+    const deadListener = 'http://127.0.0.1:17645';
+    const newPort = 17646;
+    const baseWithDeadSession = {
+      ...baseEnv,
+      HTTP_PROXY: 'http://corp-proxy:8080',
+      HTTPS_PROXY: deadListener,
+      https_proxy: deadListener,
+      CLODEX_SESSION_PROXY: '17645:12345',
+      ...(priorContract === undefined ? {} : { [NETWORK_ENV_CONTRACT_VAR]: priorContract }),
+    };
+    const state: ServerRuntimeState = mode === 'proxy'
+      ? {
+        mode,
+        port: newPort,
+        pid: process.pid,
+        caPath: '/home/u/.clodex/http-proxy/new-ca.pem',
+        startedAt: '2026-07-20T00:00:00.000Z',
+      }
+      : {
+        mode,
+        port: newPort,
+        pid: process.pid,
+        startedAt: '2026-07-20T00:00:00.000Z',
+      };
+
+    const env = computeWrapperEnv(baseWithDeadSession, state, undefined, { isAlive: () => false });
+    const contract = networkContract(env);
+
+    expect(env[NETWORK_ENV_CONTRACT_VAR]).toBeDefined();
+    expect(Object.values(contract.original)).not.toContain(deadListener);
+    if (mode === 'proxy') {
+      expect(env['HTTPS_PROXY']).toBe('http://127.0.0.1:17646');
+      expect(env['https_proxy']).toBe('http://127.0.0.1:17646');
+    } else {
+      expect(env['ANTHROPIC_BASE_URL']).toBe('http://127.0.0.1:17646/anthropic');
+      expect(env['HTTPS_PROXY']).toBeUndefined();
+      expect(env['https_proxy']).toBeUndefined();
+    }
+  });
+
   it('no live server: returns the env untouched without mutating the input', () => {
     const env = computeWrapperEnv(baseEnv, null);
 
