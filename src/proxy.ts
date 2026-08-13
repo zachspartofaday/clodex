@@ -84,6 +84,7 @@ type ProxyLog = (message: string | (() => string)) => void;
 const STREAM_KEEPALIVE_INTERVAL_MS = 20_000;
 const STREAM_KEEPALIVE_PING = 'event: ping\ndata: {"type":"ping"}\n\n';
 const INTERNAL_ADAPTER_KEEPALIVE_TIMEOUT_MS = 60_000;
+const CANONICAL_UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
 
 function createTranslationLifecycle(
   logPath: string | undefined,
@@ -433,8 +434,10 @@ export async function startProxyCatalog(
       // Without a correlation id the translation lifecycle records nothing at
       // all, so a request that reaches the adapter directly (no http-proxy hop
       // to stamp the header) would have no terminal record. Mint one instead.
-      const relayRequestId = (Array.isArray(relayRequestIdRaw) ? relayRequestIdRaw[0] : relayRequestIdRaw)
-        ?? randomUUID();
+      // Only the UUID minted by http-proxy is trusted across persisted records.
+      const relayRequestId = typeof relayRequestIdRaw === 'string' && CANONICAL_UUID_RE.test(relayRequestIdRaw)
+        ? relayRequestIdRaw
+        : randomUUID();
 
       // Per-request route resolution: look up the alias, fall back to default
       const resolvedRoute = typeof originalModel === 'string'

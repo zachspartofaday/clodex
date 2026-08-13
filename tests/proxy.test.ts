@@ -991,7 +991,7 @@ describe('translated request cancellation', () => {
           'Content-Type': 'application/json',
           Authorization: `Bearer ${handle.token}`,
           'Content-Length': Buffer.byteLength(payload),
-          'x-relay-request-id': 'req-cancel-1',
+          'x-relay-request-id': '00000000-0000-4000-8000-000000000101',
         },
       });
       request.on('error', () => {});
@@ -1004,7 +1004,7 @@ describe('translated request cancellation', () => {
         const entries = readFileSync(inferenceLogPath, 'utf8').trim().split('\n').map(line => JSON.parse(line));
         expect(entries).toContainEqual(expect.objectContaining({
           event: 'translation_cancelled',
-          requestId: 'req-cancel-1',
+          requestId: '00000000-0000-4000-8000-000000000101',
           phase: 'translating',
         }));
       });
@@ -1040,14 +1040,14 @@ describe('SDK translated error logging', () => {
         max_tokens: 100,
         messages: {},
         stream: true,
-      }, 'req-translate-error');
+      }, '00000000-0000-4000-8000-000000000102');
 
       expect(res.status).toBe(502);
       expect(res.body).toContain('error');
       const entries = readFileSync(inferenceLogPath, 'utf8').trim().split('\n').map(line => JSON.parse(line));
       expect(entries).toContainEqual(expect.objectContaining({
         event: 'translation_failed',
-        requestId: 'req-translate-error',
+        requestId: '00000000-0000-4000-8000-000000000102',
         phase: 'preparing_translation',
         sdkParts: 0,
         translatedBytes: 0,
@@ -1097,7 +1097,7 @@ describe('SDK translated error logging', () => {
         max_tokens: 100,
         messages: [{ role: 'user', content: 'hi' }],
         stream: true,
-      }, 'req-error-1');
+      }, '00000000-0000-4000-8000-000000000103');
 
       expect(res.status).toBe(400);
       expect(res.headers['retry-after']).toBeUndefined();
@@ -1106,7 +1106,7 @@ describe('SDK translated error logging', () => {
       const errorEntry = entries.find(entry => entry.event === 'upstream_error');
       expect(errorEntry).toMatchObject({
         event: 'upstream_error',
-        requestId: 'req-error-1',
+        requestId: '00000000-0000-4000-8000-000000000103',
         modelId: route.aliasId,
         provider: 'test-provider',
         route: 'translated',
@@ -1117,17 +1117,17 @@ describe('SDK translated error logging', () => {
       expect(errorEntry.errorContent).toContain('translated request rejected');
       expect(entries).toContainEqual(expect.objectContaining({
         event: 'translation_dispatched',
-        requestId: 'req-error-1',
+        requestId: '00000000-0000-4000-8000-000000000103',
         phase: 'waiting_for_sdk',
       }));
       expect(entries).toContainEqual(expect.objectContaining({
         event: 'translation_started',
-        requestId: 'req-error-1',
+        requestId: '00000000-0000-4000-8000-000000000103',
         lastPartType: 'start',
       }));
       expect(entries).toContainEqual(expect.objectContaining({
         event: 'translation_failed',
-        requestId: 'req-error-1',
+        requestId: '00000000-0000-4000-8000-000000000103',
         lastPartType: 'error',
         terminalOutcome: 'error',
         terminalCategory: 'upstream_error',
@@ -1236,13 +1236,13 @@ describe('SDK translated error logging', () => {
         max_tokens: 100,
         messages: [{ role: 'user', content: 'test transport failure' }],
         stream: true,
-      }, 'req-transport-error');
+      }, '00000000-0000-4000-8000-000000000104');
 
       expect(res.status).toBe(400);
       const entries = readFileSync(inferenceLogPath, 'utf8').trim().split('\n').map(line => JSON.parse(line));
       expect(entries).toContainEqual(expect.objectContaining({
         event: 'translation_failed',
-        requestId: 'req-transport-error',
+        requestId: '00000000-0000-4000-8000-000000000104',
         errorCode: 'websocket_transport_error',
       }));
     } finally {
@@ -1291,7 +1291,7 @@ describe('SDK translated error logging', () => {
         max_tokens: 100,
         messages: [{ role: 'user', content: 'This prompt is too long.' }],
         stream: true,
-      }, 'req-context-overflow');
+      }, '00000000-0000-4000-8000-000000000105');
 
       expect(res.status).toBe(400);
       const body = JSON.parse(res.body) as {
@@ -1302,7 +1302,7 @@ describe('SDK translated error logging', () => {
       expect(body).toMatchObject({
         type: 'error',
         error: { type: 'invalid_request_error' },
-        request_id: 'req-context-overflow',
+        request_id: '00000000-0000-4000-8000-000000000105',
       });
       expect(body.error.message).toMatch(/^prompt is too long: \d+ tokens > 10 maximum$/);
     } finally {
@@ -1366,7 +1366,7 @@ describe('SDK translated error logging', () => {
         handle.port,
         handle.token,
         requestBody,
-        'req-success-1',
+        '00000000-0000-4000-8000-000000000106',
         '/v1/messages',
         claudeSessionId,
       );
@@ -1396,18 +1396,18 @@ describe('SDK translated error logging', () => {
       const entries = readFileSync(inferenceLogPath, 'utf8').trim().split('\n').map(line => JSON.parse(line));
       expect(entries).toContainEqual(expect.objectContaining({
         event: 'translation_dispatched',
-        requestId: 'req-success-1',
+        requestId: '00000000-0000-4000-8000-000000000106',
         claudeSessionId,
         phase: 'waiting_for_sdk',
       }));
       expect(entries).toContainEqual(expect.objectContaining({
         event: 'translation_started',
-        requestId: 'req-success-1',
+        requestId: '00000000-0000-4000-8000-000000000106',
         claudeSessionId,
       }));
       expect(entries).toContainEqual(expect.objectContaining({
         event: 'translation_completed',
-        requestId: 'req-success-1',
+        requestId: '00000000-0000-4000-8000-000000000106',
         claudeSessionId,
         lastPartType: 'finish',
       }));
@@ -1490,7 +1490,7 @@ describe('SDK translated error logging', () => {
         max_tokens: 100,
         messages: [{ role: 'user', content: 'call a tool with a big argument' }],
         stream: true,
-      }, 'req-keepalive-1');
+      }, '00000000-0000-4000-8000-000000000107');
 
       expect(res.status).toBe(200);
       // At least one ping must have been injected during the buffering window.
@@ -1579,6 +1579,134 @@ describe('SDK translated error logging', () => {
     }
   }, 20_000);
 
+  it('preserves a valid relay request id across persisted lifecycle records', async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'clodex-sdk-preserved-id-'));
+    const inferenceLogPath = join(dir, 'inference.jsonl');
+    const requestId = '00000000-0000-4000-8000-000000000042';
+    const upstream = http.createServer((req, res) => {
+      req.resume();
+      res.writeHead(200, { 'Content-Type': 'application/json', 'Connection': 'close' });
+      res.end(JSON.stringify({
+        id: 'chatcmpl-preserved',
+        object: 'chat.completion',
+        created: 1,
+        model: 'translated-model',
+        choices: [{ index: 0, message: { role: 'assistant', content: 'hello' }, finish_reason: 'stop' }],
+        usage: { prompt_tokens: 3, completion_tokens: 1, total_tokens: 4 },
+      }));
+    });
+    await new Promise<void>((resolve, reject) => {
+      upstream.once('error', reject);
+      upstream.listen(0, '127.0.0.1', () => resolve());
+    });
+    const address = upstream.address();
+    if (!address || typeof address === 'string') throw new Error('test upstream did not bind');
+    const route: ProxyRoute = {
+      aliasId: 'clodex:test:translated-model',
+      realModelId: 'translated-model',
+      displayName: 'Translated Model',
+      upstreamUrl: '',
+      apiKey: 'provider-key',
+      modelFormat: 'openai',
+      npm: '@ai-sdk/openai-compatible',
+      baseURL: `http://127.0.0.1:${address.port}/v1`,
+      providerId: 'test-provider',
+    };
+    const handle = await startProxyCatalog([route], route.aliasId, false, inferenceLogPath);
+
+    try {
+      const res = await postToProxy(handle.port, handle.token, {
+        model: route.aliasId,
+        max_tokens: 100,
+        messages: [{ role: 'user', content: 'hi' }],
+        stream: false,
+      }, requestId);
+
+      expect(res.status).toBe(200);
+      const entries = readFileSync(inferenceLogPath, 'utf8').trim().split('\n').map(line => JSON.parse(line));
+      expect(entries).toContainEqual(expect.objectContaining({
+        event: 'translation_dispatched',
+        requestId,
+        phase: 'waiting_for_sdk',
+      }));
+      expect(entries).toContainEqual(expect.objectContaining({
+        event: 'translation_completed',
+        requestId,
+        phase: 'waiting_for_sdk',
+      }));
+      expect(entries.every(entry => entry.requestId === requestId)).toBe(true);
+    } finally {
+      handle.close();
+      await new Promise<void>(resolve => upstream.close(() => resolve()));
+      rmSync(dir, { recursive: true, force: true });
+    }
+  }, 20_000);
+
+  it('replaces arbitrary relay ids before persisting lifecycle records', async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'clodex-sdk-invalid-id-'));
+    const inferenceLogPath = join(dir, 'inference.jsonl');
+    const invalidIds = [
+      'https://accounts.example.test/provider/token-secret',
+      'account-private-identifier',
+      'provider-account-token',
+      'token-secret-value',
+    ];
+    const upstream = http.createServer((req, res) => {
+      req.resume();
+      res.writeHead(200, { 'Content-Type': 'application/json', 'Connection': 'close' });
+      res.end(JSON.stringify({
+        id: 'chatcmpl-replaced',
+        object: 'chat.completion',
+        created: 1,
+        model: 'translated-model',
+        choices: [{ index: 0, message: { role: 'assistant', content: 'hello' }, finish_reason: 'stop' }],
+        usage: { prompt_tokens: 3, completion_tokens: 1, total_tokens: 4 },
+      }));
+    });
+    await new Promise<void>((resolve, reject) => {
+      upstream.once('error', reject);
+      upstream.listen(0, '127.0.0.1', () => resolve());
+    });
+    const address = upstream.address();
+    if (!address || typeof address === 'string') throw new Error('test upstream did not bind');
+    const route: ProxyRoute = {
+      aliasId: 'clodex:test:translated-model',
+      realModelId: 'translated-model',
+      displayName: 'Translated Model',
+      upstreamUrl: '',
+      apiKey: 'provider-key',
+      modelFormat: 'openai',
+      npm: '@ai-sdk/openai-compatible',
+      baseURL: `http://127.0.0.1:${address.port}/v1`,
+      providerId: 'test-provider',
+    };
+    const handle = await startProxyCatalog([route], route.aliasId, false, inferenceLogPath);
+
+    try {
+      for (const invalidId of invalidIds) {
+        const res = await postToProxy(handle.port, handle.token, {
+          model: route.aliasId,
+          max_tokens: 100,
+          messages: [{ role: 'user', content: 'hi' }],
+          stream: false,
+        }, invalidId);
+        expect(res.status).toBe(200);
+      }
+
+      const entries = readFileSync(inferenceLogPath, 'utf8').trim().split('\n').map(line => JSON.parse(line));
+      for (const entry of entries) {
+        expect(entry.requestId).toMatch(/^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i);
+        for (const invalidId of invalidIds) {
+          expect(JSON.stringify(entry)).not.toContain(invalidId);
+        }
+      }
+    } finally {
+      handle.close();
+      await new Promise<void>(resolve => upstream.close(() => resolve()));
+      rmSync(dir, { recursive: true, force: true });
+    }
+  }, 20_000);
+
   it('logs dispatch and completion for a non-streaming translated request', async () => {
     const dir = mkdtempSync(join(tmpdir(), 'clodex-sdk-nonstream-'));
     const inferenceLogPath = join(dir, 'inference.jsonl');
@@ -1619,18 +1747,18 @@ describe('SDK translated error logging', () => {
         max_tokens: 100,
         messages: [{ role: 'user', content: 'hi' }],
         stream: false,
-      }, 'req-nonstream-1');
+      }, '00000000-0000-4000-8000-000000000108');
 
       expect(res.status).toBe(200);
       const entries = readFileSync(inferenceLogPath, 'utf8').trim().split('\n').map(line => JSON.parse(line));
       expect(entries).toContainEqual(expect.objectContaining({
         event: 'translation_dispatched',
-        requestId: 'req-nonstream-1',
+        requestId: '00000000-0000-4000-8000-000000000108',
         phase: 'waiting_for_sdk',
       }));
       expect(entries).toContainEqual(expect.objectContaining({
         event: 'translation_completed',
-        requestId: 'req-nonstream-1',
+        requestId: '00000000-0000-4000-8000-000000000108',
         phase: 'waiting_for_sdk',
       }));
     } finally {
