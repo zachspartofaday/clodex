@@ -89,6 +89,9 @@ export function loadPreferences(): UserPreferences {
     recentModelsByProvider: config.recentModelsByProvider,
     favoriteModels: config.favoriteModels,
     modelAliases: config.modelAliases,
+    modelProfiles: config.modelProfiles,
+    activeModelProfile: config.activeModelProfile,
+    builtinModelOverrides: config.builtinModelOverrides,
     claudeBridgeMode: config.claudeBridgeMode,
     serverBridgeMode: config.serverBridgeMode,
     appPathOverrides: config.appPathOverrides,
@@ -99,13 +102,22 @@ export function loadPreferences(): UserPreferences {
   };
 }
 
-export function savePreferences(prefs: Partial<Pick<UserPreferences, 'lastModel' | 'lastProvider' | 'recentModelsByProvider' | 'favoriteModels' | 'modelAliases' | 'claudeBridgeMode' | 'serverBridgeMode' | 'appPathOverrides' | 'localPatchesEnabled' | 'effortPolicy' | 'recentLaunchFolders'>>): void {
+export function savePreferences(prefs: Partial<Pick<UserPreferences, 'lastModel' | 'lastProvider' | 'recentModelsByProvider' | 'favoriteModels' | 'modelAliases' | 'modelProfiles' | 'activeModelProfile' | 'builtinModelOverrides' | 'claudeBridgeMode' | 'serverBridgeMode' | 'appPathOverrides' | 'localPatchesEnabled' | 'effortPolicy' | 'recentLaunchFolders'>>): void {
   updateConfig(config => {
     if (prefs.lastModel !== undefined) config.lastModel = prefs.lastModel;
     if (prefs.lastProvider !== undefined) config.lastProvider = prefs.lastProvider;
     if (prefs.recentModelsByProvider !== undefined) config.recentModelsByProvider = prefs.recentModelsByProvider;
     if (prefs.favoriteModels !== undefined) config.favoriteModels = prefs.favoriteModels;
     if (prefs.modelAliases !== undefined) config.modelAliases = prefs.modelAliases;
+    if (prefs.modelProfiles !== undefined) config.modelProfiles = prefs.modelProfiles;
+    if (prefs.builtinModelOverrides !== undefined) {
+      if (Object.keys(prefs.builtinModelOverrides).length === 0) delete config.builtinModelOverrides;
+      else config.builtinModelOverrides = prefs.builtinModelOverrides;
+    }
+    if (prefs.activeModelProfile !== undefined) {
+      if (prefs.activeModelProfile === '') delete config.activeModelProfile;
+      else config.activeModelProfile = prefs.activeModelProfile;
+    }
     if (prefs.claudeBridgeMode !== undefined) config.claudeBridgeMode = prefs.claudeBridgeMode;
     if (prefs.serverBridgeMode !== undefined) config.serverBridgeMode = prefs.serverBridgeMode;
     if (prefs.appPathOverrides !== undefined) config.appPathOverrides = prefs.appPathOverrides;

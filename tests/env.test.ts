@@ -16,6 +16,7 @@ import { createHash } from 'node:crypto';
 
 const TEST_HELPER_ID = 'a'.repeat(64);
 import { CONFLICTING_ENV_VARS } from '../src/constants.js';
+import { SONNET_DEFAULT_PROBE_MARKER_ENV } from '../src/builtin-alias-env.js';
 
 const UPSTREAM_URL = 'https://api.example.com';
 
@@ -232,6 +233,34 @@ describe('buildChildEnv', () => {
     expect(env['ANTHROPIC_DEFAULT_OPUS_MODEL']).toBeUndefined();
   });
 
+  it('clears the Sonnet probe marker whose value the sweep just discarded', () => {
+    // Endpoint launches inherit the env of a proxy-launched Claude process.
+    // The sweep always drops ANTHROPIC_DEFAULT_SONNET_MODEL, so a surviving
+    // marker is unpaired: a later explicit sonnet default with that same value
+    // would be read as a clodex injection and skipped for auto-mode
+    // classification, reinstating the bug from the opposite direction.
+    process.env['ANTHROPIC_DEFAULT_SONNET_MODEL'] = 'luna';
+    process.env[SONNET_DEFAULT_PROBE_MARKER_ENV] = 'luna';
+    try {
+      const env = buildChildEnv(UPSTREAM_URL, 'claude-sonnet-4-6', 'my-key');
+      expect(env['ANTHROPIC_DEFAULT_SONNET_MODEL']).toBeUndefined();
+      expect(env[SONNET_DEFAULT_PROBE_MARKER_ENV]).toBeUndefined();
+    } finally {
+      delete process.env['ANTHROPIC_DEFAULT_SONNET_MODEL'];
+      delete process.env[SONNET_DEFAULT_PROBE_MARKER_ENV];
+    }
+  });
+
+  it('clears an unpaired marker too, since the value it named cannot survive', () => {
+    process.env[SONNET_DEFAULT_PROBE_MARKER_ENV] = 'stale';
+    try {
+      const env = buildChildEnv(UPSTREAM_URL, 'claude-sonnet-4-6', 'my-key');
+      expect(env[SONNET_DEFAULT_PROBE_MARKER_ENV]).toBeUndefined();
+    } finally {
+      delete process.env[SONNET_DEFAULT_PROBE_MARKER_ENV];
+    }
+  });
+
   it('sets ANTHROPIC_BASE_URL to backend URL', () => {
     const env = buildChildEnv(UPSTREAM_URL, 'claude-sonnet-4-6', 'my-key');
     expect(env['ANTHROPIC_BASE_URL']).toBe(UPSTREAM_URL);
@@ -301,6 +330,20 @@ describe('buildChildEnv', () => {
 });
 
 describe('buildHttpProxyChildEnv', () => {
+  it("keeps a parent's own paired probe marker, which its sonnet default survives with", () => {
+    // Why the endpoint fix is a targeted delete and not a CONFLICTING_ENV_VARS
+    // entry: this sweep shares that list but PRESERVES an explicit sonnet
+    // default, so here the marker is still valid provenance describing a value
+    // that is still present. Dropping it would make Claude Code stop
+    // recognising its own probe-written default.
+    const env = buildHttpProxyChildEnv(18181, '/tmp/relay-ca.pem', {
+      ANTHROPIC_DEFAULT_SONNET_MODEL: 'parent-written',
+      [SONNET_DEFAULT_PROBE_MARKER_ENV]: 'parent-written',
+    });
+    expect(env['ANTHROPIC_DEFAULT_SONNET_MODEL']).toBe('parent-written');
+    expect(env[SONNET_DEFAULT_PROBE_MARKER_ENV]).toBe('parent-written');
+  });
+
   it('sets proxy trust without replacing normal Anthropic credentials or model', () => {
     const env = buildHttpProxyChildEnv(18181, '/tmp/relay-ca.pem', {
       ANTHROPIC_API_KEY: 'normal-api-key',

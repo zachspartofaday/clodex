@@ -1,6 +1,12 @@
 // src/env.ts
 import { CONFLICTING_ENV_VARS } from './constants.js';
 import {
+  applyBuiltinModelOverridesWithProvenance,
+  SESSION_PROXY_ENV,
+  SONNET_DEFAULT_PROBE_MARKER_ENV,
+} from './builtin-alias-env.js';
+export { BUILTIN_ALIAS_ENV, applyBuiltinModelOverrides } from './builtin-alias-env.js';
+import {
   createCipheriv,
   createDecipheriv,
   createHash,
@@ -39,7 +45,7 @@ import {
   withCredentialMutationLock,
   withRegistryWriteLock,
 } from './registry/lock.js';
-import type { ConflictInfo } from './types.js';
+import type { BuiltinAliasName, ConflictInfo } from './types.js';
 import { removeAnthropicProxyBypass } from './wrapper-env.js';
 import { networkEnvBaseline, recordNetworkEnvMutation } from './network-env.js';
 
@@ -167,6 +173,16 @@ export function buildChildEnv(
   for (const name of CONFLICTING_ENV_VARS) {
     delete env[name];
   }
+  // That sweep always drops ANTHROPIC_DEFAULT_SONNET_MODEL, so a probe marker
+  // surviving it describes a value this env no longer has. Left in place it is
+  // inherited unpaired by endpoint descendants and later native launches, where
+  // an explicit ANTHROPIC_DEFAULT_SONNET_MODEL set to the same value would be
+  // mistaken for a clodex injection and bypassed for auto-mode classification.
+  //
+  // Deleted here rather than added to CONFLICTING_ENV_VARS on purpose:
+  // buildHttpProxyChildEnv sweeps the same list but PRESERVES an explicit
+  // sonnet default, and there the marker is the parent's own valid provenance.
+  delete env[SONNET_DEFAULT_PROBE_MARKER_ENV];
   env['ANTHROPIC_BASE_URL'] = proxyPort
     ? `http://127.0.0.1:${proxyPort}`
     : baseUrl;
@@ -197,6 +213,7 @@ export function buildHttpProxyChildEnv(
   proxyPort: number,
   caCertPath: string,
   baseEnv: NodeJS.ProcessEnv = process.env,
+  builtinOverrides?: Partial<Record<BuiltinAliasName, string>>,
 ): NodeJS.ProcessEnv {
   const baseline = networkEnvBaseline(baseEnv);
   const env: NodeJS.ProcessEnv = { ...baseline };
@@ -204,11 +221,15 @@ export function buildHttpProxyChildEnv(
     if (name === 'ANTHROPIC_API_KEY' || name === 'ANTHROPIC_AUTH_TOKEN' || name === 'ANTHROPIC_MODEL') continue;
     delete env[name];
   }
+  applyBuiltinModelOverridesWithProvenance(env, builtinOverrides, baseEnv);
   const proxyUrl = `http://127.0.0.1:${proxyPort}`;
   env['HTTPS_PROXY'] = proxyUrl;
   env['HTTP_PROXY'] = proxyUrl;
   env['https_proxy'] = proxyUrl;
   env['http_proxy'] = proxyUrl;
+  // Explicit session marker: nested wrappers must recognize this env as a
+  // live session proxy without path heuristics (see insideSessionProxy).
+  env[SESSION_PROXY_ENV] = `${proxyPort}:${process.pid}`;
   env['NODE_EXTRA_CA_CERTS'] = caCertPath;
   removeAnthropicProxyBypass(env);
   recordNetworkEnvMutation(baseline, env);

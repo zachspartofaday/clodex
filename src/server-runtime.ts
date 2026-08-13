@@ -35,6 +35,7 @@ import {
   writeFileSync,
 } from 'node:fs';
 import { dirname, join } from 'node:path';
+import type { BuiltinAliasName } from './types.js';
 import { getAppHome } from './paths.js';
 
 export interface ServerRuntimeState {
@@ -43,6 +44,13 @@ export interface ServerRuntimeState {
   pid: number;
   /** Proxy mode only: absolute path to the CA bundle a client must trust. */
   caPath?: string;
+  /**
+   * Proxy mode only: built-in alias remaps ALREADY validated against the
+   * route table this server loaded at startup. Wrappers must apply these —
+   * never current preferences — so a remap saved after the server started
+   * cannot inject a name the running server never loaded.
+   */
+  builtinModelOverrides?: Partial<Record<BuiltinAliasName, string>>;
   startedAt: string;
 }
 
@@ -90,9 +98,35 @@ export function parseServerRuntimeRecord(value: unknown): ServerRuntimeState | n
   if (mode === 'proxy') {
     // A proxy-mode server without a CA path is unusable to clients — treat as invalid.
     if (typeof caPath !== 'string' || !caPath.trim()) return null;
-    return { mode, port: record['port'], pid, caPath, startedAt };
+    // The route-bound remap snapshot must survive the parse, or every wrapper
+    // launch silently reverts the configured built-ins to their native models
+    // (the same drop-the-new-optional-field defect the registry parser had
+    // with authAccounts). Malformed shapes drop the FIELD, not the record —
+    // a readable server beats a lost remap.
+    const overrides = parseBuiltinModelOverrides(record['builtinModelOverrides']);
+    return {
+      mode,
+      port: record['port'],
+      pid,
+      caPath,
+      ...(overrides ? { builtinModelOverrides: overrides } : {}),
+      startedAt,
+    };
   }
   return { mode, port: record['port'], pid, startedAt };
+}
+
+const BUILTIN_ALIAS_NAMES = new Set(['sonnet', 'opus', 'haiku', 'fable']);
+
+function parseBuiltinModelOverrides(raw: unknown): Partial<Record<BuiltinAliasName, string>> | null {
+  if (!raw || typeof raw !== 'object' || Array.isArray(raw)) return null;
+  const out: Partial<Record<BuiltinAliasName, string>> = {};
+  for (const [alias, target] of Object.entries(raw as Record<string, unknown>)) {
+    if (!BUILTIN_ALIAS_NAMES.has(alias)) return null;
+    if (typeof target !== 'string' || !target.trim()) return null;
+    out[alias as BuiltinAliasName] = target;
+  }
+  return Object.keys(out).length > 0 ? out : null;
 }
 
 /**

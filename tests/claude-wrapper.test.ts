@@ -46,6 +46,16 @@ async function runWrapper(
   if (!Object.hasOwn(envOverrides, 'CLODEX_OAUTH_ACCOUNT')) {
     delete env['CLODEX_OAUTH_ACCOUNT'];
   }
+  // These describe a routing state the DEVELOPER's shell may be in — running
+  // this suite from inside a live `clodex claude --proxy` session, or from a
+  // shell a previous launch injected remaps into. Inherited, they would make
+  // the wrapper prefer that real session over the fake standalone servers
+  // these cases advertise, so the suite's result would depend on how the
+  // developer's terminal was started. Scrubbed like the other clodex vars
+  // above, unless a case sets one deliberately.
+  for (const name of ['CLODEX_SESSION_PROXY', 'CLODEX_INJECTED_BUILTINS'] as const) {
+    if (!Object.hasOwn(envOverrides, name)) delete env[name];
+  }
   for (const name of Object.keys(env)) {
     if (/^CLODEX_KEY_[A-Z0-9_]+$/.test(name) && !Object.hasOwn(envOverrides, name)) {
       delete env[name];

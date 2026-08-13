@@ -6,6 +6,13 @@
 // stays tiny and fast — it runs for every Claude-Code-spawned agent process.
 
 import type { ServerRuntimeState } from './server-runtime.js';
+import type { BuiltinAliasName } from './types.js';
+import {
+  applyBuiltinModelOverridesWithProvenance,
+  clearInheritedBuiltinOverrides,
+  insideSessionProxy,
+  SESSION_PROXY_ENV,
+} from './builtin-alias-env.js';
 import {
   networkEnvBaseline,
   PROXY_ENV_VARS,
@@ -53,16 +60,68 @@ export function wrapperRequiresServer(env: NodeJS.ProcessEnv): boolean {
   return env[REQUIRE_SERVER_ENV] === '1';
 }
 
+/** kill(pid, 0) liveness: EPERM still means the process exists. */
+function sessionProxyOwnerAlive(pid: number): boolean {
+  try {
+    process.kill(pid, 0);
+    return true;
+  } catch (err) {
+    return (err as NodeJS.ErrnoException).code === 'EPERM';
+  }
+}
+
+/**
+ * Drop the routing state a PREVIOUS clodex launch stamped into this env. Every
+ * path below either repoints routing or falls back to none, so the marker no
+ * longer describes reality. That includes the proxy vars themselves: a dead
+ * session's HTTP(S)_PROXY would strand claude on a port nobody is listening
+ * on, defeating the no-server fallback. Only vars that still point at the
+ * MARKED session port are cleared — anything else (a corp proxy, a user-set
+ * value) is not ours to touch.
+ */
+function clearSessionProxyRouting(env: NodeJS.ProcessEnv, baseEnv: NodeJS.ProcessEnv): void {
+  const marker = /^(\d+)(?::\d+)?$/.exec((baseEnv[SESSION_PROXY_ENV] ?? '').trim());
+  if (marker) {
+    const marked = `http://127.0.0.1:${marker[1]}`;
+    for (const name of PROXY_ENV_VARS) {
+      if (env[name] === marked) delete env[name];
+    }
+  }
+  delete env[SESSION_PROXY_ENV];
+}
+
 export function computeWrapperEnv(
   baseEnv: NodeJS.ProcessEnv,
   state: ServerRuntimeState | null,
+  builtinOverrides?: Partial<Record<BuiltinAliasName, string>>,
+  opts?: { isAlive?: (pid: number) => boolean; sessionProxyActive?: boolean },
 ): NodeJS.ProcessEnv {
+  // A verified private session is the parent Claude process's routing
+  // authority. It must outrank every independently discovered standalone
+  // server, or a background agent can silently switch profile snapshots and
+  // lose aliases that exist only in its parent session. The wrapper entry
+  // point additionally TCP-probes the marked listener and passes the result
+  // through `sessionProxyActive`; direct callers retain the owner-liveness
+  // fallback for this pure helper.
+  const sessionProxyActive = opts?.sessionProxyActive
+    ?? insideSessionProxy(baseEnv, opts?.isAlive ?? sessionProxyOwnerAlive);
+  if (sessionProxyActive) return { ...baseEnv };
+
   // No live server: launch claude completely untouched — a down server must
-  // never break launching claude.
-  if (!state) return { ...baseEnv };
+  // never break launching claude. The one exception is clodex's OWN stale
+  // state: an inherited injection is ours, never the user's, and leaving it
+  // sends an alias straight to Anthropic as an unknown model id.
+  if (!state) {
+    const untouched: NodeJS.ProcessEnv = { ...baseEnv };
+    clearSessionProxyRouting(untouched, baseEnv);
+    clearInheritedBuiltinOverrides(untouched, baseEnv);
+    return untouched;
+  }
 
   const baseline = networkEnvBaseline(baseEnv);
   const env: NodeJS.ProcessEnv = { ...baseline };
+  clearSessionProxyRouting(env, baseEnv);
+  clearInheritedBuiltinOverrides(env, baseEnv);
 
   if (state.mode === 'proxy') {
     // Selective MITM: claude keeps its own Anthropic credentials; the proxy
@@ -71,6 +130,12 @@ export function computeWrapperEnv(
     delete env['ANTHROPIC_BASE_URL'];
     for (const name of PROXY_ENV_VARS) env[name] = proxyUrl;
     if (state.caPath) env['NODE_EXTRA_CA_CERTS'] = state.caPath;
+    // The same built-in remap the per-session `clodex claude` proxy launch
+    // applies (env.ts): saved sonnet/opus/haiku/fable overrides must also
+    // reach a claude launched through a discovered standalone server, or the
+    // remap silently depends on how claude was started. An env var the user
+    // set explicitly still wins.
+    applyBuiltinModelOverridesWithProvenance(env, builtinOverrides, baseEnv);
     removeAnthropicProxyBypass(env);
     recordNetworkEnvMutation(baseline, env);
     return env;

@@ -27,10 +27,12 @@
 import { spawn } from 'node:child_process';
 import { accessSync, constants as fsConstants, statSync } from 'node:fs';
 import { constants as osConstants } from 'node:os';
+import { SESSION_PROXY_ENV } from './builtin-alias-env.js';
 import { OAUTH_ACCOUNT_ENV } from './oauth-account-selection.js';
 import { findClaudeBinary } from './claude-binary.js';
-import { waitForTcpListenerCandidate } from './listener-ready.js';
+import { waitForTcpListener, waitForTcpListenerCandidate } from './listener-ready.js';
 import {
+  isPidAlive,
   orderWrapperServerCandidates,
   readLiveServerRuntimeStates,
   type ServerRuntimeState,
@@ -48,6 +50,35 @@ function isExecutableFile(path: string): boolean {
   } catch {
     return false;
   }
+}
+
+interface SessionProxyCandidate {
+  kind: 'session';
+  port: number;
+}
+
+interface StandaloneServerCandidate {
+  kind: 'server';
+  port: number;
+  state: ServerRuntimeState;
+}
+
+/**
+ * Recover the private `clodex claude --proxy` listener inherited by a nested
+ * process. The marker is accepted only when it names a valid loopback HTTPS
+ * proxy and its owner pid still exists; the common TCP probe below then proves
+ * the listener itself is reachable before this candidate can win.
+ */
+function inheritedSessionProxyCandidate(env: NodeJS.ProcessEnv): SessionProxyCandidate | null {
+  const marker = /^(\d+):(\d+)$/.exec((env[SESSION_PROXY_ENV] ?? '').trim());
+  if (!marker) return null;
+  const port = Number(marker[1]);
+  const ownerPid = Number(marker[2]);
+  if (!Number.isInteger(port) || port < 1 || port > 65_535) return null;
+  if (!Number.isInteger(ownerPid) || ownerPid <= 0 || !isPidAlive(ownerPid)) return null;
+  const proxyUrl = env['HTTPS_PROXY'] ?? env['https_proxy'] ?? '';
+  if (proxyUrl !== `http://127.0.0.1:${port}`) return null;
+  return { kind: 'session', port };
 }
 
 function activeProviderCredentialOverride(env: NodeJS.ProcessEnv): string | null {
@@ -131,15 +162,49 @@ async function main(): Promise<void> {
   // probe round covers every candidate so an unreachable preferred record
   // cannot delay a reachable fallback. Timed-out probes retry under one shared
   // deadline; definitive connection errors fail immediately.
-  const candidates = orderWrapperServerCandidates(readLiveServerRuntimeStates());
-  const state: ServerRuntimeState | null = await waitForTcpListenerCandidate(
+  const standaloneCandidates: StandaloneServerCandidate[] = orderWrapperServerCandidates(
+    readLiveServerRuntimeStates(),
+  ).map(state => ({ kind: 'server', port: state.port, state }));
+
+  // Service-manager readiness remains a check of ADVERTISED standalone
+  // servers, per the public --check contract. It never launches Claude.
+  if (checkOnly) {
+    const advertised = await waitForTcpListenerCandidate(
+      '127.0.0.1',
+      standaloneCandidates,
+      WRAPPER_SERVER_READY_TIMEOUT_MS,
+      { retryFailure: result => result === 'timeout' },
+    );
+    process.exit(advertised ? 0 : 1);
+  }
+
+  // A verified private session is absolute routing authority for a nested
+  // wrapper. Probe it and the best standalone candidates concurrently, but do
+  // not allow a ready lower-priority server to win while the session's bounded
+  // probe is still pending: under load, one loopback connect may time out even
+  // though the parent session remains healthy. If the session definitively
+  // refuses or misses the shared deadline, the already-running standalone
+  // probe supplies the fallback without adding a second serial delay.
+  const sessionCandidate = inheritedSessionProxyCandidate(process.env);
+  const standaloneProbe = waitForTcpListenerCandidate(
     '127.0.0.1',
-    candidates,
+    standaloneCandidates,
     WRAPPER_SERVER_READY_TIMEOUT_MS,
     { retryFailure: result => result === 'timeout' },
   );
-  if (checkOnly) process.exit(state ? 0 : 1);
-  if (!state && wrapperRequiresServer(process.env)) {
+  const sessionProxyActive = sessionCandidate
+    ? await waitForTcpListener(
+        '127.0.0.1',
+        sessionCandidate.port,
+        WRAPPER_SERVER_READY_TIMEOUT_MS,
+        { retryFailure: result => result === 'timeout' },
+      )
+    : false;
+  const selectedServer = sessionProxyActive ? null : await standaloneProbe;
+  const state: ServerRuntimeState | null = selectedServer?.state ?? null;
+  const hasLiveBridge = sessionProxyActive || state !== null;
+
+  if (!hasLiveBridge && wrapperRequiresServer(process.env)) {
     process.stderr.write('clodex-claude: no live clodex server is available\n');
     process.exit(1);
   }
@@ -160,7 +225,16 @@ async function main(): Promise<void> {
       + 'provider or account, refresh its models, and restart the server\n',
     );
   }
-  const env = computeWrapperEnv(process.env, state);
+  // Built-in remaps for standalone servers come from the SERVER's runtime
+  // record — validated against the route table it loaded at startup — never
+  // from current preferences. A selected private session preserves its
+  // already-inherited, route-bound environment instead.
+  const env = computeWrapperEnv(
+    process.env,
+    state,
+    state?.builtinModelOverrides,
+    { sessionProxyActive },
+  );
 
   execIntoClaude(claudePath!, claudeArgs, env);
 
