@@ -51,6 +51,27 @@ async function runWrapper(
       delete env[name];
     }
   }
+  // Test-only sandbox isolation, not a production semantic. Run from inside a
+  // live `clodex claude --proxy` session and the wrapper inherits that session's
+  // marker and network injection: `CLODEX_SESSION_PROXY` makes the wrapper treat
+  // the parent session as the routing authority and skip every advertised server
+  // this suite sets up, and the inherited proxy/CA values change the network
+  // snapshot it records. The wrapper's own behaviour on those variables is
+  // covered by tests/claude-wrapper-session-proxy.test.ts and
+  // tests/wrapper-env.test.ts, which supply them explicitly.
+  for (const name of [
+    'CLODEX_SESSION_PROXY',
+    'CLAUDE_CODE_CLODEX_NETWORK_ENV',
+    'HTTPS_PROXY',
+    'HTTP_PROXY',
+    'https_proxy',
+    'http_proxy',
+    'NO_PROXY',
+    'no_proxy',
+    'NODE_EXTRA_CA_CERTS',
+  ]) {
+    if (!Object.hasOwn(envOverrides, name)) delete env[name];
+  }
 
   return new Promise((resolveResult, reject) => {
     const child = spawn(process.execPath, [wrapperPath, ...args], {

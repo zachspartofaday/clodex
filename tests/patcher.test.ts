@@ -27,6 +27,10 @@ import {
   builtInPatchProofsChanged,
   captureBuiltInPatchProofs,
 } from '../src/built-in-patch-proofs.js';
+import {
+  NETWORK_ENV_CONTRACT_VAR,
+  networkEnvBaseline,
+} from '../src/network-env.js';
 
 /**
  * The digest a pre-versioning clodex wrote into `patch-state.json`: the bare
@@ -1111,35 +1115,37 @@ describe('computePatchConfigHash', () => {
 
 describe('PATCH_TRANSFORMS_VERSION', () => {
   // Folding the version into the config hash only helps if somebody actually
-  // bumps it. Nothing else couples an edit of patch-transforms.ts to the
+  // bumps it. Nothing else couples an edit of the transform sources to the
   // constant, and a forgotten bump reproduces exactly the silent staleness this
-  // mechanism exists to prevent — with a fully green suite. So pin the file.
+  // mechanism exists to prevent — with a fully green suite. So pin the sources.
   //
-  // WHEN THIS FAILS: patch-transforms.ts changed. Decide, deliberately:
+  // WHEN THIS FAILS: a transform source changed. Decide, deliberately:
   //   * transform set changed materially (site added/removed, or a site's regex,
   //     replacement, or ordering changed) -> bump PATCH_TRANSFORMS_VERSION AND
   //     update the digest below, in the same commit;
   //   * comment/formatting/type-only edit -> update the digest below and leave
   //     the version alone (no need to make every install repatch).
   //
-  // Scope caveat: this hashes THIS FILE only. patch-transforms.ts imports
+  // Scope caveat: this hashes the transform file and the constants that are
+  // emitted into its child-network patch. patch-transforms.ts also imports
   // `isReservedModelAlias`, so a change reaching the transforms from
   // model-aliases.ts will not trip this guard. That import feeds a `fail()` gate
   // only, so it can turn a patch into a hard PatchApplyError but cannot silently
   // alter the bytes of a patch that succeeds — the failure mode this guard exists
   // to prevent. It catches the common case (a direct edit), not every possible one.
-  it('is re-pinned deliberately whenever patch-transforms.ts changes', () => {
+  it('is re-pinned deliberately whenever a transform source changes', () => {
     // Normalize line endings: a Windows checkout with core.autocrlf=true would
     // otherwise fail this guard with zero source change, which is exactly the
     // "re-pin without thinking" reflex the guard is meant to avoid.
-    const source = readFileSync(
-      new URL('../src/patch-transforms.ts', import.meta.url),
-      'utf8',
-    ).replace(/\r\n/g, '\n');
+    const source = [
+      '../src/patch-transforms.ts',
+      '../src/network-env.ts',
+    ].map(path => readFileSync(new URL(path, import.meta.url), 'utf8').replace(/\r\n/g, '\n'))
+      .join('\n');
     const digest = createHash('sha256').update(source).digest('hex');
     expect({ version: PATCH_TRANSFORMS_VERSION, digest }).toEqual({
-      version: 8,
-      digest: '5b0e315bbade58f6702c166dc9d75a2f8bbc11a324c890a4f42d5ad2e069c54c',
+      version: 9,
+      digest: '1d9a2d7075a1160226f214f43d4c175ff067afedd63bad2a383fa0dce0963cc3',
     });
   });
 });
@@ -1416,6 +1422,11 @@ const CLAUDE_CORE_FIXTURE = [
   'function rz(x){switch(x){case"best":{return "opus"}default:return null}}',
   'function opts(e,t,r){let n=cur(),o=(n==="opus")?[n,r]:[r];for(let i of o)Dlh(e,i,t);return e}',
   'function RS(e,t){let r=FAc();if(r!==void 0)return r;if(EHi(e,t))return Dve;return $Ac(e,t)}',
+  // PATCH 10's anchor — the shared child-environment builder — plus a
+  // token-free neighbour ahead of it and a `process.env` reader behind it, so
+  // the anchor has to select the builder rather than the nearest match.
+  'function cwdOf(){let p=process.env.PWD;return p}',
+  'function childEnv(){let e=extra(),t=Object.keys(e).length>0,n=Object.keys(e).length>0,s=flag(process.env.CLAUDE_CODE_REMOTE)?remote():{};let o=[process.env.CLAUDE_CODE_OAUTH_TOKEN,process.env.CLAUDE_CODE_SUBSCRIPTION_TYPE,process.env.CLAUDE_BG_PTY_AUTH,"OTEL_",process.env.CLAUDE_CODE_OTEL_DIAG_STDERR],u=["CLAUDE_CODE_OAUTH_TOKEN"];if(!t&&!n&&!o[0])return process.env;let v={...process.env,...e,...s};for(let k of u)delete v[k],delete v[`INPUT_${k}`];return v}function mcpAllow(){let e=process.env.CLAUDE_CODE_MCP_ALLOWLIST_ENV;return e}',
 ].join('\n');
 
 const digestOf = (text: string) => createHash('sha256').update(text).digest('hex');
@@ -1788,6 +1799,39 @@ const CLAUDE_SPLIT_FIXTURE = [
 
 function runPatchScript(config: Parameters<typeof applyClodexPatches>[1], source = CLAUDE_FIXTURE): string {
   return applyClodexPatches(source, config).content;
+}
+
+/**
+ * Extract the patched child-environment builder and RUN it. Reading a regex
+ * replacement is not evidence the injected code executes, so every free
+ * identifier is bound explicitly — a name the fixture failed to account for
+ * surfaces as a ReferenceError instead of passing silently.
+ */
+function executeChildEnv(
+  source: string,
+  env: NodeJS.ProcessEnv,
+  extraEnv: NodeJS.ProcessEnv = {},
+): NodeJS.ProcessEnv {
+  const declaration = source
+    .split('\n')
+    .find(line => line.startsWith('function childEnv('));
+  expect(declaration).toBeDefined();
+  const childEnv = Function(
+    'process',
+    'extra',
+    'flag',
+    'remote',
+    // Only the 2.1.228-shaped fixture reads this; the base fixture ignores it.
+    'settings',
+    `${declaration};return childEnv;`,
+  )(
+    { env },
+    () => extraEnv,
+    () => false,
+    () => ({}),
+    { settingsColorEnv: {} },
+  ) as () => NodeJS.ProcessEnv;
+  return childEnv();
 }
 
 type CapabilityFunctionName = 'OI' | 'I_e' | 'eqe';
@@ -2179,6 +2223,323 @@ describe('patch script identity naming', () => {
     expect(executeDefaultEffort(runPatchScript(config), 'unconfigured', 'medium')).toBe('medium');
   });
 
+  // Claude Code 2.1.228 hoisted the settings-colour env into its own declarator
+  // inside the child builder's `let` statement, between the first
+  // `Object.keys(...).length>0` binding and the CLAUDE_CODE_REMOTE ternary. An
+  // anchor that counted declarators reported "anchor not found", and because
+  // PATCH 10 is required, `clodex patch` refused to patch 2.1.228 at all.
+  const CLAUDE_FIXTURE_228 = CLAUDE_FIXTURE.replace(
+    'let e=extra(),t=Object.keys(e).length>0,n=Object.keys(e).length>0,',
+    'let e=extra(),t=Object.keys(e).length>0,c=settings.settingsColorEnv,n=Object.keys(c).length>0,',
+  );
+
+  // The tolerated run is bounded to `[^;{}]` so it cannot reach out of the `let`
+  // statement it starts in. Widen it to `[\s\S]` and the anchor starts at the
+  // NEAREST preceding function whose head happens to fit, swallowing everything
+  // up to the real builder's tail — so a decoy that opens with the same two
+  // bindings must not be able to steal the match. Without this fixture the only
+  // test that reddens on that mutation is the sha256 transform-source pin, which
+  // is a tripwire, not a behavioural test.
+  const CLAUDE_FIXTURE_DECOY = CLAUDE_FIXTURE_228.replace(
+    'function childEnv(){',
+    'function zzDecoy(){let q=extra(),w=Object.keys(q).length>0,z=w?1:2;return z}'
+    + 'function childEnv(){',
+  );
+
+  it('does not let a preceding decoy with the same opening bindings steal the match', () => {
+    expect(CLAUDE_FIXTURE_DECOY, 'fixture drifted from the shape this test mutates')
+      .not.toBe(CLAUDE_FIXTURE_228);
+
+    const out = runPatchScript(config, CLAUDE_FIXTURE_DECOY);
+
+    expect(out.match(/\/\*ccpatch:child-network-env\*\//g)).toHaveLength(1);
+    expect(out).toContain('function childEnv(){/*ccpatch:child-network-env*/');
+    expect(out, 'the decoy is left exactly as it was').toContain(
+      'function zzDecoy(){let q=extra(),w=Object.keys(q).length>0,z=w?1:2;return z}',
+    );
+  });
+
+  it('patches a child builder that declares extra bindings before the remote check', () => {
+    expect(CLAUDE_FIXTURE_228, 'fixture drifted from the shape this test mutates')
+      .not.toBe(CLAUDE_FIXTURE);
+
+    const result = applyClodexPatches(CLAUDE_FIXTURE_228, config);
+
+    expect(result.results.at(-1)).toEqual({
+      status: 'OK',
+      name: 'PATCH 10: child network environment',
+    });
+    expect(result.content.match(/\/\*ccpatch:child-network-env\*\//g)).toHaveLength(1);
+    expect(result.content).toContain('function childEnv(){/*ccpatch:child-network-env*/');
+    // The added declarator survives, and the body still reads the local copy.
+    expect(result.content).toContain('c=settings.settingsColorEnv');
+    expect(result.content).toContain('let v={..._clodexChildEnv,...e,...s}');
+  });
+
+  it('restores the original network environment through the extra-binding builder', () => {
+    const out = runPatchScript(config, CLAUDE_FIXTURE_228);
+    const env = executeChildEnv(out, {
+      PATH: '/usr/bin',
+      HTTPS_PROXY: 'http://127.0.0.1:3457',
+      NODE_EXTRA_CA_CERTS: '/tmp/local-ca.pem',
+      [NETWORK_ENV_CONTRACT_VAR]: JSON.stringify({
+        version: 1,
+        original: {
+          HTTPS_PROXY: 'http://corp-proxy.example:8080',
+          NODE_EXTRA_CA_CERTS: null,
+        },
+        injected: {
+          HTTPS_PROXY: 'http://127.0.0.1:3457',
+          NODE_EXTRA_CA_CERTS: '/tmp/local-ca.pem',
+        },
+      }),
+    });
+
+    expect(env).toMatchObject({
+      PATH: '/usr/bin',
+      HTTPS_PROXY: 'http://corp-proxy.example:8080',
+    });
+    expect(env['NODE_EXTRA_CA_CERTS']).toBeUndefined();
+    expect(env[NETWORK_ENV_CONTRACT_VAR]).toBeUndefined();
+  });
+
+  it('targets the child builder when a token-bearing function follows it', () => {
+    const source = CLAUDE_FIXTURE.replace(
+      '}function mcpAllow(){',
+      '}function adjacent(){let e=process.env.CLAUDE_CODE_REMOTE;'
+      + 'return process.env.CLAUDE_CODE_OAUTH_TOKEN}function mcpAllow(){',
+    );
+    const out = runPatchScript(config, source);
+
+    expect(out.match(/\/\*ccpatch:child-network-env\*\//g)).toHaveLength(1);
+    expect(out).toContain('function childEnv(){/*ccpatch:child-network-env*/');
+    expect(out).toContain('function adjacent(){let e=process.env.CLAUDE_CODE_REMOTE;');
+    expect(out).not.toContain('function adjacent(){/*ccpatch:child-network-env*/');
+  });
+
+  it.each([
+    ['named', 'function nested(){}'],
+    ['anonymous', 'let nested=function(){};'],
+  ])('rejects a %s nested function in the child-environment patch target', (_name, nested) => {
+    const source = CLAUDE_FIXTURE.replace(
+      's=flag(process.env.CLAUDE_CODE_REMOTE)?remote():{};let o=',
+      `s=flag(process.env.CLAUDE_CODE_REMOTE)?remote():{};${nested}let o=`,
+    );
+
+    expect(() => runPatchScript(config, source)).toThrow(
+      'clodex patch: child network environment target validation failed',
+    );
+  });
+
+  it('rejects a child builder whose merge spread no longer reads process.env', () => {
+    const source = CLAUDE_FIXTURE.replace(
+      'let v={...process.env,...e,...s}',
+      'let v={...te,...e,...s}',
+    );
+
+    expect(() => runPatchScript(config, source)).toThrow(
+      'clodex patch: child network environment target validation failed',
+    );
+  });
+
+  it('restores the original network environment for child commands', () => {
+    const out = runPatchScript(config);
+    const env = executeChildEnv(out, {
+      PATH: '/usr/bin',
+      HTTPS_PROXY: 'http://127.0.0.1:3457',
+      HTTP_PROXY: 'http://127.0.0.1:3457',
+      https_proxy: 'http://127.0.0.1:3457',
+      http_proxy: 'http://127.0.0.1:3457',
+      NO_PROXY: 'localhost',
+      no_proxy: 'localhost',
+      NODE_EXTRA_CA_CERTS: '/tmp/local-ca.pem',
+      [NETWORK_ENV_CONTRACT_VAR]: JSON.stringify({
+        version: 1,
+        original: {
+          HTTPS_PROXY: 'http://corp-proxy.example:8080',
+          HTTP_PROXY: null,
+          https_proxy: null,
+          http_proxy: null,
+          NO_PROXY: '.internal.example',
+          no_proxy: null,
+          NODE_EXTRA_CA_CERTS: '/tmp/corporate-ca.pem',
+        },
+        injected: {
+          HTTPS_PROXY: 'http://127.0.0.1:3457',
+          HTTP_PROXY: 'http://127.0.0.1:3457',
+          https_proxy: 'http://127.0.0.1:3457',
+          http_proxy: 'http://127.0.0.1:3457',
+          NO_PROXY: 'localhost',
+          no_proxy: 'localhost',
+          NODE_EXTRA_CA_CERTS: '/tmp/local-ca.pem',
+        },
+      }),
+    });
+
+    expect(env).toMatchObject({
+      PATH: '/usr/bin',
+      HTTPS_PROXY: 'http://corp-proxy.example:8080',
+      NO_PROXY: '.internal.example',
+      NODE_EXTRA_CA_CERTS: '/tmp/corporate-ca.pem',
+    });
+    expect(env['HTTP_PROXY']).toBeUndefined();
+    expect(env['https_proxy']).toBeUndefined();
+    expect(env['http_proxy']).toBeUndefined();
+    expect(env['no_proxy']).toBeUndefined();
+    expect(env[NETWORK_ENV_CONTRACT_VAR]).toBeUndefined();
+  });
+
+  it('restores the original network environment on the merge branch', () => {
+    const out = runPatchScript(config);
+    const env = executeChildEnv(out, {
+      PATH: '/usr/bin',
+      HTTPS_PROXY: 'http://127.0.0.1:3457',
+      NODE_EXTRA_CA_CERTS: '/tmp/local-ca.pem',
+      [NETWORK_ENV_CONTRACT_VAR]: JSON.stringify({
+        version: 1,
+        original: {
+          HTTPS_PROXY: 'http://proxy.example.test:8080',
+          NODE_EXTRA_CA_CERTS: '/tmp/external-ca.pem',
+        },
+        injected: {
+          HTTPS_PROXY: 'http://127.0.0.1:3457',
+          NODE_EXTRA_CA_CERTS: '/tmp/local-ca.pem',
+        },
+      }),
+    }, {
+      CHILD_ENV_MARKER: 'merge-branch',
+    });
+
+    expect(env).toMatchObject({
+      PATH: '/usr/bin',
+      CHILD_ENV_MARKER: 'merge-branch',
+      HTTPS_PROXY: 'http://proxy.example.test:8080',
+      NODE_EXTRA_CA_CERTS: '/tmp/external-ca.pem',
+    });
+    expect(env[NETWORK_ENV_CONTRACT_VAR]).toBeUndefined();
+  });
+
+  it('keeps the native child environment unchanged without a wrapper snapshot', () => {
+    const out = runPatchScript(config);
+    const env = {
+      PATH: '/usr/bin',
+      HTTPS_PROXY: 'http://proxy.example:8080',
+    };
+
+    expect(executeChildEnv(out, env)).toBe(env);
+  });
+
+  it('preserves a network value replaced after the bridge was injected', () => {
+    const out = runPatchScript(config);
+    const env = executeChildEnv(out, {
+      PATH: '/usr/bin',
+      HTTPS_PROXY: 'http://settings-proxy.example:9000',
+      [NETWORK_ENV_CONTRACT_VAR]: JSON.stringify({
+        version: 1,
+        original: { HTTPS_PROXY: 'http://corp-proxy.example:8080' },
+        injected: { HTTPS_PROXY: 'http://127.0.0.1:3457' },
+      }),
+    });
+
+    expect(env).toEqual({
+      PATH: '/usr/bin',
+      HTTPS_PROXY: 'http://settings-proxy.example:9000',
+    });
+  });
+
+  it('removes a matching bridge value when the external environment had none', () => {
+    const out = runPatchScript(config);
+    const env = executeChildEnv(out, {
+      PATH: '/usr/bin',
+      HTTPS_PROXY: 'http://127.0.0.1:3457',
+      [NETWORK_ENV_CONTRACT_VAR]: JSON.stringify({
+        version: 1,
+        original: { HTTPS_PROXY: null },
+        injected: { HTTPS_PROXY: 'http://127.0.0.1:3457' },
+      }),
+    });
+
+    expect(env).toEqual({ PATH: '/usr/bin' });
+  });
+
+  it.each([
+    ['array', '[]'],
+    ['null', 'null'],
+    ['non-string value', JSON.stringify({
+      version: 1,
+      original: { HTTPS_PROXY: null },
+      injected: { HTTPS_PROXY: 42 },
+    })],
+    ['invalid JSON', '{'],
+  ])('fails open for %s child-network metadata', (_name, contract) => {
+    const out = runPatchScript(config);
+    const env = executeChildEnv(out, {
+      PATH: '/usr/bin',
+      HTTPS_PROXY: 'http://127.0.0.1:3457',
+      [NETWORK_ENV_CONTRACT_VAR]: contract,
+    });
+
+    expect(env).toEqual({
+      PATH: '/usr/bin',
+      HTTPS_PROXY: 'http://127.0.0.1:3457',
+    });
+  });
+
+  it.each([
+    ['valid pair', {
+      version: 1,
+      original: { HTTPS_PROXY: 'http://proxy.example.test:8080' },
+      injected: { HTTPS_PROXY: 'http://127.0.0.1:3457' },
+    }],
+    ['missing injected key', {
+      version: 1,
+      original: { HTTPS_PROXY: null },
+      injected: {},
+    }],
+    ['missing original key', {
+      version: 1,
+      original: {},
+      injected: { HTTPS_PROXY: 'http://127.0.0.1:3457' },
+    }],
+    ['unknown original key', {
+      version: 1,
+      original: { HTTPS_PROXY: null, EXTRA_PROXY: null },
+      injected: { HTTPS_PROXY: 'http://127.0.0.1:3457', EXTRA_PROXY: null },
+    }],
+    ['unknown injected key', {
+      version: 1,
+      original: { EXTRA_PROXY: null },
+      injected: { EXTRA_PROXY: 'http://127.0.0.1:3457' },
+    }],
+    ['invalid original value', {
+      version: 1,
+      original: { HTTPS_PROXY: 42 },
+      injected: { HTTPS_PROXY: 'http://127.0.0.1:3457' },
+    }],
+    ['invalid injected value', {
+      version: 1,
+      original: { HTTPS_PROXY: null },
+      injected: { HTTPS_PROXY: false },
+    }],
+    ['invalid version', {
+      version: 2,
+      original: { HTTPS_PROXY: null },
+      injected: { HTTPS_PROXY: 'http://127.0.0.1:3457' },
+    }],
+  ])('matches the host contract reader for %s', (_name, contract) => {
+    const out = runPatchScript(config);
+    const baseEnv = {
+      PATH: '/usr/bin',
+      HTTPS_PROXY: 'http://127.0.0.1:3457',
+      [NETWORK_ENV_CONTRACT_VAR]: JSON.stringify(contract),
+    };
+
+    expect(executeChildEnv(out, baseEnv, { CHILD_ENV_MARKER: 'merge-branch' })).toEqual({
+      ...networkEnvBaseline(baseEnv),
+      CHILD_ENV_MARKER: 'merge-branch',
+    });
+  });
+
   it('falls back to the canonical id as the identity when a model has no alias', () => {
     const out = runPatchScript({ 'clodex:openai:mystery': { context: 128_000 } });
     expect(out).toContain('.enum(["sonnet","opus","haiku","fable","clodex:openai:mystery"])');
@@ -2256,6 +2617,7 @@ describe('patch script identity naming', () => {
       ['PATCH 8e: exact effort metadata lists', 'OK'],
       ['PATCH 8f: preserve requested effort', 'OK'],
       ['PATCH 9: default effort', 'OK'],
+      ['PATCH 10: child network environment', 'OK'],
     ]);
     const rerun = applyClodexPatches(fresh.content, config);
     expect(rerun.results.map(r => [r.name, r.status])).toEqual([
@@ -2274,6 +2636,7 @@ describe('patch script identity naming', () => {
       ['PATCH 8e: exact effort metadata lists (refresh)', 'SKIP'],
       ['PATCH 8f: preserve requested effort (refresh)', 'SKIP'],
       ['PATCH 9: default effort (refresh)', 'SKIP'],
+      ['PATCH 10: child network environment', 'SKIP'],
     ]);
   });
 
@@ -2316,7 +2679,7 @@ describe('patch script identity naming', () => {
       ['PATCH 4: Agent tool model description', 'OK'],
       ['PATCH 7: per-model context window', 'OK'],
     ]);
-    expect(patched.results.slice(6)).toEqual([
+    expect(patched.results.slice(6, -1)).toEqual([
       { status: 'FAIL', name: 'PATCH 8a: effort capability', extra: 'anchor not found' },
       { status: 'FAIL', name: 'PATCH 8b: xhigh effort capability', extra: 'anchor not found' },
       { status: 'FAIL', name: 'PATCH 8c: max effort capability', extra: 'anchor not found' },
@@ -2325,6 +2688,12 @@ describe('patch script identity naming', () => {
       { status: 'FAIL', name: 'PATCH 8f: preserve requested effort', extra: 'anchor not found' },
       { status: 'FAIL', name: 'PATCH 9: default effort', extra: 'anchor not found' },
     ]);
+    // The child-env builder lives in the core fixture, so PATCH 10 still lands
+    // even when every effort anchor has drifted.
+    expect(patched.results.at(-1)).toEqual({
+      status: 'OK',
+      name: 'PATCH 10: child network environment',
+    });
   });
 
   it('refreshes every baked effort table when extended capabilities are removed', () => {
@@ -2464,6 +2833,7 @@ describe('2.1.227 split effort ladder topology', () => {
       ['PATCH 8e: exact effort metadata lists', 'OK'],
       ['PATCH 8f: preserve requested effort', 'OK'],
       ['PATCH 9: default effort', 'OK'],
+      ['PATCH 10: child network environment', 'OK'],
     ]);
 
     const out = patched.content;

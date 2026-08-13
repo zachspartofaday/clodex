@@ -85,6 +85,19 @@ This page explains how to bridge **every** Claude Code process on your machine â
 
 Port and CA discovery are automatic via `~/.clodex/server-runtime.json` â€” do not hardcode `HTTPS_PROXY`, ports, or certificate paths in your profile.
 
+After `clodex patch`, standard Bash-tool commands, MCP/LSP servers, hooks, and
+every other path that uses Claude Code's shared child environment receive the
+external proxy and CA settings rather than clodex's local bridge settings, so a
+`curl` in a bridged session reaches the internet instead of the MITM listener.
+Settings-level overrides are preserved. The separate `claude --bg --exec`
+environment path is not covered. The bridged Claude Code process itself still
+carries the external values in `CLAUDE_CODE_CLODEX_NETWORK_ENV` until it builds
+a standard child environment; that value can contain proxy credentials, so do
+not expose the parent environment or use `--bg --exec` for untrusted commands
+while authenticated proxy settings are present. A plain nested `claude` launched
+from Bash is an ordinary child and is intentionally unbridged; invoke
+`clodex-claude` when that nested client must use the advertised server.
+
 For service-manager readiness checks, `clodex-claude --check` exits `0` when an
 advertised server passes the process and TCP checks, and exits `1` otherwise.
 Servers advertise themselves only after their listener has passed readiness.

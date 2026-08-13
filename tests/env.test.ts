@@ -16,6 +16,7 @@ import { createHash } from 'node:crypto';
 const TEST_HELPER_ID = 'a'.repeat(64);
 import { CONFLICTING_ENV_VARS } from '../src/constants.js';
 import { SONNET_DEFAULT_PROBE_MARKER_ENV } from '../src/builtin-alias-env.js';
+import { NETWORK_ENV_CONTRACT_VAR } from '../src/network-env.js';
 
 const UPSTREAM_URL = 'https://api.example.com';
 
@@ -388,6 +389,61 @@ describe('buildHttpProxyChildEnv', () => {
       delete process.env['CLAUDE_CODE_DISABLE_EXPERIMENTAL_BETAS'];
       delete process.env['NO_PROXY'];
     }
+  });
+
+  it('records the external network baseline for the child\'s own child commands', () => {
+    // Explicit baseEnv: the snapshot has to describe the environment the child
+    // inherits, so the assertion must not depend on the test host's own proxy
+    // configuration.
+    const env = buildHttpProxyChildEnv(18181, '/tmp/relay-ca.pem', undefined, {
+      PATH: '/usr/bin',
+      NO_PROXY: 'localhost,api.anthropic.com,.internal.example',
+    });
+
+    expect(JSON.parse(env[NETWORK_ENV_CONTRACT_VAR]!)).toEqual({
+      version: 1,
+      original: {
+        HTTPS_PROXY: null,
+        HTTP_PROXY: null,
+        https_proxy: null,
+        http_proxy: null,
+        NO_PROXY: 'localhost,api.anthropic.com,.internal.example',
+        no_proxy: null,
+        NODE_EXTRA_CA_CERTS: null,
+      },
+      injected: {
+        HTTPS_PROXY: 'http://127.0.0.1:18181',
+        HTTP_PROXY: 'http://127.0.0.1:18181',
+        https_proxy: 'http://127.0.0.1:18181',
+        http_proxy: 'http://127.0.0.1:18181',
+        NO_PROXY: 'localhost,.internal.example',
+        no_proxy: 'localhost,.internal.example',
+        NODE_EXTRA_CA_CERTS: '/tmp/relay-ca.pem',
+      },
+    });
+  });
+
+  it('records the outer external values, not a nested launch\'s own injection', () => {
+    // A `clodex claude --proxy` launched from inside another clodex session
+    // inherits the outer listener in HTTPS_PROXY. Recording THAT as the original
+    // would make every child command "revert" to a listener that only speaks to
+    // api.anthropic.com.
+    const env = buildHttpProxyChildEnv(18181, '/tmp/relay-ca.pem', undefined, {
+      PATH: '/usr/bin',
+      HTTPS_PROXY: 'http://127.0.0.1:51234',
+      NODE_EXTRA_CA_CERTS: '/tmp/outer-ca.pem',
+      [NETWORK_ENV_CONTRACT_VAR]: JSON.stringify({
+        version: 1,
+        original: { HTTPS_PROXY: 'http://corp-proxy.example:8080', NODE_EXTRA_CA_CERTS: null },
+        injected: { HTTPS_PROXY: 'http://127.0.0.1:51234', NODE_EXTRA_CA_CERTS: '/tmp/outer-ca.pem' },
+      }),
+    });
+
+    const contract = JSON.parse(env[NETWORK_ENV_CONTRACT_VAR]!) as {
+      original: Record<string, string | null>;
+    };
+    expect(contract.original['HTTPS_PROXY']).toBe('http://corp-proxy.example:8080');
+    expect(contract.original['NODE_EXTRA_CA_CERTS']).toBeNull();
   });
 });
 
