@@ -719,6 +719,62 @@ describe('generateAnthropicResponse', () => {
     vi.resetModules();
   });
 
+  it('sanitizes generated Read tool calls using the called tool and file type', async () => {
+    vi.resetModules();
+    const generateText = vi.fn(async () => ({
+      text: '',
+      toolCalls: [
+        {
+          toolCallId: 'call_source',
+          toolName: 'Read',
+          input: { file_path: '/repo/file.ts', pages: '1' },
+        },
+        {
+          toolCallId: 'call_pdf',
+          toolName: 'Read',
+          input: { file_path: '/repo/FILE.PDF', pages: '1-3' },
+        },
+      ],
+      finishReason: 'tool-calls',
+      usage: { inputTokens: 1, outputTokens: 2 },
+    }));
+    vi.doMock('ai', () => ({
+      generateText,
+      streamText: vi.fn(),
+      tool: vi.fn((spec: unknown) => spec),
+      jsonSchema: vi.fn((schema: unknown) => schema),
+    }));
+
+    const { generateAnthropicResponse } = await import('../src/sdk-adapter.js');
+    const body = await generateAnthropicResponse(
+      {} as never,
+      {
+        messages: [],
+        tools: translateTools([{
+          name: 'Read',
+          description: 'Read a file',
+          input_schema: {
+            type: 'object',
+            properties: {
+              file_path: { type: 'string' },
+              pages: { type: 'string' },
+            },
+            required: ['file_path'],
+          },
+        }]),
+      },
+      'test-model',
+    );
+    const toolUses = (body.content as any[]).filter(item => item.type === 'tool_use');
+    vi.doUnmock('ai');
+    vi.resetModules();
+
+    expect(toolUses.map(item => item.input)).toEqual([
+      { file_path: '/repo/file.ts' },
+      { file_path: '/repo/FILE.PDF', pages: '1-3' },
+    ]);
+  });
+
   it('forceStream collects a real stream into one response instead of calling generateText', async () => {
     vi.resetModules();
     const generateText = vi.fn();
@@ -1205,6 +1261,20 @@ describe('writeAnthropicStream', () => {
     },
   }]);
 
+  const readTools = translateTools([{
+    name: 'Read',
+    description: 'Read a file',
+    input_schema: {
+      type: 'object',
+      properties: {
+        file_path: { type: 'string' },
+        offset: { type: 'number' },
+        pages: { type: 'string' },
+      },
+      required: ['file_path'],
+    },
+  }]);
+
   function toolInputFromEvents(events: Array<{ event: string; data: any }>): any {
     const start = events.find(e => e.event === 'content_block_start' && e.data.content_block.type === 'tool_use')!;
     const json = events
@@ -1235,6 +1305,88 @@ describe('writeAnthropicStream', () => {
       { type: 'finish', finishReason: 'tool-calls' },
     ], 'm', undefined, webSearchTools);
     expect(toolInputFromEvents(events)).toEqual({ query: 'who won' });
+  });
+
+  it('strips non-PDF Read.pages after split streamed input is assembled', async () => {
+    const input = { file_path: '/repo/file.swift', offset: 1, pages: '1' };
+    const encoded = JSON.stringify(input);
+    const { events } = await collect([
+      { type: 'start' },
+      { type: 'tool-input-start', id: 'call_read', toolName: 'Read' },
+      { type: 'tool-input-delta', id: 'call_read', delta: encoded.slice(0, 24) },
+      { type: 'tool-input-delta', id: 'call_read', delta: encoded.slice(24) },
+      { type: 'tool-input-end', id: 'call_read' },
+      { type: 'tool-call', toolCallId: 'call_read', toolName: 'Read', input },
+      { type: 'finish', finishReason: 'tool-calls' },
+    ], 'm', undefined, readTools);
+    expect(toolInputFromEvents(events)).toEqual({ file_path: '/repo/file.swift', offset: 1 });
+  });
+
+  it('strips non-PDF Read.pages from the complete-buffer fallback', async () => {
+    const input = { file_path: '/repo/file.json', pages: '' };
+    const { events } = await collect([
+      { type: 'start' },
+      { type: 'tool-input-start', id: 'call_read', toolName: 'Read' },
+      { type: 'tool-input-delta', id: 'call_read', delta: JSON.stringify(input) },
+      { type: 'tool-input-end', id: 'call_read' },
+      { type: 'finish', finishReason: 'tool-calls' },
+    ], 'm', undefined, readTools);
+    expect(toolInputFromEvents(events)).toEqual({ file_path: '/repo/file.json' });
+  });
+
+  it.each([null, undefined])('sanitizes complete buffered Read input when parsed input is %s', async (parsedInput) => {
+    const buffered = { file_path: '/repo/file.json', offset: null, pages: '1' };
+    const { events } = await collect([
+      { type: 'start' },
+      { type: 'tool-input-start', id: 'call_read', toolName: 'Read' },
+      { type: 'tool-input-delta', id: 'call_read', delta: JSON.stringify(buffered) },
+      { type: 'tool-input-end', id: 'call_read' },
+      { type: 'tool-call', toolCallId: 'call_read', toolName: 'Read', input: parsedInput },
+      { type: 'finish', finishReason: 'tool-calls' },
+    ], 'm', undefined, readTools);
+    expect(toolInputFromEvents(events)).toEqual({ file_path: '/repo/file.json' });
+  });
+
+  it('emits malformed buffered JSON bytes exactly once when parsed input is absent', async () => {
+    const partial = '{"file_path":"/repo/file.json","pages":';
+    const { events } = await collect([
+      { type: 'start' },
+      { type: 'tool-input-start', id: 'call_read', toolName: 'Read' },
+      { type: 'tool-input-delta', id: 'call_read', delta: partial },
+      { type: 'tool-input-end', id: 'call_read' },
+      { type: 'finish', finishReason: 'stop' },
+    ], 'm', undefined, readTools);
+    expect(events
+      .filter(e => e.event === 'content_block_delta' && e.data.delta.type === 'input_json_delta')
+      .map(e => e.data.delta.partial_json)).toEqual([partial]);
+  });
+
+  it('strips non-PDF Read.pages from a non-streamed tool call', async () => {
+    const { events } = await collect([
+      { type: 'start' },
+      {
+        type: 'tool-call',
+        toolCallId: 'call_read',
+        toolName: 'Read',
+        input: { file_path: '/repo/file.ts', pages: '1' },
+      },
+      { type: 'finish', finishReason: 'tool-calls' },
+    ], 'm', undefined, readTools);
+    expect(toolInputFromEvents(events)).toEqual({ file_path: '/repo/file.ts' });
+  });
+
+  it('preserves Read.pages for PDFs in a non-streamed tool call', async () => {
+    const { events } = await collect([
+      { type: 'start' },
+      {
+        type: 'tool-call',
+        toolCallId: 'call_pdf',
+        toolName: 'Read',
+        input: { file_path: '/repo/FILE.PDF', pages: '1-3' },
+      },
+      { type: 'finish', finishReason: 'tool-calls' },
+    ], 'm', undefined, readTools);
+    expect(toolInputFromEvents(events)).toEqual({ file_path: '/repo/FILE.PDF', pages: '1-3' });
   });
 
   it('preserves an intentional empty array for a schema-required property', async () => {
@@ -1376,5 +1528,86 @@ describe('translateRequest openai promptCacheKey', () => {
 
   it('omits the key for non-OpenAI providers', () => {
     expect(keyOf(req(), '@ai-sdk/xai')).toBeUndefined();
+  });
+});
+
+describe('translateRequest global effort policy', () => {
+  const compatibility = {
+    reasoningEffortMap: { minimal: null, low: null, medium: null, high: 'high', max: 'max' },
+  };
+  const effortProfile = {
+    modelId: 'sparse-model',
+    transport: 'openai-completions',
+    defaultLevel: null,
+    levels: [
+      { level: 'high' as const, native: { kind: 'reasoning-effort' as const, value: 'high' } },
+      { level: 'max' as const, native: { kind: 'reasoning-effort' as const, value: 'max' } },
+    ],
+  };
+
+  function translate(
+    effort: string | undefined,
+    options: Record<string, unknown> = {},
+    metadata: Record<string, unknown> = {},
+  ) {
+    return translateRequest({
+      model: 'sparse-model',
+      messages: [{ role: 'user', content: 'hi' }],
+      ...(effort === undefined ? {} : { output_config: { effort } }),
+    }, '@ai-sdk/openai-compatible', {
+      reasoningMetadata: {
+        providerId: 'opencode-go',
+        compatibility,
+        effortProfile,
+        upstreamModelId: 'sparse-model',
+        ...metadata,
+      },
+      ...options,
+    } as never);
+  }
+
+  it('sends a supported level through the reviewed wire map unchanged', () => {
+    expect(translate('max').providerOptions?.opencodeGo).toEqual({ reasoningEffort: 'max' });
+  });
+
+  it('sends no effort for an unsupported level by default', () => {
+    expect(translate('low').providerOptions?.opencodeGo).toBeUndefined();
+  });
+
+  it('rounds an unsupported level onto the ladder when the policy says so', () => {
+    expect(translate('low', { effortPolicy: 'up' }).providerOptions?.opencodeGo)
+      .toEqual({ reasoningEffort: 'high' });
+    expect(translate('xhigh', { effortPolicy: 'down' }).providerOptions?.opencodeGo)
+      .toEqual({ reasoningEffort: 'high' });
+  });
+
+  it('refuses an unsupported level under exact', () => {
+    expect(() => translate('low', { effortPolicy: 'exact' }))
+      .toThrow(/Effort "low" is not supported by sparse-model/);
+  });
+
+  it('injects nothing when the client omits effort and no default is declared', () => {
+    expect(translate(undefined).providerOptions?.opencodeGo).toBeUndefined();
+  });
+
+  it('ignores a caller fallback the profile cannot run rather than substituting', () => {
+    expect(translate(undefined, { defaultEffort: 'low' }).providerOptions?.opencodeGo)
+      .toBeUndefined();
+  });
+
+  it('leaves a model without a reviewed profile on its existing behavior', () => {
+    const params = translateRequest({
+      model: 'sparse-model',
+      messages: [{ role: 'user', content: 'hi' }],
+      output_config: { effort: 'max' },
+    }, '@ai-sdk/openai-compatible', {
+      effortPolicy: 'exact',
+      reasoningMetadata: {
+        providerId: 'opencode-go',
+        compatibility,
+        upstreamModelId: 'sparse-model',
+      },
+    } as never);
+    expect(params.providerOptions?.opencodeGo).toEqual({ reasoningEffort: 'max' });
   });
 });

@@ -12,13 +12,15 @@
 // from-scratch reimplementation with a different patch mechanism and an added
 // per-model context window patch.
 //
-// The ALIAS is the model's identity inside the binary: for any entry that
-// defines one, the alias (not the canonical `clodex:<provider>:<model>` id) is
-// what lands in the Agent-tool enum, the known-alias validator, the /model
-// picker, and the context-window table — so `model: sol` in agent/skill
-// frontmatter validates. Entries with no alias fall back to their canonical id
-// as the identity (they still join the enum, validator, and context table, but
-// skip the resolver and /model picker patches).
+// Each ALIAS is a model identity inside the binary: for any entry that defines
+// one or more, every alias (not the canonical `clodex:<provider>:<model>` id)
+// lands in the Agent-tool enum, the known-alias validator, the /model picker,
+// and the context-window table — so `model: sol` in agent/skill frontmatter
+// validates, and so several saved names pointing at one favorite each stay a
+// complete identity instead of collapsing to whichever was saved last. Entries
+// with no alias fall back to their canonical id as the identity (they still
+// join the enum, validator, and context table, but skip the resolver and
+// /model picker patches).
 
 import { isReservedModelAlias } from './model-aliases.js';
 import {
@@ -38,9 +40,12 @@ import {
  * hash of the transform inputs to force that decision to be made rather than
  * forgotten.
  */
-export const PATCH_TRANSFORMS_VERSION = 6;
+export const PATCH_TRANSFORMS_VERSION = 10;
 
 export interface PatchScriptModelEntry {
+  /** Ordered native identities for this model, in saved alias order. */
+  aliases?: string[];
+  /** Legacy single-identity input, accepted while callers migrate to `aliases`. */
   alias?: string;
   context?: number;
   /** Human label for the /model picker, e.g. `GPT-5.6 Sol (OpenAI (ChatGPT))`. */
@@ -56,6 +61,19 @@ export interface PatchScriptEffort {
 
 /** Real model id (e.g. `clodex:openai-oauth:gpt-5.6-sol`) → alias/context. */
 export type PatchScriptModelConfig = Record<string, PatchScriptModelEntry>;
+
+/**
+ * The ordered aliases an entry carries, normalized the same way saved aliases
+ * are. The legacy single `alias` comes first so a mixed entry keeps a stable
+ * order, and so `{alias:'x'}` and `{aliases:['x']}` are the same configuration
+ * to every consumer — including the freshness hash.
+ */
+export function patchEntryAliases(entry: PatchScriptModelEntry): string[] {
+  return [
+    ...(entry.alias === undefined ? [] : [entry.alias]),
+    ...(entry.aliases ?? []),
+  ].map(alias => String(alias).trim().toLowerCase());
+}
 
 const NATIVE_EFFORT_LEVELS = ['low', 'medium', 'high', 'xhigh', 'max'] as const;
 const BASE_EFFORT_LEVELS = ['low', 'medium', 'high'] as const;
@@ -115,12 +133,14 @@ export function formatPatchSiteLine(result: PatchSiteResult): string {
 export function applyClodexPatches(source: string, config: PatchScriptModelConfig): ApplyPatchesOutcome {
   let js = source;
   const MODEL_CONFIG = config;
+  const MODEL_ENTRIES = Object.entries(MODEL_CONFIG);
 
   // ---- derive helpers ------------------------------------------------------
-  // alias -> model id (only for entries that define an alias)
+  // alias -> model id (only for entries that define aliases)
   const ALIAS_TO_ID: Record<string, string> = Object.create(null);
-  // The name Claude Code knows a model by: its alias when it has one, else its
-  // canonical id. This single value is used for the Agent-tool enum, the
+  const ALIASES: string[] = [];
+  // The names Claude Code knows a model by: every alias when it has any, else
+  // its canonical id. These values are used for the Agent-tool enum, the
   // known-alias validator, the /model picker value, and the context-window table,
   // so the name the binary validates == the name it sends upstream == the name
   // the proxy echoes back == the key its context window is stored under.
@@ -129,15 +149,18 @@ export function applyClodexPatches(source: string, config: PatchScriptModelConfi
   const DISPLAY_BY_IDENTITY: Record<string, string> = Object.create(null);
   // lowercased alias AND id -> context-window tokens (only for models that set it)
   const CONTEXT_BY_KEY: Record<string, number> = Object.create(null);
+  const CONTEXT_KEYS: string[] = [];
   // lowercased alias AND id for every configured model. Capability verdicts
   // must distinguish configured-false from an unknown identity that may use
   // the native fallback.
   const CONFIGURED_CAPABILITY_KEYS = new Set<string>();
+  const CAPABILITY_KEYS: string[] = [];
   // lowercased alias AND id -> effort metadata for Claude Code's capability gates.
   const EFFORT_BY_KEY = Object.create(null) as Record<
     string,
     PatchScriptModelEntry['effort']
   >;
+  const EFFORT_KEYS: string[] = [];
 
   const report: PatchSiteResult[] = [];
   const fail = (message: string): never => {
@@ -150,30 +173,59 @@ export function applyClodexPatches(source: string, config: PatchScriptModelConfi
   };
   const registerCapabilityKeys = (value: string): void => {
     for (const key of capabilityKeys(value)) {
+      if (!CONFIGURED_CAPABILITY_KEYS.has(key)) CAPABILITY_KEYS.push(key);
       CONFIGURED_CAPABILITY_KEYS.add(key);
     }
   };
+  const registerOrderedValue = <T>(
+    keys: string[],
+    values: Record<string, T>,
+    key: string,
+    value: T,
+  ): void => {
+    if (!Object.prototype.hasOwnProperty.call(values, key)) keys.push(key);
+    values[key] = value;
+  };
 
-  for (const [id, value] of Object.entries(MODEL_CONFIG)) {
+  for (const [id, value] of MODEL_ENTRIES) {
     const spec: PatchScriptModelEntry = value && typeof value === 'object' ? value : { alias: value as unknown as string };
-    if (spec.alias !== undefined) {
-      const rawAlias = String(spec.alias).trim();
-      const a = rawAlias.toLowerCase();
+    if (spec.aliases !== undefined && !Array.isArray(spec.aliases)) {
+      fail('clodex patch: aliases for "' + id + '" must be an array');
+    }
+    const rawAliases: unknown[] = [
+      ...(spec.alias === undefined ? [] : [spec.alias]),
+      ...(spec.aliases ?? []),
+    ];
+    for (const raw of rawAliases) {
+      if (typeof raw !== 'string') {
+        fail('clodex patch: alias for "' + id + '" must be a string');
+      }
+    }
+    const aliases = patchEntryAliases(spec);
+    for (const [index, a] of aliases.entries()) {
+      const raw = rawAliases[index] as string;
       if (!/^[a-z0-9][a-z0-9._-]*(\[1m\])?$/.test(a)) {
-        fail('clodex patch: alias "' + spec.alias + '" is not a safe lowercase alias');
+        fail('clodex patch: alias "' + raw + '" is not a safe lowercase alias');
       }
       if (isReservedModelAlias(a)) {
         fail('clodex patch: reserved alias "' + a + '" cannot be reassigned');
       }
+      // Two entries (or one entry twice) claiming a name would silently make the
+      // later one win the resolver and context lookups. Fail instead.
+      if (ALIAS_TO_ID[a] !== undefined) {
+        fail('clodex patch: alias "' + a + '" is configured more than once');
+      }
       ALIAS_TO_ID[a] = String(id);
+      ALIASES.push(a);
       IDENTITIES.push(a);
       if (spec.display) DISPLAY_BY_IDENTITY[a] = String(spec.display);
-    } else {
+    }
+    if (aliases.length === 0) {
       IDENTITIES.push(String(id));
       if (spec.display) DISPLAY_BY_IDENTITY[String(id)] = String(spec.display);
     }
-    if (spec.alias !== undefined) {
-      registerCapabilityKeys(String(spec.alias));
+    for (const alias of aliases) {
+      registerCapabilityKeys(alias);
     }
     registerCapabilityKeys(String(id));
 
@@ -185,13 +237,20 @@ export function applyClodexPatches(source: string, config: PatchScriptModelConfi
       // A [1m] suffix hard-codes 1M upstream (and sends the context-1m beta header
       // + raises the media cap). An explicit context on a [1m] model would win via
       // PATCH 7 while those side effects silently stayed on — so reject it.
-      if (/\[1m\]/i.test(String(spec.alias ?? '')) || /\[1m\]/i.test(id)) {
+      if (aliases.some(alias => /\[1m\]/i.test(alias)) || /\[1m\]/i.test(id)) {
         fail(
-          'clodex patch: "' + id + '" sets context but keeps the [1m] suffix — drop the suffix from both the id and the alias'
+          'clodex patch: "' + id + '" sets context but keeps the [1m] suffix — drop the suffix from the id and every alias'
         );
       }
-      if (spec.alias !== undefined) CONTEXT_BY_KEY[String(spec.alias).trim().toLowerCase()] = n;
-      CONTEXT_BY_KEY[String(id).trim().toLowerCase()] = n;
+      for (const alias of aliases) {
+        registerOrderedValue(CONTEXT_KEYS, CONTEXT_BY_KEY, alias, n);
+      }
+      registerOrderedValue(
+        CONTEXT_KEYS,
+        CONTEXT_BY_KEY,
+        String(id).trim().toLowerCase(),
+        n,
+      );
     }
 
     if (spec.effort) {
@@ -201,19 +260,17 @@ export function applyClodexPatches(source: string, config: PatchScriptModelConfi
           `clodex patch: effort for "${id}" must include low, medium, and high with a native default`,
         );
       }
-      if (spec.alias !== undefined) {
-        for (const key of capabilityKeys(String(spec.alias))) {
-          EFFORT_BY_KEY[key] = effort;
+      for (const alias of aliases) {
+        for (const key of capabilityKeys(alias)) {
+          registerOrderedValue(EFFORT_KEYS, EFFORT_BY_KEY, key, effort);
         }
       }
       for (const key of capabilityKeys(String(id))) {
-        EFFORT_BY_KEY[key] = effort;
+        registerOrderedValue(EFFORT_KEYS, EFFORT_BY_KEY, key, effort);
       }
     }
   }
-  const ALIASES = Object.keys(ALIAS_TO_ID);
-  const MODELS = Object.keys(MODEL_CONFIG);
-  if (MODELS.length === 0) fail('clodex patch: MODEL_CONFIG is empty');
+  if (MODEL_ENTRIES.length === 0) fail('clodex patch: MODEL_CONFIG is empty');
 
   /** Picker/description label for an identity; falls back to the old wording. */
   function displayFor(identity: string, fallbackId: string): string {
@@ -222,6 +279,8 @@ export function applyClodexPatches(source: string, config: PatchScriptModelConfi
 
   const reEsc = (s: string) => s.replace(/[.*+?^$\{\}()|[\]\\]/g, '\\$&');
   const q = (s: string) => JSON.stringify(s); // safe JS string literal
+  const orderedRecordLiteral = <T>(keys: string[], values: Record<string, T>): string =>
+    '{' + keys.map(key => q(key) + ':' + JSON.stringify(values[key])).join(',') + '}';
 
   // ---- reporting -----------------------------------------------------------
   function log(status: PatchSiteStatus, name: string, extra?: string) {
@@ -327,15 +386,43 @@ export function applyClodexPatches(source: string, config: PatchScriptModelConfi
   // edit) tops up cleanly rather than duplicating cases.
   // ---------------------------------------------------------------------------
   {
-    const missing = ALIASES.filter((a) => !new RegExp('case' + reEsc(q(a)) + ':return').test(js));
-    const cases = missing.map((a) => 'case' + q(a) + ':return ' + q(a) + ';').join('');
+    const resolverRegex = /(case"best":\{[^{}]*\})((?:case"[^"]+":return[^{};]+;)*)/;
+    const classifyResolverSuffix = (suffix: string): { missing: string[]; invalid: string[] } => {
+      const missing: string[] = [];
+      const invalid: string[] = [];
+      for (const a of ALIASES) {
+        const labelCount = suffix.match(new RegExp('case' + reEsc(q(a)) + ':', 'g'))?.length ?? 0;
+        const selfCount = suffix.match(
+          new RegExp('case' + reEsc(q(a)) + ':return ' + reEsc(q(a)) + ';', 'g'),
+        )?.length ?? 0;
+        if (labelCount === 0) missing.push(a);
+        else if (labelCount !== 1 || selfCount !== 1) invalid.push(a);
+      }
+      return { missing, invalid };
+    };
+    const resolverMatches = js.match(new RegExp(resolverRegex.source, 'g'));
+    const resolverMatch = resolverMatches?.length === 1 ? resolverRegex.exec(js) : undefined;
+    const resolverClassification = resolverMatch
+      ? classifyResolverSuffix(resolverMatch[2] ?? '')
+      : undefined;
     if (ALIASES.length === 0) {
       log('SKIP', 'PATCH 6: alias resolver switch', 'no aliases configured');
+    } else if (resolverClassification?.invalid.length) {
+      log('FAIL', 'PATCH 6: alias resolver switch', 'invalid alias resolver cases');
+      fail('clodex patch: invalid alias resolver cases');
     } else {
       applyOnce(
         'PATCH 6: alias resolver switch',
-        /(case"best":\{[^{}]*\})/,
-        (m) => m + cases,
+        resolverRegex,
+        (_m, anchor, suffix) => {
+          const { missing, invalid } = classifyResolverSuffix(suffix ?? '');
+          if (invalid.length) {
+            log('FAIL', 'PATCH 6: alias resolver switch', 'invalid alias resolver cases');
+            fail('clodex patch: invalid alias resolver cases');
+          }
+          const cases = missing.map((a) => 'case' + q(a) + ':return ' + q(a) + ';').join('');
+          return (anchor ?? '') + cases + (suffix ?? '');
+        },
         { required: true, noopIsSkip: true }
       );
     }
@@ -350,26 +437,55 @@ export function applyClodexPatches(source: string, config: PatchScriptModelConfi
   // aliases not already injected are added, so reruns top up cleanly.
   // ---------------------------------------------------------------------------
   {
-    const missing = ALIASES.filter((a) => !new RegExp('value:' + reEsc(q(a))).test(js));
-    const entries = missing
-      .map(
-        // value = the alias (the name the user types and the binary sends);
-        // description = the real model label, e.g. "GPT-5.6 Sol (OpenAI (ChatGPT))".
-        // (tweakcc's writeContent round-trips utf8 faithfully — verified — so the
-        // old adhoc-patch ASCII-only constraint no longer applies.)
-        (a) => '{value:' + q(a) + ',label:' + q(a.charAt(0).toUpperCase() + a.slice(1)) + ',description:' + q(displayFor(a, ALIAS_TO_ID[a]!)) + '}'
-      )
-      .join(',');
-    const inject = missing.length
-      ? '[' + entries + '].forEach(function(_o){if(!e.some(function(_i){return _i.value===_o.value}))e.push(_o)});'
-      : '';
+    const escapedJsonString = '"(?:\\\\.|[^"\\\\])*"';
+    const pickerEntry = '\\{value:' + escapedJsonString + ',label:' + escapedJsonString + ',description:' + escapedJsonString + '\\}';
+    const pickerInjection = '\\[' + pickerEntry
+      + '(?:,' + pickerEntry + ')*\\]\\.forEach\\(function\\(_o\\)\\{if\\(!e\\.some\\(function\\(_i\\)\\{return _i\\.value===_o\\.value\\}\\)\\)e\\.push\\(_o\\)\\}\\);';
+    const pickerRegex = new RegExp(
+      '(\\?\\[[\\w$]+,r\\]:\\[r\\];for\\(let [\\w$]+ of [\\w$]+\\)[\\w$]+\\(e,[\\w$]+,t\\);)'
+      + '((?:' + pickerInjection + ')*)',
+    );
+    const pickerEntryForAlias = (alias: string): string =>
+      '{value:' + q(alias)
+      + ',label:' + q(alias.charAt(0).toUpperCase() + alias.slice(1))
+      + ',description:' + q(displayFor(alias, ALIAS_TO_ID[alias]!))
+      + '}';
+    const classifyPickerSuffix = (suffix: string): { missing: string[]; invalid: string[] } => {
+      const missing: string[] = [];
+      const invalid: string[] = [];
+      for (const a of ALIASES) {
+        const valueOccurrences = suffix.match(
+          new RegExp('\\{value:' + reEsc(q(a)) + '(?=,label:)', 'g'),
+        )?.length ?? 0;
+        const entryOccurrences = suffix.match(
+          new RegExp(reEsc(pickerEntryForAlias(a)), 'g'),
+        )?.length ?? 0;
+        if (valueOccurrences === 0) missing.push(a);
+        else if (valueOccurrences !== 1 || entryOccurrences !== 1) invalid.push(a);
+      }
+      return { missing, invalid };
+    };
+    const pickerMatches = js.match(new RegExp(pickerRegex.source, 'g'));
+    const pickerMatch = pickerMatches?.length === 1 ? pickerRegex.exec(js) : undefined;
+    const pickerClassification = pickerMatch
+      ? classifyPickerSuffix(pickerMatch[2] ?? '')
+      : undefined;
     if (ALIASES.length === 0) {
       log('SKIP', 'PATCH 5: model picker options', 'no aliases configured');
+    } else if (pickerClassification?.invalid.length) {
+      log('FAIL', 'PATCH 5: model picker options', 'invalid target-owned picker entries');
     } else {
       applyOnce(
         'PATCH 5: model picker options',
-        /(\?\[[\w$]+,r\]:\[r\];for\(let [\w$]+ of [\w$]+\)[\w$]+\(e,[\w$]+,t\);)/,
-        (m) => m + inject,
+        pickerRegex,
+        (_m, anchor, suffix) => {
+          const { missing } = classifyPickerSuffix(suffix ?? '');
+          const entries = missing.map(pickerEntryForAlias).join(',');
+          const inject = missing.length
+            ? '[' + entries + '].forEach(function(_o){if(!e.some(function(_i){return _i.value===_o.value}))e.push(_o)});'
+            : '';
+          return (anchor ?? '') + inject + (suffix ?? '');
+        },
         { required: false, noopIsSkip: true }
       );
     }
@@ -413,10 +529,10 @@ export function applyClodexPatches(source: string, config: PatchScriptModelConfi
   // Anchor: the resolver's exact body shape. Identifiers are wildcarded (they
   // churn per build); the (e,t) arity + 3-statement shape matches once.
   // ---------------------------------------------------------------------------
-  if (Object.keys(CONTEXT_BY_KEY).length) {
+  if (CONTEXT_KEYS.length) {
     const MARKER = '/*ccpatch:ctx*/';
     const SNIPPET =
-      MARKER + 'var _ccw=(' + JSON.stringify(CONTEXT_BY_KEY) + ')[String(e||"").trim().toLowerCase()];if(_ccw!==void 0)return _ccw;';
+      MARKER + 'var _ccw=(' + orderedRecordLiteral(CONTEXT_KEYS, CONTEXT_BY_KEY) + ')[String(e||"").trim().toLowerCase()];if(_ccw!==void 0)return _ccw;';
 
     if (js.includes(MARKER)) {
       // Re-patching an already-patched binary: refresh the baked table in place
@@ -451,24 +567,20 @@ export function applyClodexPatches(source: string, config: PatchScriptModelConfi
     name: string,
     anchor: RegExp,
   ): void {
-    const verdicts = Object.fromEntries(
-      [...CONFIGURED_CAPABILITY_KEYS].map(key => {
-        const effort = EFFORT_BY_KEY[key];
-        return [
-          key,
-          effort !== undefined && (
-            capability === 'effort'
-            || effort.levels.includes(capability === 'xhigh_effort' ? 'xhigh' : 'max')
-          ),
-        ];
-      }),
-    );
+    const verdicts: Record<string, boolean> = Object.create(null);
+    for (const key of CAPABILITY_KEYS) {
+      const effort = EFFORT_BY_KEY[key];
+      verdicts[key] = effort !== undefined && (
+        capability === 'effort'
+        || effort.levels.includes(capability === 'xhigh_effort' ? 'xhigh' : 'max')
+      );
+    }
     const hasMarker = js.includes(marker);
-    if (Object.keys(verdicts).length === 0 && !hasMarker) return;
+    if (CAPABILITY_KEYS.length === 0 && !hasMarker) return;
 
     const snippet = (arg: string) =>
       marker
-      + 'var _ccv=Object.assign(Object.create(null),' + JSON.stringify(verdicts)
+      + 'var _ccv=Object.assign(Object.create(null),' + orderedRecordLiteral(CAPABILITY_KEYS, verdicts)
       + ')[String(' + arg + '||"").trim().toLowerCase()];'
       + 'if(_ccv!==void 0)return _ccv;';
 
@@ -519,13 +631,12 @@ export function applyClodexPatches(source: string, config: PatchScriptModelConfi
   // PATCH 9 — per-model default effort.
   // ---------------------------------------------------------------------------
   const DEFAULT_EFFORT_MARKER = '/*ccpatch:default-effort*/';
-  const defaults = Object.fromEntries(
-    Object.entries(EFFORT_BY_KEY).map(([key, effort]) => [key, effort!.defaultLevel]),
-  );
-  if (Object.keys(defaults).length || js.includes(DEFAULT_EFFORT_MARKER)) {
+  const defaults: Record<string, string> = Object.create(null);
+  for (const key of EFFORT_KEYS) defaults[key] = EFFORT_BY_KEY[key]!.defaultLevel;
+  if (EFFORT_KEYS.length || js.includes(DEFAULT_EFFORT_MARKER)) {
     const snippet = (arg: string) =>
       DEFAULT_EFFORT_MARKER
-      + 'var _cce=Object.assign(Object.create(null),' + JSON.stringify(defaults)
+      + 'var _cce=Object.assign(Object.create(null),' + orderedRecordLiteral(EFFORT_KEYS, defaults)
       + ')[String(' + arg + '||"").trim().toLowerCase()];'
       + 'if(_cce!==void 0)return _cce;';
 

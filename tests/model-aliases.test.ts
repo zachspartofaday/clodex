@@ -1,7 +1,9 @@
 import { describe, expect, it } from 'vitest';
 import {
   canonicalModelAliasName,
+  describeModelAliasRejection,
   isValidModelAlias,
+  modelAliasLookupKey,
   modelAliasTarget,
   normalizeModelAliases,
   parseModelAliasAssignment,
@@ -50,6 +52,15 @@ describe('model aliases', () => {
     }
   });
 
+  it('shares writer identity for valid spellings without absorbing route or malformed identities', () => {
+    expect(modelAliasLookupKey(' DeFaUlT ')).toBe('default');
+    expect(modelAliasLookupKey('DEFAULT')).toBe('default');
+    expect(modelAliasLookupKey('luna')).not.toBe(modelAliasLookupKey('orbit'));
+    expect(modelAliasLookupKey('DeFaUlT[1m]')).toBe('DeFaUlT[1m]');
+    expect(modelAliasLookupKey('clodex:Provider:Model')).toBe('clodex:Provider:Model');
+    expect(modelAliasLookupKey('Bad Alias')).toBe('Bad Alias');
+  });
+
   it('collapses equivalent case variants and rejects ambiguous collisions', () => {
     const normalized = normalizeModelAliases([
       { name: 'LuNa', providerId: 'one', modelId: 'model-a' },
@@ -76,6 +87,43 @@ describe('model aliases', () => {
       { name: 'Orbit', providerId: 'one', modelId: 'model-a' },
       { name: 'ORBIT', providerId: 'two', modelId: 'model-b' },
       { name: 'best', providerId: 'one', modelId: 'model-a' },
+    ]);
+  });
+
+  it('preserves distinct names that intentionally share one target, in saved order', () => {
+    const normalized = normalizeModelAliases([
+      { name: 'luna', providerId: 'opencode-go', modelId: 'deepseek-v4-flash' },
+      { name: 'terra', providerId: 'opencode-go', modelId: 'deepseek-v4-flash' },
+      { name: 'ds4', providerId: 'opencode-go', modelId: 'deepseek-v4-flash' },
+    ]);
+
+    expect(normalized.aliases.map(alias => alias.name)).toEqual(['luna', 'terra', 'ds4']);
+    expect(normalized.rejections).toEqual([]);
+  });
+
+  it('keeps valid same-target names while rejecting only the unusable ones', () => {
+    const normalized = normalizeModelAliases([
+      { name: 'luna', providerId: 'opencode-go', modelId: 'deepseek-v4-flash' },
+      { name: 'best', providerId: 'opencode-go', modelId: 'deepseek-v4-flash' },
+      { name: 'terra', providerId: 'opencode-go', modelId: 'deepseek-v4-flash' },
+      { name: 'Terra', providerId: 'opencode-go', modelId: 'other-model' },
+      { name: 'ds4', providerId: 'opencode-go', modelId: 'deepseek-v4-flash' },
+    ]);
+
+    expect(normalized.aliases.map(alias => alias.name)).toEqual(['luna', 'ds4']);
+    expect(normalized.rejections).toEqual([
+      {
+        alias: { name: 'best', providerId: 'opencode-go', modelId: 'deepseek-v4-flash' },
+        reason: 'reserved-name',
+      },
+      {
+        alias: { name: 'terra', providerId: 'opencode-go', modelId: 'deepseek-v4-flash' },
+        reason: 'conflicting-targets',
+      },
+      {
+        alias: { name: 'Terra', providerId: 'opencode-go', modelId: 'other-model' },
+        reason: 'conflicting-targets',
+      },
     ]);
   });
 
@@ -141,6 +189,13 @@ describe('model aliases', () => {
     ])).toThrow(
       'Saved model aliases are malformed: "modelAliases[1]" must be an object with a string "name".',
     );
+  });
+
+  it('keeps capacity omission distinct from target unavailability', () => {
+    expect(describeModelAliasRejection('target-not-exposed'))
+      .toBe('target is outside the active Claude Code catalog');
+    expect(describeModelAliasRejection('target-unavailable'))
+      .toBe('target is unavailable or unsupported');
   });
 
   it('formats a canonical HTTP-proxy target', () => {

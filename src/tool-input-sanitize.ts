@@ -15,10 +15,12 @@
 
 /**
  * Strip filler values GPT-family models emit for optional params instead of
- * omitting them: top-level `null` always, and empty arrays for properties the
- * tool's schema does not require. Required properties keep their empty arrays —
- * there an empty array is an intentional value (e.g. TodoWrite's `todos: []`
- * clears the list).
+ * omitting them: top-level `null` always, empty arrays for properties the
+ * tool's schema does not require, and `pages` from non-PDF Read calls. Required
+ * properties keep their empty arrays — there an empty array is an intentional
+ * value (e.g. TodoWrite's `todos: []` clears the list). Read's `pages` is
+ * different: it is PDF-only, and malformed provider filler can fail Claude
+ * Code's input validation before a tool hook can remove it.
  *
  * The returned object is prototype-less so model-controlled keys like
  * `__proto__` are stored as ordinary own properties instead of silently
@@ -27,10 +29,25 @@
 export function sanitizeToolInput(
   input: Record<string, unknown>,
   requiredProps?: ReadonlySet<string>,
+  toolName?: string,
 ): Record<string, unknown> {
+  const filePath = toolName === 'Read' && typeof input.file_path === 'string'
+    ? input.file_path
+    : undefined;
+  const finalPathComponent = filePath === undefined
+    ? undefined
+    : filePath.slice(Math.max(filePath.lastIndexOf('/'), filePath.lastIndexOf('\\')) + 1);
+  const lastDot = finalPathComponent?.lastIndexOf('.') ?? -1;
+  const extension = finalPathComponent !== undefined
+    && lastDot > 0
+    && lastDot < finalPathComponent.length - 1
+    ? finalPathComponent.slice(lastDot + 1).toLowerCase()
+    : undefined;
+  const nonPdfRead = toolName === 'Read' && extension !== undefined && extension !== 'pdf';
   const out: Record<string, unknown> = Object.create(null);
   for (const [k, v] of Object.entries(input)) {
     if (v === null) continue;
+    if (nonPdfRead && k === 'pages') continue;
     if (Array.isArray(v) && v.length === 0 && !requiredProps?.has(k)) continue;
     out[k] = v;
   }

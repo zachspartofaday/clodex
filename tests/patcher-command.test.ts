@@ -26,6 +26,15 @@ import { tmpdir } from 'node:os';
 import { basename, join } from 'node:path';
 import { runLaunchPatchCheck, runPatchCommand, readPatchManifest } from '../src/patcher.js';
 
+vi.mock('@clack/prompts', async () => {
+  const actual = await vi.importActual<typeof import('@clack/prompts')>('@clack/prompts');
+  return {
+    ...actual,
+    confirm: vi.fn(),
+    isCancel: vi.fn(actual.isCancel),
+  };
+});
+
 const hoisted = vi.hoisted(() => ({
   sentinel: '\n#__CLAUDE_BUNDLE__\n',
   /** Paths passed to readContent, so tests can pin how MANY extractions ran. */
@@ -106,13 +115,25 @@ function installClaude(version: string, bundle = PRISTINE_BUNDLE): string {
   return realpathSync(real);
 }
 
-function saveFavorites(): void {
+function saveFavorites(
+  favorites: Array<{ providerId: string; modelId: string }> = [
+    { providerId: 'openai-oauth', modelId: 'gpt-5.6-sol' },
+  ],
+  modelAliases = [{ name: 'sol', providerId: 'openai-oauth', modelId: 'gpt-5.6-sol' }],
+): void {
   mkdirSync(clodexHome, { recursive: true });
   writeFileSync(join(clodexHome, 'config.json'), JSON.stringify({
-    favoriteModels: [{ providerId: 'openai-oauth', modelId: 'gpt-5.6-sol' }],
-    modelAliases: [{ name: 'sol', providerId: 'openai-oauth', modelId: 'gpt-5.6-sol' }],
+    favoriteModels: favorites,
+    modelAliases,
   }));
 }
+
+const UNPATCHED_WARNING = 'Claude Code\'s current clodex patch configuration is not confirmed, so aliases, favorites, context windows/auto-compaction, '
+  + 'and effort metadata may be missing or outdated. Run `clodex patch` to apply or repair the current configuration. '
+  + 'To roll back a previous patch, run `clodex patch --restore` only when a trustworthy backup exists.';
+const STALE_WARNING = 'Claude Code\'s clodex patch is not confirmed current, so aliases, favorites, context windows/auto-compaction, '
+  + 'and effort metadata may be missing or outdated. Run `clodex patch` to apply or repair the current configuration. '
+  + 'To roll back a previous patch, run `clodex patch --restore` only when a trustworthy backup exists.';
 
 beforeEach(() => {
   home = mkdtempSync(join(tmpdir(), 'clodex-patch-e2e-'));
@@ -127,6 +148,8 @@ beforeEach(() => {
 
   hoisted.readContentCalls.length = 0;
   logs = [];
+  vi.mocked(p.confirm).mockReset();
+  vi.mocked(p.isCancel).mockReset().mockReturnValue(false);
   for (const level of ['info', 'warn', 'error', 'success', 'step', 'message'] as const) {
     vi.spyOn(p.log, level).mockImplementation((message?: unknown) => {
       logs.push(`${level}: ${String(message)}`);
@@ -136,6 +159,8 @@ beforeEach(() => {
 
 afterEach(() => {
   vi.restoreAllMocks();
+  Reflect.deleteProperty(process.stdin, 'isTTY');
+  Reflect.deleteProperty(process.stdout, 'isTTY');
   delete process.env.TWEAKCC_CONFIG_DIR;
   delete process.env.CLODEX_CLAUDE_PATH;
   delete process.env.TWEAKCC_CC_INSTALLATION_PATH;
@@ -213,6 +238,191 @@ describe('runPatchCommand version resolution', () => {
 
     expect(stderr.mock.calls.join('\n')).toMatch(/Could not determine the version/);
     expect(readPatchManifest()).toBeNull();
+  });
+});
+
+describe('runLaunchPatchCheck degraded warnings', () => {
+  it('reports conditional restore guidance for a fresh unpatched install without a backup', async () => {
+    const real = installClaude('2.1.220');
+    const before = readFileSync(real);
+    const stderr = vi.spyOn(console, 'error').mockImplementation(() => {});
+    const confirm = vi.mocked(p.confirm);
+
+    await expect(runLaunchPatchCheck({})).resolves.toBeUndefined();
+
+    expect(stderr).toHaveBeenCalledTimes(1);
+    expect(stderr.mock.calls[0]?.[0]).toBe(`clodex: ${UNPATCHED_WARNING}`);
+    expect(confirm).not.toHaveBeenCalled();
+    expect(readFileSync(real)).toEqual(before);
+    expect(readPatchManifest()).toBeNull();
+    expect(backupFiles()).toEqual([]);
+  });
+
+  it('classifies patched bytes with a missing manifest as unpatched without changing them in dry-run', async () => {
+    const real = installClaude('2.1.220');
+    expect(await runPatchCommand({})).toBe(0);
+    const patchedBytes = readFileSync(real);
+    rmSync(join(clodexHome, 'patch-state.json'));
+    const stderr = vi.spyOn(console, 'error').mockImplementation(() => {});
+    const confirm = vi.mocked(p.confirm);
+    Object.defineProperty(process.stdin, 'isTTY', { configurable: true, value: true });
+    Object.defineProperty(process.stdout, 'isTTY', { configurable: true, value: true });
+
+    await expect(runLaunchPatchCheck({ dryRun: true })).resolves.toBeUndefined();
+
+    expect(stderr).toHaveBeenCalledTimes(1);
+    expect(stderr.mock.calls[0]?.[0]).toBe(`clodex: ${UNPATCHED_WARNING}`);
+    expect(confirm).not.toHaveBeenCalled();
+    expect(readFileSync(real)).toEqual(patchedBytes);
+    expect(readPatchManifest()).toBeNull();
+  });
+
+  it('reports stale-config as not confirmed current and retains the live patched bytes', async () => {
+    const real = installClaude('2.1.220');
+    expect(await runPatchCommand({})).toBe(0);
+    const before = readFileSync(real);
+    saveFavorites(
+      [{ providerId: 'openai-oauth', modelId: 'gpt-5.6-sol' }],
+      [{ name: 'terra', providerId: 'openai-oauth', modelId: 'gpt-5.6-sol' }],
+    );
+    const stderr = vi.spyOn(console, 'error').mockImplementation(() => {});
+    const confirm = vi.mocked(p.confirm);
+
+    await expect(runLaunchPatchCheck({})).resolves.toBeUndefined();
+
+    expect(stderr).toHaveBeenCalledTimes(1);
+    expect(stderr.mock.calls[0]?.[0]).toBe(`clodex: ${STALE_WARNING}`);
+    expect(confirm).not.toHaveBeenCalled();
+    expect(readFileSync(real)).toEqual(before);
+    expect(bundleOf(real)).toContain('"sol"');
+    expect(readPatchManifest()).not.toBeNull();
+  });
+
+  it('keeps current patch state silent', async () => {
+    installClaude('2.1.220');
+    expect(await runPatchCommand({})).toBe(0);
+    const stderr = vi.spyOn(console, 'error').mockImplementation(() => {});
+    const confirm = vi.mocked(p.confirm);
+
+    await expect(runLaunchPatchCheck({})).resolves.toBeUndefined();
+
+    expect(stderr).not.toHaveBeenCalled();
+    expect(confirm).not.toHaveBeenCalled();
+  });
+
+  it('keeps unpatched agent stdout silent', async () => {
+    installClaude('2.1.220');
+    const stderr = vi.spyOn(console, 'error').mockImplementation(() => {});
+    const confirm = vi.mocked(p.confirm);
+
+    await expect(runLaunchPatchCheck({ agentStdout: true })).resolves.toBeUndefined();
+
+    expect(stderr).not.toHaveBeenCalled();
+    expect(confirm).not.toHaveBeenCalled();
+  });
+
+  it('keeps stale-config and stale-binary agent stdout silent', async () => {
+    const real = installClaude('2.1.220');
+    expect(await runPatchCommand({})).toBe(0);
+    const stderr = vi.spyOn(console, 'error').mockImplementation(() => {});
+    const confirm = vi.mocked(p.confirm);
+    const mutations = [
+      () => saveFavorites(
+        [{ providerId: 'openai-oauth', modelId: 'gpt-5.6-sol' }],
+        [{ name: 'terra', providerId: 'openai-oauth', modelId: 'gpt-5.6-sol' }],
+      ),
+      () => writeFileSync(real, Buffer.concat([readFileSync(real), Buffer.from('size drift')])),
+    ];
+
+    for (const mutate of mutations) {
+      mutate();
+      const before = readFileSync(real);
+      stderr.mockClear();
+      confirm.mockClear();
+
+      await expect(runLaunchPatchCheck({ agentStdout: true })).resolves.toBeUndefined();
+
+      expect(stderr).not.toHaveBeenCalled();
+      expect(confirm).not.toHaveBeenCalled();
+      expect(readFileSync(real)).toEqual(before);
+    }
+  });
+
+  it('declines the interactive unpatched offer without patching', async () => {
+    const real = installClaude('2.1.220');
+    const before = readFileSync(real);
+    const stderr = vi.spyOn(console, 'error').mockImplementation(() => {});
+    const confirm = vi.mocked(p.confirm).mockResolvedValue(false);
+    Object.defineProperty(process.stdin, 'isTTY', { configurable: true, value: true });
+    Object.defineProperty(process.stdout, 'isTTY', { configurable: true, value: true });
+
+    await expect(runLaunchPatchCheck({})).resolves.toBeUndefined();
+
+    expect(confirm).toHaveBeenCalledWith({ message: `${UNPATCHED_WARNING} Patch now?`, initialValue: false });
+    expect(stderr).not.toHaveBeenCalled();
+    expect(readFileSync(real)).toEqual(before);
+    expect(readPatchManifest()).toBeNull();
+  });
+
+  it('continues without patching when the interactive offer is canceled', async () => {
+    const real = installClaude('2.1.220');
+    const before = readFileSync(real);
+    const stderr = vi.spyOn(console, 'error').mockImplementation(() => {});
+    const confirm = vi.mocked(p.confirm).mockResolvedValue(false);
+    vi.mocked(p.isCancel).mockReturnValue(true);
+    Object.defineProperty(process.stdin, 'isTTY', { configurable: true, value: true });
+    Object.defineProperty(process.stdout, 'isTTY', { configurable: true, value: true });
+
+    await expect(runLaunchPatchCheck({})).resolves.toBeUndefined();
+
+    expect(confirm).toHaveBeenCalledWith({ message: `${UNPATCHED_WARNING} Patch now?`, initialValue: false });
+    expect(stderr).not.toHaveBeenCalled();
+    expect(readFileSync(real)).toEqual(before);
+    expect(readPatchManifest()).toBeNull();
+  });
+
+  it('patches only after an interactive yes answer', async () => {
+    const real = installClaude('2.1.220');
+    const stderr = vi.spyOn(console, 'error').mockImplementation(() => {});
+    const confirm = vi.mocked(p.confirm).mockResolvedValue(true);
+    Object.defineProperty(process.stdin, 'isTTY', { configurable: true, value: true });
+    Object.defineProperty(process.stdout, 'isTTY', { configurable: true, value: true });
+
+    await expect(runLaunchPatchCheck({})).resolves.toBeUndefined();
+
+    expect(confirm).toHaveBeenCalledWith({ message: `${UNPATCHED_WARNING} Patch now?`, initialValue: false });
+    expect(stderr).not.toHaveBeenCalled();
+    expect(bundleOf(real)).toContain('"sol"');
+    expect(readPatchManifest()).not.toBeNull();
+  });
+
+  it('keeps a version-read failure silent for agent stdout', async () => {
+    const real = installClaude('2.1.220');
+    writeFileSync(real, 'not an executable at all');
+    const stderr = vi.spyOn(console, 'error').mockImplementation(() => {});
+
+    await expect(runLaunchPatchCheck({ agentStdout: true })).resolves.toBeUndefined();
+
+    expect(stderr).not.toHaveBeenCalled();
+  });
+
+  it('keeps a caught patch-check error nonblocking and silent for agent stdout', async () => {
+    writeFileSync(join(clodexHome, 'config.json'), JSON.stringify({ favoriteModels: 'not-an-array' }));
+    const stderr = vi.spyOn(console, 'error').mockImplementation(() => {});
+
+    await expect(runLaunchPatchCheck({ agentStdout: true })).resolves.toBeUndefined();
+
+    expect(stderr).not.toHaveBeenCalled();
+  });
+
+  it('reports a caught patch-check error without blocking an ordinary launch', async () => {
+    writeFileSync(join(clodexHome, 'config.json'), JSON.stringify({ favoriteModels: 'not-an-array' }));
+    const stderr = vi.spyOn(console, 'error').mockImplementation(() => {});
+
+    await expect(runLaunchPatchCheck({})).resolves.toBeUndefined();
+
+    expect(stderr).toHaveBeenCalledTimes(1);
+    expect(stderr.mock.calls[0]?.[0]).toContain('clodex: patch check skipped');
   });
 });
 
@@ -322,7 +532,7 @@ describe('runPatchCommand local patches', () => {
     expect(stderr).toHaveBeenCalled();
   });
 
-  it('detects an edited local module as stale without executing the new bytes', async () => {
+  it('detects local-module-only staleness without executing new bytes or changing live built-ins', async () => {
     const real = installClaude('2.1.220');
     const modulePath = join(clodexHome, 'local-patches.mjs');
     writeFileSync(modulePath, `
@@ -332,6 +542,7 @@ describe('runPatchCommand local patches', () => {
       }];
     `);
     expect(await runPatchCommand({ localPatches: true })).toBe(0);
+    const livePatchedBytes = readFileSync(real);
 
     const proofPath = join(home, 'edited-module-executed');
     writeFileSync(modulePath, `
@@ -345,8 +556,9 @@ describe('runPatchCommand local patches', () => {
     const stderr = vi.spyOn(console, 'error').mockImplementation(() => {});
 
     await expect(runLaunchPatchCheck({ dryRun: true })).resolves.toBeUndefined();
-    expect(stderr.mock.calls.join('\n')).toContain('stale-patched');
+    expect(stderr.mock.calls.join('\n')).toContain(`clodex: ${STALE_WARNING}`);
     expect(existsSync(proofPath)).toBe(false);
+    expect(readFileSync(real)).toEqual(livePatchedBytes);
     expect(bundleOf(real)).toContain('/*clodex-local:first*/');
     expect(bundleOf(real)).not.toContain('/*clodex-local:second*/');
   });
@@ -398,8 +610,8 @@ describe('runPatchCommand local patches', () => {
 
   it('publishes built-ins when a local proof cannot be captured', async () => {
     const bundle = PRISTINE_BUNDLE.replace(
-      'case"best":{return "opus"}default:return null',
-      'case"best":{return "opus"}case"sol":return "native";default:return null',
+      'function rz(x){',
+      `function decoy(){return 'case"sol":return "sol";'}\nfunction rz(x){`,
     );
     const real = installClaude('2.1.220', bundle);
     writeFileSync(join(clodexHome, 'local-patches.mjs'), `
@@ -411,7 +623,9 @@ describe('runPatchCommand local patches', () => {
 
     expect(await runPatchCommand({ localPatches: true })).toBe(0);
     expect(bundleOf(real)).toContain('/*ccpatch:effort*/');
-    expect(bundleOf(real)).toContain('case"sol":return "native";');
+    expect(bundleOf(real)).toContain('case"best":{return "opus"}case"sol":return "sol";default:return null');
+    expect(bundleOf(real)).toContain(`function decoy(){return 'case"sol":return "sol";'}`);
+    expect(bundleOf(real).match(/case"sol":return "sol";/g)).toHaveLength(2);
     expect(bundleOf(real)).not.toContain('/*clodex-local:must-not-run*/');
     expect(logs.join('\n')).toMatch(/FAIL\s+LOCAL PATCH SET.*postconditions/);
   });
@@ -730,5 +944,97 @@ describe('runPatchCommand backup directory integrity', () => {
     // Backups are published temp-then-rename, so no `.tmp-*` may survive.
     expect(backupFiles().filter(name => name.includes('.tmp-'))).toEqual([]);
     expect(bundleOf(real)).toContain('"sol"');
+  });
+});
+
+describe('runPatchCommand patch exposure warning', () => {
+  it('keeps unavailable retained favorites in saved-order capacity without backfill', async () => {
+    const real = installClaude('2.1.220');
+    const ordinaryFavorites = Array.from({ length: 19 }, (_, index) => ({
+      providerId: 'custom-provider',
+      modelId: `custom-${index}`,
+    }));
+    const staleFavorite = { providerId: 'opencode-go', modelId: 'stale-future-model' };
+    const lateFavorite = { providerId: 'opencode-go', modelId: 'qwen3.8-max' };
+    writeFileSync(join(clodexHome, 'config.json'), JSON.stringify({
+      favoriteModels: [staleFavorite, ...ordinaryFavorites, lateFavorite],
+      modelAliases: [
+        { name: 'stale', ...staleFavorite },
+        { name: 'late', ...lateFavorite },
+      ],
+    }));
+    writeFileSync(join(clodexHome, 'providers.json'), JSON.stringify({
+      schemaVersion: 1,
+      providers: [{
+        id: 'opencode-go',
+        templateId: 'opencode-go',
+        name: 'OpenCode Go',
+        enabled: true,
+        authRef: 'keyring:provider:opencode-go',
+        authType: 'api',
+        api: { npm: '@ai-sdk/openai-compatible', url: 'https://opencode.ai/zen/go/v1' },
+        modelsCache: {
+          fetchedAt: '2026-08-12T00:00:00.000Z',
+          models: [{
+            id: staleFavorite.modelId,
+            name: 'Stale future model',
+            modelFormat: 'openai',
+          }, {
+            id: lateFavorite.modelId,
+            name: 'Qwen 3.8 Max',
+            modelFormat: 'openai',
+          }],
+        },
+        addedAt: '2026-08-12T00:00:00.000Z',
+      }],
+    }));
+
+    expect(await runPatchCommand({})).toBe(0);
+
+    const warning = logs.join('\n');
+    expect(warning).toMatch(
+      /warn: 1 saved favorite not patched because clodex limits the Claude-facing patch catalog to 20 models/,
+    );
+    expect(warning).toMatch(/Capacity is selected from saved order before availability and support checks/);
+    expect(warning).toMatch(/unavailable entries keep a position and can leave fewer active models/);
+    expect(warning).toMatch(/Removing or reordering those entries reclaims positions/);
+    expect(warning).toContain('  clodex:opencode-go:qwen3.8-max');
+    expect(warning).toMatch(/Saved model alias "stale" was not patched.*outside the active Claude Code catalog/);
+    expect(warning).toMatch(/Saved model alias "late" was not patched.*outside the active Claude Code catalog/);
+    expect(bundleOf(real)).toContain('"clodex:custom-provider:custom-18"');
+    expect(bundleOf(real)).not.toContain('stale-future-model');
+    expect(bundleOf(real)).not.toContain('qwen3.8-max');
+  });
+
+  it('warns that capacity is selected from saved order and lists the skipped favorite', async () => {
+    const real = installClaude('2.1.220');
+    const favorites = [{ providerId: 'openai-oauth', modelId: 'gpt-5.6-sol' }];
+    for (let n = 2; n <= 21; n++) {
+      favorites.push({ providerId: 'openai-oauth', modelId: `gpt-5.6-sol-${n}` });
+    }
+    saveFavorites(favorites, [{
+      name: 'late',
+      providerId: 'openai-oauth',
+      modelId: 'gpt-5.6-sol-21',
+    }]);
+
+    expect(await runPatchCommand({})).toBe(0);
+
+    const warning = logs.join('\n');
+    expect(warning).toMatch(
+      /warn: 1 saved favorite not patched because clodex limits the Claude-facing patch catalog to 20 models/,
+    );
+    // Capacity is selected from saved order BEFORE availability/support checks, so
+    // unavailable entries can leave fewer active models than the catalog allows.
+    expect(warning).toMatch(/Capacity is selected from saved order before availability and support checks/);
+    expect(warning).toMatch(/unavailable entries keep a position and can leave fewer active models/);
+    expect(warning).toMatch(/Removing or reordering those entries reclaims positions/);
+    // The 21st saved favorite is omitted from the patch and listed as skipped.
+    expect(warning).toContain('  clodex:openai-oauth:gpt-5.6-sol-21');
+    expect(warning).toContain(
+      'Saved model alias "late" was not patched — target is outside the active Claude Code catalog.',
+    );
+    expect(bundleOf(real)).toContain('"clodex:openai-oauth:gpt-5.6-sol-20"');
+    expect(bundleOf(real)).not.toContain('clodex:openai-oauth:gpt-5.6-sol-21');
   });
 });

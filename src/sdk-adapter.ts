@@ -17,15 +17,29 @@ import {
   thinkingProviderOptions,
   type ReasoningMetadata,
 } from './provider-factory.js';
+import {
+  DEFAULT_UNSUPPORTED_EFFORT_POLICY,
+  resolveRequestEffort,
+  type UnsupportedEffortPolicy,
+} from './effort-policy.js';
 import { resolveUpstreamTools } from './tool-search.js';
 import { sanitizeToolInput } from './tool-input-sanitize.js';
 import type { AnthropicRequestMessage, AnthropicToolDefinition } from './proxy-types.js';
 import { anthropicErrorType, upstreamHttpStatus } from './upstream-error.js';
 import { upstreamMaxRetries } from './upstream-retry.js';
 import { emitParentNotice } from './parent-notice.js';
-import { CLAUDE_CODE_BILLING_HEADER_PREFIX } from './oauth/claude-identity.js';
 
 export { silenceSdkWarnings };
+
+/**
+ * Prefix of the Claude Code billing-attribution system line.
+ *
+ * clodex never emits this line; it only STRIPS one a client already sent, so a
+ * volatile per-request attribution string can never head a translated prompt
+ * and churn an upstream's implicit cache prefix. Private to this module on
+ * purpose — it is a recognizer, and nothing may import it to build the line.
+ */
+const CLAUDE_CODE_BILLING_HEADER_PREFIX = 'x-anthropic-billing-header:';
 
 export type SdkTranslationErrorSignature =
   | 'reasoning_part_not_found'
@@ -83,6 +97,12 @@ export interface AnthropicRequest {
 export interface TranslateRequestOptions {
   /** Fallback when the client omits effort (e.g. Claude Desktop gateway). */
   defaultEffort?: string;
+  /**
+   * Global behavior for an explicit effort the target model cannot run. Applies
+   * only where the model carries a reviewed effort profile; everywhere else the
+   * existing per-provider mapping is unchanged.
+   */
+  effortPolicy?: UnsupportedEffortPolicy;
   reasoningMetadata?: ReasoningMetadata;
   /** ChatGPT Codex OAuth requires instructions and manages its own output limit. */
   openAiOAuth?: boolean;
@@ -465,6 +485,30 @@ function isClaudeCodeStructuredOutputCompactRequest(body: AnthropicRequest): boo
   return text.includes(COMPACT_TEXT_ONLY_START) && text.includes(COMPACT_TEXT_ONLY_END);
 }
 
+/**
+ * The effort level this request should send, after the global policy has had
+ * its say.
+ *
+ * Without a reviewed profile this is the historical behavior verbatim: the
+ * client's effort, or the caller's fallback. With one, an unsupported level is
+ * resolved by policy — omitted, rounded along the executable ladder, or
+ * refused — and an omitted effort uses only a DECLARED default.
+ */
+function resolveTranslatedEffort(
+  body: AnthropicRequest,
+  options?: TranslateRequestOptions,
+): string | undefined {
+  const requested = anthropicEffortFromRequest(body) ?? options?.defaultEffort;
+  const profile = options?.reasoningMetadata?.effortProfile;
+  if (!profile) return requested;
+  const resolution = resolveRequestEffort(
+    requested,
+    profile,
+    options?.effortPolicy ?? DEFAULT_UNSUPPORTED_EFFORT_POLICY,
+  );
+  return resolution?.resolved;
+}
+
 export function translateRequest(
   body: AnthropicRequest,
   npm: string,
@@ -498,7 +542,11 @@ export function translateRequest(
   if (options?.maxTools !== undefined && upstreamTools.length > options.maxTools) {
     upstreamTools = upstreamTools.slice(0, options.maxTools);
   }
-  const effort = anthropicEffortFromRequest(body) ?? options?.defaultEffort;
+  // Resolve the global effort EXACTLY ONCE, before anything is serialized. The
+  // direct chat-completions forward resolves at its own boundary and then hands
+  // the same already-resolved level to the same wire map, which is what makes
+  // the two paths produce byte-identical bodies.
+  const effort = resolveTranslatedEffort(body, options);
   let providerOptions = deepMergeProviderOptions(
     thinkingProviderOptions(npm),
     effortProviderOptions(npm, effort, options?.reasoningMetadata?.upstreamModelId ?? body.model, options?.reasoningMetadata),
@@ -707,10 +755,31 @@ export async function writeAnthropicStream(
   let openType: 'text' | 'thinking' | 'tool' | null = null;
   let pendingThinkingSig: string | undefined;
   const idToBlock = new Map<string, number>();
+  const toolNameById = new Map<string, string>();
   // Tool input deltas are buffered (not forwarded raw) so the complete input
   // can be sanitized once the SDK's parsed `tool-call` part arrives.
   const toolJsonBuffer = new Map<string, string>();
   const flushedTools = new Set<string>();
+  const bufferedToolInput = (id: string): string | undefined => {
+    const buffered = toolJsonBuffer.get(id);
+    let json = buffered;
+    const toolName = toolNameById.get(id);
+    if (buffered && toolName) {
+      try {
+        const parsed = JSON.parse(buffered) as unknown;
+        if (parsed && typeof parsed === 'object' && !Array.isArray(parsed)) {
+          json = JSON.stringify(sanitizeToolInput(
+            parsed as Record<string, unknown>,
+            requiredProps.get(toolName),
+            toolName,
+          ));
+        }
+      } catch {
+        // Preserve malformed/partial JSON exactly; the client owns its error.
+      }
+    }
+    return json;
+  };
   let openToolId: string | null = null;
   let finishReason = 'end_turn';
   let usage: AnthropicUsage = {
@@ -746,14 +815,15 @@ export async function writeAnthropicStream(
       });
       pendingThinkingSig = undefined;
     }
-    // Stream ended (or moved on) without a tool-call part for this block: emit
-    // the buffered raw JSON so the deltas that did arrive are not lost.
+    // Stream ended (or moved on) without a tool-call part for this block. Parse
+    // and sanitize complete buffered JSON when possible; malformed or partial
+    // JSON still passes through unchanged so the deltas are not lost.
     if (openType === 'tool' && openToolId !== null && !flushedTools.has(openToolId)) {
-      const buffered = toolJsonBuffer.get(openToolId);
-      if (buffered) {
+      const json = bufferedToolInput(openToolId);
+      if (json) {
         emit('content_block_delta', {
           type: 'content_block_delta', index: blockIndex,
-          delta: { type: 'input_json_delta', partial_json: buffered },
+          delta: { type: 'input_json_delta', partial_json: json },
         });
       }
       flushedTools.add(openToolId);
@@ -817,6 +887,7 @@ export async function writeAnthropicStream(
           type: 'tool_use', id: encodeToolUseId(part.id ?? '', sig), name: part.toolName, input: {},
         });
         idToBlock.set(part.id ?? '', blockIndex);
+        toolNameById.set(part.id ?? '', part.toolName ?? '');
         openToolId = part.id ?? '';
         break;
       }
@@ -835,8 +906,8 @@ export async function writeAnthropicStream(
           // falling back to the buffered raw JSON if the SDK gave no parsed input.
           if (!flushedTools.has(id)) {
             const json = part.input !== undefined && part.input !== null
-              ? JSON.stringify(sanitizeToolInput(part.input as Record<string, unknown>, requiredProps.get(part.toolName ?? '')))
-              : (toolJsonBuffer.get(id) ?? '');
+              ? JSON.stringify(sanitizeToolInput(part.input as Record<string, unknown>, requiredProps.get(part.toolName ?? ''), part.toolName))
+              : (bufferedToolInput(id) ?? '');
             if (json) {
               emit('content_block_delta', {
                 type: 'content_block_delta', index: idToBlock.get(id) ?? blockIndex,
@@ -853,7 +924,7 @@ export async function writeAnthropicStream(
           });
           emit('content_block_delta', {
             type: 'content_block_delta', index: blockIndex,
-            delta: { type: 'input_json_delta', partial_json: JSON.stringify(sanitizeToolInput(part.input as Record<string, unknown> ?? {}, requiredProps.get(part.toolName ?? ''))) },
+            delta: { type: 'input_json_delta', partial_json: JSON.stringify(sanitizeToolInput(part.input as Record<string, unknown> ?? {}, requiredProps.get(part.toolName ?? ''), part.toolName)) },
           });
           flushedTools.add(id);
         }
@@ -1081,7 +1152,7 @@ export async function generateAnthropicResponse(
         type: 'tool_use',
         id: encodeToolUseId(tc.toolCallId, grabRoundTripSignature(tc as FullStreamPart)),
         name: tc.toolName,
-        input: sanitizeToolInput(tc.input as Record<string, unknown> ?? {}, requiredProps.get(tc.toolName)),
+        input: sanitizeToolInput(tc.input as Record<string, unknown> ?? {}, requiredProps.get(tc.toolName), tc.toolName),
       })),
     ],
     stop_reason: finishReason === 'tool-calls' ? 'tool_use' : 'end_turn',

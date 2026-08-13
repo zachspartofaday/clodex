@@ -10,8 +10,9 @@ import { execFileSync } from 'node:child_process';
 import * as p from '@clack/prompts';
 import { createHash } from 'node:crypto';
 import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { createRequire } from 'node:module';
 import { tmpdir } from 'node:os';
-import { join } from 'node:path';
+import { dirname, join } from 'node:path';
 import {
   applyPatch,
   buildPatchModelConfig,
@@ -38,6 +39,8 @@ import {
   NETWORK_ENV_CONTRACT_VAR,
   networkEnvBaseline,
 } from '../src/network-env.js';
+import { buildHttpProxyRoutes } from '../src/http-proxy/routes.js';
+import type { LocalProvider } from '../src/types.js';
 
 /**
  * The digest a pre-versioning clodex wrote into `patch-state.json`: the bare
@@ -117,7 +120,7 @@ describe('buildPatchModelConfig', () => {
     );
 
     expect(config['clodex:openai-oauth:gpt-5.6-sol']).toEqual({
-      alias: 'sol',
+      aliases: ['sol'],
       context: 272_000,
       display: 'GPT-5.6 Sol (OpenAI (ChatGPT))',
       effort: {
@@ -136,6 +139,55 @@ describe('buildPatchModelConfig', () => {
     // Unknown window → no context (Claude Code's 200k default) + warning entry
     expect(config['clodex:openai:mystery-model']).toEqual({});
     expect(unknownWindows).toEqual(['clodex:openai:mystery-model']);
+  });
+
+  it('preserves every alias when several names target one favorite', () => {
+    const { config } = buildPatchModelConfig(
+      [{ providerId: 'opencode-go', modelId: 'deepseek-v4-flash' }],
+      [
+        { name: 'luna', providerId: 'opencode-go', modelId: 'deepseek-v4-flash' },
+        { name: 'terra', providerId: 'opencode-go', modelId: 'deepseek-v4-flash' },
+        { name: 'ds4', providerId: 'opencode-go', modelId: 'deepseek-v4-flash' },
+      ],
+      () => ({
+        contextWindow: 1_000_000,
+        displayName: 'DeepSeek V4 Flash (OpenCode Go)',
+        effort: {
+          levels: ['none', 'low', 'medium', 'high', 'xhigh', 'max'],
+          defaultLevel: 'medium',
+        },
+      }),
+    );
+
+    // Saved order, every alias, one shared projected capability contract.
+    expect(config['clodex:opencode-go:deepseek-v4-flash']).toEqual({
+      aliases: ['luna', 'terra', 'ds4'],
+      context: 1_000_000,
+      display: 'DeepSeek V4 Flash (OpenCode Go)',
+      effort: {
+        levels: ['low', 'medium', 'high', 'xhigh', 'max'],
+        defaultLevel: 'high',
+      },
+    });
+  });
+
+  it('keeps same-target aliases without inventing effort from sparse metadata', () => {
+    const { config } = buildPatchModelConfig(
+      [{ providerId: 'opencode-go', modelId: 'deepseek-v4-flash' }],
+      [
+        { name: 'luna', providerId: 'opencode-go', modelId: 'deepseek-v4-flash' },
+        { name: 'ds4', providerId: 'opencode-go', modelId: 'deepseek-v4-flash' },
+      ],
+      () => ({
+        contextWindow: 1_000_000,
+        effort: { levels: ['high', 'max'], defaultLevel: 'high' },
+      }),
+    );
+
+    expect(config['clodex:opencode-go:deepseek-v4-flash']).toEqual({
+      aliases: ['luna', 'ds4'],
+      context: 1_000_000,
+    });
   });
 
   it('omits context when the window equals the 200k default', () => {
@@ -191,9 +243,9 @@ describe('buildPatchModelConfig', () => {
       (providerId, modelId) => meta.get(`${providerId}:${modelId}`),
     );
 
-    expect(config['clodex:openai-oauth:gpt-5.6-sol']?.alias).toBe('sol');
-    expect(config['clodex:openai-oauth:gpt-5.6-luna']?.alias).toBeUndefined();
-    expect(config['clodex:openai:mystery-model']?.alias).toBeUndefined();
+    expect(config['clodex:openai-oauth:gpt-5.6-sol']?.aliases).toEqual(['sol']);
+    expect(config['clodex:openai-oauth:gpt-5.6-luna']?.aliases).toBeUndefined();
+    expect(config['clodex:openai:mystery-model']?.aliases).toBeUndefined();
   });
 
   it('returns every rejected saved alias so the patch command can report it', () => {
@@ -223,6 +275,92 @@ describe('buildPatchModelConfig', () => {
     } finally {
       warn.mockRestore();
     }
+  });
+
+  it('does not treat missing patch metadata as target unavailability', () => {
+    const favorite = { providerId: 'provider', modelId: 'model-a' };
+    const desired = buildPatchModelConfig(
+      [favorite],
+      [{ name: 'active', ...favorite }],
+      () => undefined,
+    );
+
+    expect(desired.config['clodex:provider:model-a']?.aliases).toEqual(['active']);
+    expect(desired.unknownWindows).toEqual(['clodex:provider:model-a']);
+    expect(desired.rejectedAliasRejections).toEqual([]);
+  });
+
+  it('patches only the first catalog-sized favorite window and rejects aliases beyond it', () => {
+    const manyFavorites = Array.from({ length: 25 }, (_, index) => ({
+      providerId: 'provider',
+      modelId: `model-${index}`,
+    }));
+    const desired = buildPatchModelConfig(
+      manyFavorites,
+      [{ name: 'late', providerId: 'provider', modelId: 'model-20' }],
+      () => ({ contextWindow: 200_000 }),
+    );
+
+    expect(Object.keys(desired.config)).toEqual(
+      manyFavorites.slice(0, 20).map(favorite => (
+        `clodex:${favorite.providerId}:${favorite.modelId}`
+      )),
+    );
+    expect(desired.capacitySkippedFavorites).toEqual(manyFavorites.slice(20));
+    expect(desired.rejectedAliasRejections).toEqual([{
+      alias: { name: 'late', providerId: 'provider', modelId: 'model-20' },
+      reason: 'target-not-exposed',
+    }]);
+  });
+
+  it('rejects every same-target alias beyond the catalog window without backfilling', () => {
+    const manyFavorites = Array.from({ length: 21 }, (_, index) => ({
+      providerId: 'provider',
+      modelId: `model-${index}`,
+    }));
+    const desired = buildPatchModelConfig(
+      manyFavorites,
+      [
+        { name: 'first', providerId: 'provider', modelId: 'model-0' },
+        { name: 'late', providerId: 'provider', modelId: 'model-20' },
+        { name: 'later', providerId: 'provider', modelId: 'model-20' },
+        { name: 'alsofirst', providerId: 'provider', modelId: 'model-0' },
+      ],
+      () => ({ contextWindow: 200_000 }),
+    );
+
+    expect(desired.config['clodex:provider:model-0']?.aliases).toEqual(['first', 'alsofirst']);
+    expect(desired.config['clodex:provider:model-20']).toBeUndefined();
+    expect(desired.rejectedAliasRejections).toEqual([
+      {
+        alias: { name: 'late', providerId: 'provider', modelId: 'model-20' },
+        reason: 'target-not-exposed',
+      },
+      {
+        alias: { name: 'later', providerId: 'provider', modelId: 'model-20' },
+        reason: 'target-not-exposed',
+      },
+    ]);
+  });
+
+  it('keeps the surviving same-target aliases when a sibling name is unusable', () => {
+    const favorite = { providerId: 'provider', modelId: 'model-a' };
+    const desired = buildPatchModelConfig(
+      [favorite],
+      [
+        { name: 'luna', ...favorite },
+        { name: 'default', ...favorite },
+        { name: 'bad name', ...favorite },
+        { name: 'ds4', ...favorite },
+      ],
+      () => ({ contextWindow: 200_000 }),
+    );
+
+    expect(desired.config['clodex:provider:model-a']?.aliases).toEqual(['luna', 'ds4']);
+    expect(desired.rejectedAliasRejections).toEqual([
+      { alias: { name: 'default', ...favorite }, reason: 'reserved-name' },
+      { alias: { name: 'bad name', ...favorite }, reason: 'invalid-name' },
+    ]);
   });
 });
 
@@ -277,6 +415,165 @@ describe('buildDesiredPatchConfig', () => {
       }),
     );
   }
+
+  it('filters only stale retained favorites while preserving ordinary unknowns and input order', () => {
+    const favorites = [
+      { providerId: 'opencode-go', modelId: 'stale-future-model' },
+      { providerId: 'imported-opencode', modelId: 'deepseek-v4-pro' },
+      { providerId: 'custom-provider', modelId: 'custom-unknown-model' },
+      { providerId: 'imported-opencode', modelId: 'stale-future-model' },
+      { providerId: 'opencode-go', modelId: 'qwen3.8-max' },
+    ];
+    const aliases = [
+      { name: 'stale', providerId: 'opencode-go', modelId: 'stale-future-model' },
+      { name: 'deep', providerId: 'imported-opencode', modelId: 'deepseek-v4-pro' },
+      { name: 'custom', providerId: 'custom-provider', modelId: 'custom-unknown-model' },
+      { name: 'stale-imported', providerId: 'imported-opencode', modelId: 'stale-future-model' },
+      { name: 'qwen', providerId: 'opencode-go', modelId: 'qwen3.8-max' },
+    ];
+    writeFileSync(join(home, 'config.json'), JSON.stringify({ favoriteModels: favorites, modelAliases: aliases }));
+    writeFileSync(join(home, 'providers.json'), JSON.stringify({
+      schemaVersion: 1,
+      providers: [{
+        id: 'opencode-go',
+        templateId: 'opencode-go',
+        name: 'OpenCode Go',
+        enabled: true,
+        authRef: 'keyring:provider:opencode-go',
+        authType: 'api',
+        api: { npm: '@ai-sdk/openai-compatible', url: 'https://opencode.ai/zen/go/v1' },
+        modelsCache: {
+          fetchedAt: '2026-08-12T00:00:00.000Z',
+          models: [{
+            id: 'qwen3.8-max',
+            upstreamModelId: 'qwen3.8-max',
+            name: 'Qwen 3.8 Max',
+            modelFormat: 'openai',
+          }, {
+            id: 'stale-future-model',
+            upstreamModelId: 'stale-future-model',
+            name: 'Stale future model',
+            modelFormat: 'openai',
+          }],
+        },
+        addedAt: '2026-08-12T00:00:00.000Z',
+      }, {
+        id: 'imported-opencode',
+        templateId: 'opencode-go',
+        name: 'Imported OpenCode Go',
+        enabled: true,
+        authRef: 'keyring:provider:imported-opencode',
+        authType: 'api',
+        api: { npm: '@ai-sdk/openai-compatible', url: 'https://opencode.ai/zen/go/v1' },
+        modelsCache: {
+          fetchedAt: '2026-08-12T00:00:00.000Z',
+          models: [{
+            id: 'deepseek-v4-pro',
+            upstreamModelId: 'deepseek-v4-pro',
+            name: 'DeepSeek V4 Pro',
+            modelFormat: 'openai',
+          }, {
+            id: 'stale-future-model',
+            upstreamModelId: 'stale-future-model',
+            name: 'Stale future model',
+            modelFormat: 'openai',
+          }],
+        },
+        addedAt: '2026-08-12T00:00:00.000Z',
+      }, {
+        id: 'custom-provider',
+        templateId: 'custom-openai',
+        name: 'Custom provider',
+        enabled: true,
+        authRef: 'keyring:provider:custom-provider',
+        authType: 'api',
+        api: { npm: '@ai-sdk/openai-compatible', url: 'https://custom.invalid/v1' },
+        modelsCache: {
+          fetchedAt: '2026-08-12T00:00:00.000Z',
+          models: [{
+            id: 'custom-unknown-model',
+            upstreamModelId: 'custom-unknown-model',
+            name: 'Custom unknown model',
+            modelFormat: 'openai',
+          }],
+        },
+        addedAt: '2026-08-12T00:00:00.000Z',
+      }],
+    }));
+    const configBefore = readFileSync(join(home, 'config.json'), 'utf8');
+    const providersBefore = readFileSync(join(home, 'providers.json'), 'utf8');
+
+    const desired = buildDesiredPatchConfig();
+
+    expect(Object.keys(desired.config)).toEqual([
+      'clodex:imported-opencode:deepseek-v4-pro',
+      'clodex:custom-provider:custom-unknown-model',
+      'clodex:opencode-go:qwen3.8-max',
+    ]);
+    expect(desired.config['clodex:imported-opencode:deepseek-v4-pro']?.aliases).toEqual(['deep']);
+    expect(desired.config['clodex:custom-provider:custom-unknown-model']?.aliases).toEqual(['custom']);
+    expect(desired.config['clodex:opencode-go:qwen3.8-max']?.aliases).toEqual(['qwen']);
+    expect(desired.config['clodex:opencode-go:stale-future-model']).toBeUndefined();
+    expect(desired.config['clodex:imported-opencode:stale-future-model']).toBeUndefined();
+    expect(desired.rejectedAliases).toEqual(expect.arrayContaining([
+      aliases[0],
+      aliases[3],
+    ]));
+    expect(readFileSync(join(home, 'config.json'), 'utf8')).toBe(configBefore);
+    expect(readFileSync(join(home, 'providers.json'), 'utf8')).toBe(providersBefore);
+  });
+
+  it('does not backfill past a stale retained favorite in the exposure window', () => {
+    const ordinaryFavorites = Array.from({ length: 19 }, (_, index) => ({
+      providerId: 'custom-provider',
+      modelId: `custom-${index}`,
+    }));
+    const staleFavorite = { providerId: 'opencode-go', modelId: 'stale-future-model' };
+    const lateFavorite = { providerId: 'opencode-go', modelId: 'qwen3.8-max' };
+    writeFileSync(join(home, 'config.json'), JSON.stringify({
+      favoriteModels: [staleFavorite, ...ordinaryFavorites, lateFavorite],
+      modelAliases: [
+        { name: 'stale', ...staleFavorite },
+        { name: 'late', ...lateFavorite },
+      ],
+    }));
+    writeFileSync(join(home, 'providers.json'), JSON.stringify({
+      schemaVersion: 1,
+      providers: [{
+        id: 'opencode-go',
+        templateId: 'opencode-go',
+        name: 'OpenCode Go',
+        enabled: true,
+        authRef: 'keyring:provider:opencode-go',
+        authType: 'api',
+        api: { npm: '@ai-sdk/openai-compatible', url: 'https://opencode.ai/zen/go/v1' },
+        modelsCache: {
+          fetchedAt: '2026-08-12T00:00:00.000Z',
+          models: [{
+            id: staleFavorite.modelId,
+            name: 'Stale future model',
+            modelFormat: 'openai',
+          }, {
+            id: lateFavorite.modelId,
+            name: 'Qwen 3.8 Max',
+            modelFormat: 'openai',
+          }],
+        },
+        addedAt: '2026-08-12T00:00:00.000Z',
+      }],
+    }));
+
+    const desired = buildDesiredPatchConfig();
+
+    expect(Object.keys(desired.config)).toEqual(
+      ordinaryFavorites.map(favorite => `clodex:${favorite.providerId}:${favorite.modelId}`),
+    );
+    expect(desired.capacitySkippedFavorites).toEqual([lateFavorite]);
+    expect(desired.rejectedAliasRejections).toEqual([
+      { alias: { name: 'stale', ...staleFavorite }, reason: 'target-not-exposed' },
+      { alias: { name: 'late', ...lateFavorite }, reason: 'target-not-exposed' },
+    ]);
+  });
 
   it('preserves the native high default when provider metadata defaults to medium', () => {
     writeInputs({
@@ -346,6 +643,46 @@ describe('buildDesiredPatchConfig', () => {
 
     expect(desired.config['clodex:qiniu-ai:kimi-k2']?.effort).toBeUndefined();
   });
+
+  it('enforces the Claude-facing cap through the disk-only desired config path', () => {
+    const models = Array.from({ length: 25 }, (_, index) => ({
+      id: `model-${index}`,
+      name: `Model ${index}`,
+      contextWindow: 200_000,
+      modelFormat: 'openai',
+    }));
+    const favorites = models.map(model => ({ providerId: 'openai', modelId: model.id }));
+    writeFileSync(
+      join(home, 'config.json'),
+      JSON.stringify({ favoriteModels: favorites }),
+    );
+    writeFileSync(
+      join(home, 'providers.json'),
+      JSON.stringify({
+        schemaVersion: 1,
+        providers: [{
+          id: 'openai',
+          templateId: 'openai',
+          name: 'OpenAI',
+          enabled: true,
+          authRef: 'env:OPENAI_API_KEY',
+          api: { npm: '@ai-sdk/openai' },
+          modelsCache: {
+            fetchedAt: '2026-07-27T00:00:00.000Z',
+            models,
+          },
+          addedAt: '2026-07-27T00:00:00.000Z',
+        }],
+      }),
+    );
+
+    const desired = buildDesiredPatchConfig();
+
+    expect(Object.keys(desired.config)).toEqual(
+      favorites.slice(0, 20).map(favorite => `clodex:${favorite.providerId}:${favorite.modelId}`),
+    );
+    expect(desired.capacitySkippedFavorites).toEqual(favorites.slice(20));
+  });
 });
 
 describe('computePatchConfigHash', () => {
@@ -359,6 +696,24 @@ describe('computePatchConfigHash', () => {
     expect(computePatchConfigHash(a)).not.toBe(
       computePatchConfigHash({ ...a, 'clodex:p:m1': { alias: 'x', context: 2000 } }),
     );
+  });
+
+  it('hashes every alias in saved order', () => {
+    const one = { 'clodex:p:m1': { aliases: ['luna'], context: 1000 } };
+    const three = {
+      'clodex:p:m1': { aliases: ['luna', 'terra', 'ds4'], context: 1000 },
+    };
+
+    // Adding or removing an alias makes an installed patch read as stale.
+    expect(computePatchConfigHash(one)).not.toBe(computePatchConfigHash(three));
+    // Reordering does too — the order is the identity order baked into the binary.
+    expect(computePatchConfigHash(three)).not.toBe(computePatchConfigHash({
+      'clodex:p:m1': { aliases: ['ds4', 'terra', 'luna'], context: 1000 },
+    }));
+    // A legacy single-alias entry and its one-element array form are the same config.
+    expect(computePatchConfigHash({
+      'clodex:p:m1': { alias: 'luna', context: 1000 },
+    })).toBe(computePatchConfigHash(one));
   });
 
   it('changes when only the display label changes (so an old patch reads as stale)', () => {
@@ -468,9 +823,61 @@ describe('PATCH_TRANSFORMS_VERSION', () => {
       .join('\n');
     const digest = createHash('sha256').update(source).digest('hex');
     expect({ version: PATCH_TRANSFORMS_VERSION, digest }).toEqual({
-      version: 6,
-      digest: 'c2abf1d2b334562c3b3b3e2158d44c9986001c0401415912ef7dd450137eab3e',
+      version: 10,
+      digest: '658787435634d24e9324ad89b7adf7b0ba6b4681f823b78b11e4b428d996548c',
     });
+  });
+});
+
+describe('tweakcc dependency patch', () => {
+  it('keeps tweakcc 4.3.0 patched for only the exact Bun root CLI module', () => {
+    const packageJson = JSON.parse(
+      readFileSync(new URL('../package.json', import.meta.url), 'utf8'),
+    ) as { dependencies: Record<string, string> };
+    const workspace = readFileSync(
+      new URL('../pnpm-workspace.yaml', import.meta.url),
+      'utf8',
+    );
+    const lockfile = readFileSync(
+      new URL('../pnpm-lock.yaml', import.meta.url),
+      'utf8',
+    );
+    const patch = readFileSync(
+      new URL('../patches/tweakcc@4.3.0.patch', import.meta.url),
+      'utf8',
+    );
+    const tweakccEntry = createRequire(import.meta.url).resolve('tweakcc');
+    const installedNativeModule = readFileSync(
+      join(dirname(dirname(tweakccEntry)), 'nativeInstallation-Bo_Crunz.mjs'),
+      'utf8',
+    );
+
+    expect(packageJson.dependencies['tweakcc']).toBe('4.3.0');
+    expect(workspace.match(/  tweakcc@4\.3\.0: patches\/tweakcc@4\.3\.0\.patch/g)).toHaveLength(1);
+    expect(lockfile.match(
+      /  tweakcc@4\.3\.0:\n    hash: 9f4c832147f900c8308e842920a2796aa1e5841cf3a73c1f033ba96421c1d3bd\n    path: patches\/tweakcc@4\.3\.0\.patch/g,
+    )).toHaveLength(1);
+    expect(patch.match(/^\+.*e===`\/\$bunfs\/root\/cli`.*$/gm)).toHaveLength(1);
+
+    // tweakcc does not export this selector. Execute the exact expression from
+    // the installed dependency so a missing/reverse-applied pnpm patch fails
+    // behaviorally rather than merely proving that the patch artifact exists.
+    const selectorMatch = installedNativeModule.match(
+      /function [\w$]+\(([\w$]+)\)\{return ([^}]*src\/entrypoints\/cli\.js[^}]*)\}/,
+    );
+    expect(selectorMatch).toBeDefined();
+    const selector = new Function(
+      selectorMatch![1]!,
+      `return ${selectorMatch![2]!};`,
+    ) as (moduleName: string) => boolean;
+
+    expect(selector('/$bunfs/root/cli')).toBe(true);
+    expect(selector('/src/entrypoints/cli.js')).toBe(true);
+    expect(selector('/opt/$bunfs/root/cli')).toBe(false);
+    expect(selector('$bunfs/root/cli')).toBe(false);
+    expect(selector('/$bunfs/root/cli.exe')).toBe(false);
+    expect(selector('\\$bunfs\\root\\cli')).toBe(false);
+    expect(selector('/cli')).toBe(false);
   });
 });
 
@@ -603,9 +1010,52 @@ describe('applyClodexPatches input validation', () => {
     })).toThrow(/reserved alias/);
   });
 
+  it('rejects an unsafe or reserved name anywhere in an alias list', () => {
+    expect(() => applyClodexPatches('var x = 1;', {
+      'clodex:openai:model': { aliases: ['luna', 'Bad Alias!', 'ds4'] },
+    })).toThrow(/not a safe lowercase alias/);
+    expect(() => applyClodexPatches('var x = 1;', {
+      'clodex:openai:model': { aliases: ['luna', 'sonnet', 'ds4'] },
+    })).toThrow(/reserved alias/);
+  });
+
+  it('rejects malformed alias lists and non-string entries', () => {
+    expect(() => applyClodexPatches('var x = 1;', {
+      'clodex:openai:model': { aliases: 'luna' as unknown as string[] },
+    })).toThrow(/aliases for "clodex:openai:model" must be an array/);
+    expect(() => applyClodexPatches('var x = 1;', {
+      'clodex:openai:model': { aliases: ['luna', 7 as unknown as string] },
+    })).toThrow(/alias for "clodex:openai:model" must be a string/);
+  });
+
+  it('rejects duplicate aliases instead of silently overwriting one', () => {
+    expect(() => applyClodexPatches('var x = 1;', {
+      'clodex:openai:model-a': { aliases: ['luna'] },
+      'clodex:openai:model-b': { aliases: ['luna'] },
+    })).toThrow(/alias "luna" is configured more than once/);
+    expect(() => applyClodexPatches('var x = 1;', {
+      'clodex:openai:model': { aliases: ['luna', 'LUNA'] },
+    })).toThrow(/alias "luna" is configured more than once/);
+    expect(() => applyClodexPatches('var x = 1;', {
+      'clodex:openai:model': { alias: 'luna', aliases: ['luna'] },
+    })).toThrow(/alias "luna" is configured more than once/);
+    expect(() => applyClodexPatches('var x = 1;', {
+      'clodex:openai:model': { aliases: ['10', '10'] },
+    })).toThrow(/alias "10" is configured more than once/);
+  });
+
   it('rejects an explicit context on a [1m]-suffixed id (the suffix already forces 1M)', () => {
     expect(() => applyClodexPatches('var x = 1;', {
       'clodex:openai:model[1m]': { context: 1_000_000 },
+    })).toThrow(/keeps the \[1m\] suffix/);
+  });
+
+  it('rejects an explicit context when any alias in the list keeps the [1m] suffix', () => {
+    expect(() => applyClodexPatches('var x = 1;', {
+      'clodex:openai:model': {
+        aliases: ['luna', 'ds4[1m]'],
+        context: 1_000_000,
+      },
     })).toThrow(/keeps the \[1m\] suffix/);
   });
 
@@ -931,7 +1381,7 @@ describe('applyPatch', () => {
         {
           config: {
             'clodex:test:extended': {
-              alias: 'extended',
+              aliases: ['extended', 'second', 'third'],
               effort: {
                 levels: ['low', 'medium', 'high', 'xhigh', 'max'],
                 defaultLevel: 'high',
@@ -947,6 +1397,8 @@ describe('applyPatch', () => {
       const manifestBytes = readFileSync(getPatchManifestPath(), 'utf8');
       const manifest = JSON.parse(manifestBytes) as PatchManifest;
       expect(outcome.ok).toBe(true);
+      // Every alias is a native identity, so the summary counts all of them.
+      expect(outcome.message).toContain('3 aliases');
       expect(readFileSync(binaryPath, 'utf8')).toBe(replacement);
       expect(readFileSync(pristinePath, 'utf8')).toBe('pristine-native');
       expect(readFileSync(join(tweakccHome, 'native-binary.backup'), 'utf8')).toBe('pristine-native');
@@ -1235,6 +1687,289 @@ describe('patch script identity naming', () => {
     expect(out).not.toMatch(/KNOWN=\[[^\]]*gpt-5\.6-sol/);
   });
 
+  const multiAliasConfig = {
+    'clodex:opencode-go:deepseek-v4-flash': {
+      aliases: ['luna', 'terra', 'ds4'],
+      context: 1_000_000,
+      display: 'DeepSeek V4 Flash (OpenCode Go)',
+      effort: {
+        levels: ['low', 'medium', 'high', 'xhigh', 'max'],
+        defaultLevel: 'high',
+      },
+    },
+  };
+
+  it('preserves numeric saved aliases in their explicit order', () => {
+    const out = runPatchScript({
+      'clodex:openai:same-target': { aliases: ['10', '2'] },
+      'clodex:openai:luna': { alias: 'luna' },
+    });
+
+    expect(out).toContain('.enum(["sonnet","opus","haiku","fable","10","2","luna"])');
+    expect(out).toContain(
+      'case"best":{return "opus"}case"10":return "10";case"2":return "2";'
+      + 'case"luna":return "luna";default:return null',
+    );
+    expect(out).toContain(
+      '{value:"10",label:"10",description:"Custom model (clodex:openai:same-target)"},'
+      + '{value:"2",label:"2",description:"Custom model (clodex:openai:same-target)"},'
+      + '{value:"luna",label:"Luna",description:"Custom model (clodex:openai:luna)"}',
+    );
+  });
+
+  const numericOrderConfig: PatchScriptModelConfig = {
+    'clodex:openai:same-target': {
+      aliases: ['10', '2'],
+      context: 111_111,
+      display: 'Same Target',
+      effort: {
+        levels: ['low', 'medium', 'high', 'xhigh', 'max'],
+        defaultLevel: 'high',
+      },
+    },
+    'clodex:openai:luna-target': {
+      alias: 'luna',
+      context: 222_222,
+      display: 'Luna Target',
+      effort: {
+        levels: ['low', 'medium', 'high', 'xhigh', 'max'],
+        defaultLevel: 'high',
+      },
+    },
+    'clodex:openai:100': {
+      context: 333_333,
+      display: 'Numeric Canonical',
+      effort: {
+        levels: ['low', 'medium', 'high', 'xhigh', 'max'],
+        defaultLevel: 'high',
+      },
+    },
+  };
+
+  it('keeps numeric aliases, same-target metadata, and numeric canonical fallback order byte-for-byte', () => {
+    const patched = applyClodexPatches(CLAUDE_FIXTURE, numericOrderConfig);
+    const out = patched.content;
+
+    expect(out).toContain('.enum(["sonnet","opus","haiku","fable","10","2","luna","clodex:openai:100"])');
+    expect(out).toContain(
+      '["sonnet","opus","haiku","fable","opusplan","10","2","luna","clodex:openai:100"]',
+    );
+    expect(out).toContain(
+      'Additional custom models: 10 = Same Target; 2 = Same Target; '
+      + 'luna = Luna Target; clodex:openai:100 = Numeric Canonical.',
+    );
+    expect(out).toContain(
+      'case"best":{return "opus"}case"10":return "10";case"2":return "2";'
+      + 'case"luna":return "luna";default:return null',
+    );
+    expect(out).toContain(
+      'Dlh(e,i,t);[{value:"10",label:"10",description:"Same Target"},'
+      + '{value:"2",label:"2",description:"Same Target"},'
+      + '{value:"luna",label:"Luna",description:"Luna Target"}]'
+      + '.forEach(function(_o){if(!e.some(function(_i){return _i.value===_o.value}))e.push(_o)});',
+    );
+
+    const contextTable = '{"10":111111,"2":111111,"clodex:openai:same-target":111111,'
+      + '"luna":222222,"clodex:openai:luna-target":222222,"clodex:openai:100":333333}';
+    expect(out).toContain('/*ccpatch:ctx*/var _ccw=(' + contextTable + ')');
+
+    const capabilityTable = '{"10":true,"10[1m]":true,"2":true,"2[1m]":true,'
+      + '"clodex:openai:same-target":true,"clodex:openai:same-target[1m]":true,'
+      + '"luna":true,"luna[1m]":true,"clodex:openai:luna-target":true,'
+      + '"clodex:openai:luna-target[1m]":true,"clodex:openai:100":true,"clodex:openai:100[1m]":true}';
+    expect(out).toContain('/*ccpatch:effort*/var _ccv=Object.assign(Object.create(null),'
+      + capabilityTable + ')');
+    expect(out).toContain('/*ccpatch:xhigh-effort*/var _ccv=Object.assign(Object.create(null),'
+      + capabilityTable + ')');
+    expect(out).toContain('/*ccpatch:max-effort*/var _ccv=Object.assign(Object.create(null),'
+      + capabilityTable + ')');
+
+    const defaultsTable = '{"10":"high","10[1m]":"high","2":"high","2[1m]":"high",'
+      + '"clodex:openai:same-target":"high","clodex:openai:same-target[1m]":"high",'
+      + '"luna":"high","luna[1m]":"high","clodex:openai:luna-target":"high",'
+      + '"clodex:openai:luna-target[1m]":"high","clodex:openai:100":"high",'
+      + '"clodex:openai:100[1m]":"high"}';
+    expect(out).toContain('/*ccpatch:default-effort*/var _cce=Object.assign(Object.create(null),'
+      + defaultsTable + ')');
+
+    const proofNames = captureBuiltInPatchProofs(
+      out,
+      numericOrderConfig,
+      patched.results,
+    ).map(proof => proof.name);
+    expect(proofNames.slice(3, 9)).toEqual([
+      'PATCH 6: alias resolver switch (10)',
+      'PATCH 6: alias resolver switch (2)',
+      'PATCH 6: alias resolver switch (luna)',
+      'PATCH 5: model picker options (10)',
+      'PATCH 5: model picker options (2)',
+      'PATCH 5: model picker options (luna)',
+    ]);
+    expect(builtInPatchProofsChanged(
+      out,
+      captureBuiltInPatchProofs(out, numericOrderConfig, patched.results),
+    )).toBe(false);
+  });
+
+  it('does not sort saved aliases while preserving their explicit order', () => {
+    const out = runPatchScript({
+      'clodex:openai:ordered': { aliases: ['2', '10', 'luna'] },
+    });
+    expect(out).toContain('.enum(["sonnet","opus","haiku","fable","2","10","luna"])');
+    expect(out).toContain(
+      'case"best":{return "opus"}case"2":return "2";case"10":return "10";'
+      + 'case"luna":return "luna";default:return null',
+    );
+  });
+
+  it('preserves writer, routing, and freshness-hash alias order', () => {
+    const aliases = [
+      { name: '10', providerId: 'openai', modelId: 'same-target' },
+      { name: '2', providerId: 'openai', modelId: 'same-target' },
+      { name: 'luna', providerId: 'openai', modelId: 'luna-target' },
+    ];
+    const { config } = buildPatchModelConfig(
+      [
+        { providerId: 'openai', modelId: 'same-target' },
+        { providerId: 'openai', modelId: 'luna-target' },
+        { providerId: 'openai', modelId: '100' },
+      ],
+      aliases,
+      () => undefined,
+    );
+    expect(config['clodex:openai:same-target']?.aliases).toEqual(['10', '2']);
+    expect(config['clodex:openai:luna-target']?.aliases).toEqual(['luna']);
+
+    const providers: LocalProvider[] = [{
+      id: 'openai',
+      name: 'OpenAI',
+      apiKey: 'key',
+      models: [
+        {
+          id: 'same-target',
+          upstreamModelId: 'same-target',
+          name: 'Same Target',
+          family: 'test',
+          brand: 'Test',
+          modelFormat: 'openai',
+          npm: '@ai-sdk/openai',
+        },
+        {
+          id: 'luna-target',
+          upstreamModelId: 'luna-target',
+          name: 'Luna Target',
+          family: 'test',
+          brand: 'Test',
+          modelFormat: 'openai',
+          npm: '@ai-sdk/openai',
+        },
+      ],
+    }];
+    const routed = buildHttpProxyRoutes(providers, [
+      { providerId: 'openai', modelId: 'same-target' },
+      { providerId: 'openai', modelId: 'luna-target' },
+    ], aliases);
+    expect(routed.aliases.map(alias => alias.name)).toEqual(['10', '2', 'luna']);
+
+    const reordered = {
+      ...config,
+      'clodex:openai:same-target': {
+        ...config['clodex:openai:same-target']!,
+        aliases: ['2', '10'],
+      },
+    };
+    expect(computePatchConfigHash(reordered)).not.toBe(computePatchConfigHash(config));
+  });
+
+  it('injects every same-target alias as a complete native identity', () => {
+    const patched = applyClodexPatches(CLAUDE_FIXTURE, multiAliasConfig);
+    const out = patched.content;
+
+    // PATCH 1 + PATCH 3: all three names, in saved order, and never the id.
+    expect(out).toContain(
+      '.enum(["sonnet","opus","haiku","fable","luna","terra","ds4"]).optional().describe(',
+    );
+    expect(out).toContain(
+      '["sonnet","opus","haiku","fable","opusplan","luna","terra","ds4"]',
+    );
+    expect(out).not.toMatch(/\.enum\(\[[^\]]*deepseek-v4-flash/);
+    expect(out).not.toMatch(/KNOWN=\[[^\]]*deepseek-v4-flash/);
+
+    const contextTable = out.match(
+      /\/\*ccpatch:ctx\*\/var _ccw=\((\{[^}]*\})\)/,
+    )?.[1];
+    expect(contextTable).toBeTruthy();
+    const context = JSON.parse(contextTable!) as Record<string, number>;
+    const defaultTable = out.match(
+      /\/\*ccpatch:default-effort\*\/var _cce=Object\.assign\(Object\.create\(null\),(\{[^}]*\})\)/,
+    )?.[1];
+    expect(defaultTable).toBeTruthy();
+    const defaults = JSON.parse(defaultTable!) as Record<string, string>;
+
+    for (const alias of ['luna', 'terra', 'ds4']) {
+      // PATCH 6 — each case resolves to itself.
+      expect(out).toContain(`case"${alias}":return "${alias}";`);
+      // PATCH 5 — each alias is its own picker option.
+      expect(out).toContain(
+        `{value:"${alias}",label:"${alias.charAt(0).toUpperCase() + alias.slice(1)}",`
+        + 'description:"DeepSeek V4 Flash (OpenCode Go)"}',
+      );
+      // PATCH 7 — each alias keys the context table.
+      expect(context[alias]).toBe(1_000_000);
+      // PATCH 8a/8b/8c — each alias carries the same projected capability verdicts.
+      expect(executeCapability(out, 'OI', alias, false)).toBe(true);
+      expect(executeCapability(out, 'I_e', alias, false)).toBe(true);
+      expect(executeCapability(out, 'eqe', alias, false)).toBe(true);
+      // PATCH 9 — each alias carries the same native default.
+      expect(defaults[alias]).toBe('high');
+      expect(executeDefaultEffort(out, alias, 'medium')).toBe('high');
+    }
+    // The canonical id keeps its PATCH 7/8/9 lookup keys.
+    expect(context['clodex:opencode-go:deepseek-v4-flash']).toBe(1_000_000);
+    expect(defaults['clodex:opencode-go:deepseek-v4-flash']).toBe('high');
+
+    // PATCH 4 lists every identity.
+    expect(out).toContain(
+      'Additional custom models: luna = DeepSeek V4 Flash (OpenCode Go); '
+      + 'terra = DeepSeek V4 Flash (OpenCode Go); ds4 = DeepSeek V4 Flash (OpenCode Go).',
+    );
+
+    // Built-in proof capture enumerates every alias.
+    const proofNames = captureBuiltInPatchProofs(
+      out,
+      multiAliasConfig,
+      patched.results,
+    ).map(proof => proof.name);
+    for (const alias of ['luna', 'terra', 'ds4']) {
+      expect(proofNames).toContain(`PATCH 6: alias resolver switch (${alias})`);
+      expect(proofNames).toContain(`PATCH 5: model picker options (${alias})`);
+    }
+    expect(builtInPatchProofsChanged(out, captureBuiltInPatchProofs(
+      out,
+      multiAliasConfig,
+      patched.results,
+    ))).toBe(false);
+  });
+
+  it('treats a legacy single alias exactly like its one-element array form', () => {
+    const legacy = runPatchScript({
+      'clodex:opencode-go:deepseek-v4-flash': {
+        alias: 'luna',
+        context: 1_000_000,
+        display: 'DeepSeek V4 Flash (OpenCode Go)',
+      },
+    });
+    const current = runPatchScript({
+      'clodex:opencode-go:deepseek-v4-flash': {
+        aliases: ['luna'],
+        context: 1_000_000,
+        display: 'DeepSeek V4 Flash (OpenCode Go)',
+      },
+    });
+
+    expect(current).toBe(legacy);
+  });
+
   it('resolves an alias to ITSELF so the sent name and the context-map key stay identical', () => {
     const out = runPatchScript(config);
     // PATCH 6 must emit the case (not skip it — default: returns null) but map
@@ -1379,6 +2114,78 @@ describe('patch script identity naming', () => {
   it('falls through to the native default for an unconfigured identity', () => {
     expect(executeDefaultEffort(runPatchScript(config), 'unconfigured', 'medium')).toBe('medium');
   });
+
+  if (process.env.REVIEW_BUNDLE_DIR) {
+    for (const version of ['2.1.228', '2.1.229'] as const) {
+      it(`replays the ordered numeric patch against pristine Claude Code ${version}`, () => {
+        const bundlePath = join(process.env.REVIEW_BUNDLE_DIR!, `claude-${version}.js`);
+        expect(existsSync(bundlePath), `missing replay bundle ${bundlePath}`).toBe(true);
+        const pristine = readFileSync(bundlePath, 'utf8');
+        const patched = applyClodexPatches(pristine, numericOrderConfig);
+        const out = patched.content;
+
+        expect(patched.results.every(result => result.status === 'OK')).toBe(true);
+        expect(out).toContain('"10","2","luna","clodex:openai:100"');
+        expect(out).toContain(
+          '{value:"10",label:"10",description:"Same Target"},'
+          + '{value:"2",label:"2",description:"Same Target"},'
+          + '{value:"luna",label:"Luna",description:"Luna Target"}',
+        );
+        expect(out).toContain(
+          'case"10":return "10";case"2":return "2";case"luna":return "luna";',
+        );
+        expect(out).toContain(
+          '/*ccpatch:ctx*/var _ccw=({"10":111111,"2":111111,'
+          + '"clodex:openai:same-target":111111,"luna":222222,'
+          + '"clodex:openai:luna-target":222222,"clodex:openai:100":333333})',
+        );
+
+        const proofNames = captureBuiltInPatchProofs(
+          out,
+          numericOrderConfig,
+          patched.results,
+        ).map(proof => proof.name);
+        expect(proofNames.slice(3, 9)).toEqual([
+          'PATCH 6: alias resolver switch (10)',
+          'PATCH 6: alias resolver switch (2)',
+          'PATCH 6: alias resolver switch (luna)',
+          'PATCH 5: model picker options (10)',
+          'PATCH 5: model picker options (2)',
+          'PATCH 5: model picker options (luna)',
+        ]);
+        expect(builtInPatchProofsChanged(
+          out,
+          captureBuiltInPatchProofs(out, numericOrderConfig, patched.results),
+        )).toBe(false);
+
+        const executable = out.replace(/^#![^\n]*\n/, '');
+        expect(() => new Function(executable)).not.toThrow();
+        const resolverNeedle = 'case"10":return "10";case"2":return "2";'
+          + 'case"luna":return "luna";';
+        const resolverNeedleIndex = out.indexOf(resolverNeedle);
+        expect(resolverNeedleIndex).toBeGreaterThan(0);
+        const resolverStart = out.lastIndexOf('function ', resolverNeedleIndex);
+        const resolverEnd = out.indexOf('default:return null}}', resolverNeedleIndex);
+        expect(resolverStart).toBeGreaterThanOrEqual(0);
+        expect(resolverEnd).toBeGreaterThan(resolverNeedleIndex);
+        const resolverSource = out.slice(resolverStart, resolverEnd + 'default:return null}}'.length);
+        const resolverName = resolverSource.match(/^function ([A-Za-z_$][\w$]*)/)?.[1];
+        const resolverDependency = resolverSource.match(/\{let [A-Za-z_$][\w$]*=([A-Za-z_$][\w$]*)\(\);/)?.[1];
+        expect(resolverName).toBeDefined();
+        expect(resolverDependency).toBeDefined();
+        const resolver = new Function(
+          resolverDependency!,
+          `${resolverSource};return ${resolverName};`,
+        )(() => 'native') as unknown as ((model: string) => string | null);
+        expect(resolver('10')).toBe('10');
+        expect(resolver('2')).toBe('2');
+        expect(resolver('luna')).toBe('luna');
+
+        const rerun = applyClodexPatches(out, numericOrderConfig);
+        expect(rerun.content).toBe(out);
+      });
+    }
+  }
 
   // Claude Code 2.1.228 hoisted the settings-colour env into its own declarator
   // inside the child builder's `let` statement, between the first
@@ -1756,6 +2563,289 @@ describe('patch script identity naming', () => {
   it('is idempotent — re-running the same patch changes nothing', () => {
     const once = runPatchScript(config);
     expect(runPatchScript(config, once)).toBe(once);
+  });
+
+  it('does not treat unrelated string and auto literals as PATCH 5/6 presence', () => {
+    const source = CLAUDE_FIXTURE.replace(
+      'function rz(x){',
+      `function decoys(){return 'case"string":return "string";value:"auto"'}\nfunction rz(x){`,
+    );
+    const out = runPatchScript({
+      'clodex:test:string': { alias: 'string', display: 'String' },
+      'clodex:test:auto': { alias: 'auto', display: 'Auto' },
+    }, source);
+
+    expect(out).toContain('case"string":return "string";');
+    expect(out).toContain('case"auto":return "auto";');
+    expect(out).toContain('{value:"string",label:"String",description:"String"}');
+    expect(out).toContain('{value:"auto",label:"Auto",description:"Auto"}');
+  });
+
+  it('scopes PATCH 5/6 presence to their target suffixes across the collision matrix', () => {
+    const source = CLAUDE_FIXTURE
+      .replace(
+        'function rz(x){',
+        `function unrelatedResolver(){return 'case"string":return "string";case"auto":return "auto";'}\nfunction rz(x){`,
+      )
+      .replace(
+        'function opts(e,t,r){',
+        `function unrelatedPicker(){return 'value:"string";value:"auto"'}\nfunction opts(e,t,r){`,
+      );
+    const out = runPatchScript({
+      'clodex:test:string': { alias: 'string', display: 'String' },
+      'clodex:test:auto': { alias: 'auto', display: 'Auto' },
+      'clodex:test:local': { alias: 'local', display: 'Local' },
+      'clodex:test:darwin': { alias: 'darwin', display: 'Darwin' },
+      'clodex:test:invalid': { alias: 'invalid_type', display: 'Invalid type' },
+    }, source);
+
+    expect(out).toContain(`function unrelatedResolver(){return 'case"string":return "string";case"auto":return "auto";'}`);
+    expect(out).toContain(`function unrelatedPicker(){return 'value:"string";value:"auto"'}`);
+    for (const alias of ['string', 'auto', 'local', 'darwin', 'invalid_type']) {
+      expect(out).toContain(`case"${alias}":return "${alias}";`);
+      expect(out).toContain(`value:"${alias}"`);
+    }
+    expect(out.match(/case"string":return "string";/g)).toHaveLength(2);
+    expect(out.match(/case"auto":return "auto";/g)).toHaveLength(2);
+  });
+
+  it('tops up only missing aliases before the byte-preserved PATCH 5/6 suffixes', () => {
+    const existingResolverSuffix = 'case"darwin":return "darwin";';
+    const escapedDescription = JSON.stringify('Existing "Darwin" \\ path');
+    const existingPickerSuffix = '[{value:"darwin",label:"Darwin",description:'
+      + escapedDescription
+      + '}].forEach(function(_o){if(!e.some(function(_i){return _i.value===_o.value}))e.push(_o)});';
+    const source = CLAUDE_FIXTURE
+      .replace(
+        'function rz(x){switch(x){case"best":{return "opus"}default:return null}}',
+        'function rz(x){switch(x){case"best":{return "opus"}'
+          + existingResolverSuffix
+          + 'default:return null}}',
+      )
+      .replace(
+        'Dlh(e,i,t);return e}',
+        'Dlh(e,i,t);' + existingPickerSuffix + 'return e}',
+      );
+    const config = {
+      'clodex:test:local': { alias: 'local', display: 'Local' },
+      'clodex:test:darwin': { alias: 'darwin', display: 'Existing "Darwin" \\ path' },
+      'clodex:test:invalid': { alias: 'invalid_type', display: 'Invalid type' },
+    };
+
+    const first = applyClodexPatches(source, config);
+    const out = first.content;
+    expect(out).toContain(
+      'case"best":{return "opus"}case"local":return "local";'
+        + 'case"invalid_type":return "invalid_type";'
+        + existingResolverSuffix
+        + 'default:return null',
+    );
+    const localEntry = '{value:"local",label:"Local",description:"Local"}';
+    const invalidEntry = '{value:"invalid_type",label:"Invalid_type",description:"Invalid type"}';
+    const insertedPicker = '[' + localEntry + ',' + invalidEntry + '].forEach(function(_o){if(!e.some(function(_i){return _i.value===_o.value}))e.push(_o)});';
+    expect(out).toContain(insertedPicker + existingPickerSuffix);
+    expect(out.match(/case"darwin":return "darwin";/g)).toHaveLength(1);
+    expect(out.match(/value:"darwin",label:"Darwin"/g)).toHaveLength(1);
+
+    const rerun = applyClodexPatches(out, config);
+    expect(rerun.content).toBe(out);
+    expect(rerun.results.find(result => result.name === 'PATCH 6: alias resolver switch')?.status).toBe('SKIP');
+    expect(rerun.results.find(result => result.name === 'PATCH 5: model picker options')?.status).toBe('SKIP');
+  });
+
+  it('tops up numeric PATCH 5/6 suffixes in ordered-subset order and is byte-idempotent', () => {
+    const config = {
+      'clodex:test:same-target': { aliases: ['10', '2'], display: 'Same Target' },
+      'clodex:test:luna': { alias: 'luna', display: 'Luna' },
+    };
+    const existingResolverSuffix = 'case"2":return "2";';
+    const existingPickerSuffix = '[{value:"2",label:"2",description:"Same Target"}]'
+      + '.forEach(function(_o){if(!e.some(function(_i){return _i.value===_o.value}))e.push(_o)});';
+    const source = CLAUDE_FIXTURE
+      .replace(
+        'case"best":{return "opus"}default:return null',
+        'case"best":{return "opus"}' + existingResolverSuffix + 'default:return null',
+      )
+      .replace('Dlh(e,i,t);return e}', 'Dlh(e,i,t);' + existingPickerSuffix + 'return e}');
+
+    const first = applyClodexPatches(source, config);
+    expect(first.content).toContain(
+      'case"best":{return "opus"}case"10":return "10";case"luna":return "luna";'
+      + existingResolverSuffix + 'default:return null',
+    );
+    expect(first.content).toContain(
+      '[{value:"10",label:"10",description:"Same Target"},'
+      + '{value:"luna",label:"Luna",description:"Luna"}]'
+      + '.forEach(function(_o){if(!e.some(function(_i){return _i.value===_o.value}))e.push(_o)});'
+      + existingPickerSuffix,
+    );
+
+    const rerun = applyClodexPatches(first.content, config);
+    expect(rerun.content).toBe(first.content);
+    expect(rerun.results.find(result => result.name === 'PATCH 6: alias resolver switch')?.status)
+      .toBe('SKIP');
+    expect(rerun.results.find(result => result.name === 'PATCH 5: model picker options')?.status)
+      .toBe('SKIP');
+  });
+
+  it('rejects a wrong numeric self-map and reports wrong numeric picker metadata as optional FAIL', () => {
+    const config = {
+      'clodex:test:same-target': { aliases: ['10', '2'], display: 'Same Target' },
+    };
+    const wrongResolver = CLAUDE_FIXTURE.replace(
+      'case"best":{return "opus"}default:return null',
+      'case"best":{return "opus"}case"10":return "wrong";default:return null',
+    );
+    expect(() => applyClodexPatches(wrongResolver, config)).toThrowError(PatchApplyError);
+
+    const wrongEntry = '{value:"10",label:"Wrong",description:"Same Target"}';
+    const wrongPicker = '[' + wrongEntry
+      + '].forEach(function(_o){if(!e.some(function(_i){return _i.value===_o.value}))e.push(_o)});';
+    const result = applyClodexPatches(
+      CLAUDE_FIXTURE.replace('Dlh(e,i,t);return e}', 'Dlh(e,i,t);' + wrongPicker + 'return e}'),
+      config,
+    );
+    expect(result.results.find(entry => entry.name === 'PATCH 5: model picker options')).toEqual({
+      status: 'FAIL',
+      name: 'PATCH 5: model picker options',
+      extra: 'invalid target-owned picker entries',
+    });
+    expect(result.content).toContain(wrongPicker);
+    expect(result.content).not.toContain('{value:"10",label:"10",description:"Same Target"}');
+  });
+
+  it('keeps PATCH 5 and PATCH 6 independent when either site has drifted', () => {
+    const config = { 'clodex:test:local': { alias: 'local', display: 'Local' } };
+    const resolverOnly = CLAUDE_FIXTURE.replace(
+      'case"best":{return "opus"}default:return null',
+      'case"best":{return "opus"}case"local":return "local";default:return null',
+    );
+    const resolverResult = applyClodexPatches(resolverOnly, config);
+    expect(resolverResult.results.find(result => result.name === 'PATCH 6: alias resolver switch')?.status).toBe('SKIP');
+    expect(resolverResult.results.find(result => result.name === 'PATCH 5: model picker options')?.status).toBe('OK');
+
+    const pickerBlock = '[{value:"local",label:"Local",description:"Local"}].forEach(function(_o){if(!e.some(function(_i){return _i.value===_o.value}))e.push(_o)});';
+    const pickerOnly = CLAUDE_FIXTURE.replace(
+      'Dlh(e,i,t);return e}',
+      'Dlh(e,i,t);' + pickerBlock + 'return e}',
+    );
+    const pickerResult = applyClodexPatches(pickerOnly, config);
+    expect(pickerResult.results.find(result => result.name === 'PATCH 6: alias resolver switch')?.status).toBe('OK');
+    expect(pickerResult.results.find(result => result.name === 'PATCH 5: model picker options')?.status).toBe('SKIP');
+  });
+
+  it('ignores unrelated duplicate resolver and picker literals', () => {
+    const source = CLAUDE_FIXTURE.replace(
+      'function rz(x){',
+      `function unrelated(){return 'case"local":return "local";case"local":return "local";value:"local";value:"local"'}\nfunction rz(x){`,
+    );
+    const out = runPatchScript({ 'clodex:test:local': { alias: 'local', display: 'Local' } }, source);
+
+    expect(out).toContain('case"best":{return "opus"}case"local":return "local";default:return null');
+    expect(out).toContain('{value:"local",label:"Local",description:"Local"}');
+    expect(out).toContain(`function unrelated(){return 'case"local":return "local";case"local":return "local";value:"local";value:"local"'}`);
+  });
+
+  it('fails required PATCH 6 on wrong or duplicate target-owned resolver cases', () => {
+    const config = { 'clodex:test:local': { alias: 'local', display: 'Local' } };
+    const wrongMap = CLAUDE_FIXTURE.replace(
+      'case"best":{return "opus"}default:return null',
+      'case"best":{return "opus"}case"local":return "darwin";default:return null',
+    );
+    expect(() => applyClodexPatches(wrongMap, config)).toThrowError(PatchApplyError);
+
+    const duplicate = CLAUDE_FIXTURE.replace(
+      'case"best":{return "opus"}default:return null',
+      'case"best":{return "opus"}case"local":return "local";case"local":return "local";default:return null',
+    );
+    expect(() => applyClodexPatches(duplicate, config)).toThrowError(PatchApplyError);
+  });
+
+  it('reports optional PATCH 5 FAIL on duplicate target-owned picker entries', () => {
+    const config = { 'clodex:test:local': { alias: 'local', display: 'Local' } };
+    const pickerBlock = '[{value:"local",label:"Local",description:"Local"}].forEach(function(_o){if(!e.some(function(_i){return _i.value===_o.value}))e.push(_o)});';
+    const source = CLAUDE_FIXTURE
+      .replace(
+        'case"best":{return "opus"}default:return null',
+        'case"best":{return "opus"}case"local":return "local";default:return null',
+      )
+      .replace(
+        'Dlh(e,i,t);return e}',
+        'Dlh(e,i,t);' + pickerBlock + pickerBlock + 'return e}',
+      );
+
+    const result = applyClodexPatches(source, config);
+    expect(result.results.find(result => result.name === 'PATCH 5: model picker options')).toEqual({
+      status: 'FAIL',
+      name: 'PATCH 5: model picker options',
+      extra: 'invalid target-owned picker entries',
+    });
+    expect(result.content.match(/value:"local",label:"Local"/g)).toHaveLength(2);
+  });
+
+  it.each([
+    ['CLAUDE_FIXTURE', 'wrong-label-only', CLAUDE_FIXTURE, '{value:"local",label:"Wrong",description:"Local"}'],
+    ['CLAUDE_FIXTURE', 'wrong-description-only', CLAUDE_FIXTURE, '{value:"local",label:"Local",description:"Wrong"}'],
+    ['CLAUDE_FIXTURE', 'both-wrong', CLAUDE_FIXTURE, '{value:"local",label:"Wrong",description:"Wrong"}'],
+    ['CLAUDE_FIXTURE_228', 'wrong-label-only', CLAUDE_FIXTURE_228, '{value:"local",label:"Wrong",description:"Local"}'],
+    ['CLAUDE_FIXTURE_228', 'wrong-description-only', CLAUDE_FIXTURE_228, '{value:"local",label:"Local",description:"Wrong"}'],
+    ['CLAUDE_FIXTURE_228', 'both-wrong', CLAUDE_FIXTURE_228, '{value:"local",label:"Wrong",description:"Wrong"}'],
+  ] as const)('reports optional PATCH 5 FAIL for %s %s target-owned entries', (_fixtureName, _mutation, fixture, wrongEntry) => {
+    const config = { 'clodex:test:local': { alias: 'local', display: 'Local' } };
+    const expectedEntry = '{value:"local",label:"Local",description:"Local"}';
+    const pickerBlock = '[' + wrongEntry + '].forEach(function(_o){if(!e.some(function(_i){return _i.value===_o.value}))e.push(_o)});';
+    const source = fixture.replace('Dlh(e,i,t);return e}', 'Dlh(e,i,t);' + pickerBlock + 'return e}');
+    const result = applyClodexPatches(source, config);
+
+    expect(result.results.find(result => result.name === 'PATCH 5: model picker options')).toEqual({
+      status: 'FAIL',
+      name: 'PATCH 5: model picker options',
+      extra: 'invalid target-owned picker entries',
+    });
+    expect(result.content.split(expectedEntry)).toHaveLength(1);
+    expect(result.content.split(wrongEntry)).toHaveLength(2);
+    expect(result.content).toContain(pickerBlock);
+  });
+
+  it('reports optional PATCH 5 FAIL when exact and wrong entries share a target value', () => {
+    const config = { 'clodex:test:local': { alias: 'local', display: 'Local' } };
+    const exactBlock = '[{value:"local",label:"Local",description:"Local"}].forEach(function(_o){if(!e.some(function(_i){return _i.value===_o.value}))e.push(_o)});';
+    const wrongBlock = '[{value:"local",label:"Wrong",description:"Local"}].forEach(function(_o){if(!e.some(function(_i){return _i.value===_o.value}))e.push(_o)});';
+    const source = CLAUDE_FIXTURE.replace(
+      'Dlh(e,i,t);return e}',
+      'Dlh(e,i,t);' + exactBlock + wrongBlock + 'return e}',
+    );
+
+    const result = applyClodexPatches(source, config);
+    expect(result.results.find(result => result.name === 'PATCH 5: model picker options')).toEqual({
+      status: 'FAIL',
+      name: 'PATCH 5: model picker options',
+      extra: 'invalid target-owned picker entries',
+    });
+    expect(result.content).toContain(exactBlock + wrongBlock);
+    expect(result.content.match(/value:"local"/g)).toHaveLength(2);
+  });
+
+  it('reports PATCH 5/6 SKIP when every configured target entry is already present', () => {
+    const config = {
+      'clodex:test:local': { alias: 'local', display: 'Local' },
+      'clodex:test:darwin': { alias: 'darwin', display: 'Darwin' },
+    };
+    const pickerBlock = '[{value:"local",label:"Local",description:"Local"},{value:"darwin",label:"Darwin",description:"Darwin"}].forEach(function(_o){if(!e.some(function(_i){return _i.value===_o.value}))e.push(_o)});';
+    const source = CLAUDE_FIXTURE
+      .replace(
+        'case"best":{return "opus"}default:return null',
+        'case"best":{return "opus"}case"local":return "local";case"darwin":return "darwin";default:return null',
+      )
+      .replace('Dlh(e,i,t);return e}', 'Dlh(e,i,t);' + pickerBlock + 'return e}');
+
+    const result = applyClodexPatches(source, config);
+    expect(result.content.match(/case"local":return "local";/g)).toHaveLength(1);
+    expect(result.content.match(/case"darwin":return "darwin";/g)).toHaveLength(1);
+    expect(result.content.match(/value:"local",label:"Local"/g)).toHaveLength(1);
+    expect(result.content.match(/value:"darwin",label:"Darwin"/g)).toHaveLength(1);
+    expect(result.results.find(result => result.name === 'PATCH 6: alias resolver switch')?.status).toBe('SKIP');
+    expect(result.results.find(result => result.name === 'PATCH 5: model picker options')?.status).toBe('SKIP');
   });
 
   it('reports OK per site on a fresh run and SKIP/refresh on a re-run', () => {
