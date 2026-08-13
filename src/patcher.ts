@@ -1011,10 +1011,12 @@ export async function runPatchCommand(opts: {
 
 function describeLaunchPatchDegradation(state: Exclude<PatchState, 'current'>): string {
   return state === 'unpatched'
-    ? 'Claude Code\'s clodex patch is not installed, so aliases, favorites, context windows/auto-compaction, '
-      + 'and effort metadata are not patched. Run `clodex patch` to repair or `clodex patch --restore` to roll back.'
-    : 'Claude Code\'s clodex patch is stale, so aliases, favorites, context windows/auto-compaction, '
-      + 'and effort metadata are not patched. Run `clodex patch` to repair or `clodex patch --restore` to roll back.';
+    ? 'Claude Code\'s current clodex patch configuration is not confirmed, so aliases, favorites, context windows/auto-compaction, '
+      + 'and effort metadata may be missing or outdated. Run `clodex patch` to apply or repair the current configuration. '
+      + 'To roll back a previous patch, run `clodex patch --restore` only when a trustworthy backup exists.'
+    : 'Claude Code\'s clodex patch is not confirmed current, so aliases, favorites, context windows/auto-compaction, '
+      + 'and effort metadata may be missing or outdated. Run `clodex patch` to apply or repair the current configuration. '
+      + 'To roll back a previous patch, run `clodex patch --restore` only when a trustworthy backup exists.';
 }
 
 /**
