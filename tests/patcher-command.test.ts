@@ -610,8 +610,8 @@ describe('runPatchCommand local patches', () => {
 
   it('publishes built-ins when a local proof cannot be captured', async () => {
     const bundle = PRISTINE_BUNDLE.replace(
-      'case"best":{return "opus"}default:return null',
-      'case"best":{return "opus"}case"sol":return "native";default:return null',
+      'function rz(x){',
+      `function decoy(){return 'case"sol":return "sol";'}\nfunction rz(x){`,
     );
     const real = installClaude('2.1.220', bundle);
     writeFileSync(join(clodexHome, 'local-patches.mjs'), `
@@ -623,7 +623,9 @@ describe('runPatchCommand local patches', () => {
 
     expect(await runPatchCommand({ localPatches: true })).toBe(0);
     expect(bundleOf(real)).toContain('/*ccpatch:effort*/');
-    expect(bundleOf(real)).toContain('case"sol":return "native";');
+    expect(bundleOf(real)).toContain('case"best":{return "opus"}case"sol":return "sol";default:return null');
+    expect(bundleOf(real)).toContain(`function decoy(){return 'case"sol":return "sol";'}`);
+    expect(bundleOf(real).match(/case"sol":return "sol";/g)).toHaveLength(2);
     expect(bundleOf(real)).not.toContain('/*clodex-local:must-not-run*/');
     expect(logs.join('\n')).toMatch(/FAIL\s+LOCAL PATCH SET.*postconditions/);
   });

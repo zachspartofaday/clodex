@@ -40,7 +40,7 @@ import {
  * hash of the transform inputs to force that decision to be made rather than
  * forgotten.
  */
-export const PATCH_TRANSFORMS_VERSION = 7;
+export const PATCH_TRANSFORMS_VERSION = 8;
 
 export interface PatchScriptModelEntry {
   /** Ordered native identities for this model, in saved alias order. */
@@ -363,15 +363,43 @@ export function applyClodexPatches(source: string, config: PatchScriptModelConfi
   // edit) tops up cleanly rather than duplicating cases.
   // ---------------------------------------------------------------------------
   {
-    const missing = ALIASES.filter((a) => !new RegExp('case' + reEsc(q(a)) + ':return').test(js));
-    const cases = missing.map((a) => 'case' + q(a) + ':return ' + q(a) + ';').join('');
+    const resolverRegex = /(case"best":\{[^{}]*\})((?:case"[^"]+":return[^{};]+;)*)/;
+    const classifyResolverSuffix = (suffix: string): { missing: string[]; invalid: string[] } => {
+      const missing: string[] = [];
+      const invalid: string[] = [];
+      for (const a of ALIASES) {
+        const labelCount = suffix.match(new RegExp('case' + reEsc(q(a)) + ':', 'g'))?.length ?? 0;
+        const selfCount = suffix.match(
+          new RegExp('case' + reEsc(q(a)) + ':return ' + reEsc(q(a)) + ';', 'g'),
+        )?.length ?? 0;
+        if (labelCount === 0) missing.push(a);
+        else if (labelCount !== 1 || selfCount !== 1) invalid.push(a);
+      }
+      return { missing, invalid };
+    };
+    const resolverMatches = js.match(new RegExp(resolverRegex.source, 'g'));
+    const resolverMatch = resolverMatches?.length === 1 ? resolverRegex.exec(js) : undefined;
+    const resolverClassification = resolverMatch
+      ? classifyResolverSuffix(resolverMatch[2] ?? '')
+      : undefined;
     if (ALIASES.length === 0) {
       log('SKIP', 'PATCH 6: alias resolver switch', 'no aliases configured');
+    } else if (resolverClassification?.invalid.length) {
+      log('FAIL', 'PATCH 6: alias resolver switch', 'invalid alias resolver cases');
+      fail('clodex patch: invalid alias resolver cases');
     } else {
       applyOnce(
         'PATCH 6: alias resolver switch',
-        /(case"best":\{[^{}]*\})/,
-        (m) => m + cases,
+        resolverRegex,
+        (_m, anchor, suffix) => {
+          const { missing, invalid } = classifyResolverSuffix(suffix ?? '');
+          if (invalid.length) {
+            log('FAIL', 'PATCH 6: alias resolver switch', 'invalid alias resolver cases');
+            fail('clodex patch: invalid alias resolver cases');
+          }
+          const cases = missing.map((a) => 'case' + q(a) + ':return ' + q(a) + ';').join('');
+          return (anchor ?? '') + cases + (suffix ?? '');
+        },
         { required: true, noopIsSkip: true }
       );
     }
@@ -386,26 +414,55 @@ export function applyClodexPatches(source: string, config: PatchScriptModelConfi
   // aliases not already injected are added, so reruns top up cleanly.
   // ---------------------------------------------------------------------------
   {
-    const missing = ALIASES.filter((a) => !new RegExp('value:' + reEsc(q(a))).test(js));
-    const entries = missing
-      .map(
-        // value = the alias (the name the user types and the binary sends);
-        // description = the real model label, e.g. "GPT-5.6 Sol (OpenAI (ChatGPT))".
-        // (tweakcc's writeContent round-trips utf8 faithfully — verified — so the
-        // old adhoc-patch ASCII-only constraint no longer applies.)
-        (a) => '{value:' + q(a) + ',label:' + q(a.charAt(0).toUpperCase() + a.slice(1)) + ',description:' + q(displayFor(a, ALIAS_TO_ID[a]!)) + '}'
-      )
-      .join(',');
-    const inject = missing.length
-      ? '[' + entries + '].forEach(function(_o){if(!e.some(function(_i){return _i.value===_o.value}))e.push(_o)});'
-      : '';
+    const escapedJsonString = '"(?:\\\\.|[^"\\\\])*"';
+    const pickerEntry = '\\{value:' + escapedJsonString + ',label:' + escapedJsonString + ',description:' + escapedJsonString + '\\}';
+    const pickerInjection = '\\[' + pickerEntry
+      + '(?:,' + pickerEntry + ')*\\]\\.forEach\\(function\\(_o\\)\\{if\\(!e\\.some\\(function\\(_i\\)\\{return _i\\.value===_o\\.value\\}\\)\\)e\\.push\\(_o\\)\\}\\);';
+    const pickerRegex = new RegExp(
+      '(\\?\\[[\\w$]+,r\\]:\\[r\\];for\\(let [\\w$]+ of [\\w$]+\\)[\\w$]+\\(e,[\\w$]+,t\\);)'
+      + '((?:' + pickerInjection + ')*)',
+    );
+    const classifyPickerSuffix = (suffix: string): { missing: string[]; duplicate: string[] } => {
+      const missing: string[] = [];
+      const duplicate: string[] = [];
+      for (const a of ALIASES) {
+        const count = suffix.match(
+          new RegExp('\\{value:' + reEsc(q(a)) + '(?=,label:)', 'g'),
+        )?.length ?? 0;
+        if (count === 0) missing.push(a);
+        else if (count > 1) duplicate.push(a);
+      }
+      return { missing, duplicate };
+    };
+    const pickerMatches = js.match(new RegExp(pickerRegex.source, 'g'));
+    const pickerMatch = pickerMatches?.length === 1 ? pickerRegex.exec(js) : undefined;
+    const pickerClassification = pickerMatch
+      ? classifyPickerSuffix(pickerMatch[2] ?? '')
+      : undefined;
     if (ALIASES.length === 0) {
       log('SKIP', 'PATCH 5: model picker options', 'no aliases configured');
+    } else if (pickerClassification?.duplicate.length) {
+      log('FAIL', 'PATCH 5: model picker options', 'duplicate target-owned picker entries');
     } else {
       applyOnce(
         'PATCH 5: model picker options',
-        /(\?\[[\w$]+,r\]:\[r\];for\(let [\w$]+ of [\w$]+\)[\w$]+\(e,[\w$]+,t\);)/,
-        (m) => m + inject,
+        pickerRegex,
+        (_m, anchor, suffix) => {
+          const { missing } = classifyPickerSuffix(suffix ?? '');
+          const entries = missing
+            .map(
+              // value = the alias (the name the user types and the binary sends);
+              // description = the real model label, e.g. "GPT-5.6 Sol (OpenAI (ChatGPT))".
+              // (tweakcc's writeContent round-trips utf8 faithfully — verified — so the
+              // old adhoc-patch ASCII-only constraint no longer applies.)
+              (a) => '{value:' + q(a) + ',label:' + q(a.charAt(0).toUpperCase() + a.slice(1)) + ',description:' + q(displayFor(a, ALIAS_TO_ID[a]!)) + '}'
+            )
+            .join(',');
+          const inject = missing.length
+            ? '[' + entries + '].forEach(function(_o){if(!e.some(function(_i){return _i.value===_o.value}))e.push(_o)});'
+            : '';
+          return (anchor ?? '') + inject + (suffix ?? '');
+        },
         { required: false, noopIsSkip: true }
       );
     }

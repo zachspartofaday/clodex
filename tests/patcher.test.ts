@@ -809,8 +809,8 @@ describe('PATCH_TRANSFORMS_VERSION', () => {
       .join('\n');
     const digest = createHash('sha256').update(source).digest('hex');
     expect({ version: PATCH_TRANSFORMS_VERSION, digest }).toEqual({
-      version: 7,
-      digest: 'b2f31f2c250404ad7e3210cb07ef3ba424f4f5e3b986522f3b9b8f1d5e794b0a',
+      version: 8,
+      digest: '125a4f90afcf04765b9aa25394edb595cbfd4ccad803c6bdbdc4dad6a55ecf7a',
     });
   });
 });
@@ -2180,6 +2180,185 @@ describe('patch script identity naming', () => {
   it('is idempotent — re-running the same patch changes nothing', () => {
     const once = runPatchScript(config);
     expect(runPatchScript(config, once)).toBe(once);
+  });
+
+  it('does not treat unrelated string and auto literals as PATCH 5/6 presence', () => {
+    const source = CLAUDE_FIXTURE.replace(
+      'function rz(x){',
+      `function decoys(){return 'case"string":return "string";value:"auto"'}\nfunction rz(x){`,
+    );
+    const out = runPatchScript({
+      'clodex:test:string': { alias: 'string', display: 'String' },
+      'clodex:test:auto': { alias: 'auto', display: 'Auto' },
+    }, source);
+
+    expect(out).toContain('case"string":return "string";');
+    expect(out).toContain('case"auto":return "auto";');
+    expect(out).toContain('{value:"string",label:"String",description:"String"}');
+    expect(out).toContain('{value:"auto",label:"Auto",description:"Auto"}');
+  });
+
+  it('scopes PATCH 5/6 presence to their target suffixes across the collision matrix', () => {
+    const source = CLAUDE_FIXTURE
+      .replace(
+        'function rz(x){',
+        `function unrelatedResolver(){return 'case"string":return "string";case"auto":return "auto";'}\nfunction rz(x){`,
+      )
+      .replace(
+        'function opts(e,t,r){',
+        `function unrelatedPicker(){return 'value:"string";value:"auto"'}\nfunction opts(e,t,r){`,
+      );
+    const out = runPatchScript({
+      'clodex:test:string': { alias: 'string', display: 'String' },
+      'clodex:test:auto': { alias: 'auto', display: 'Auto' },
+      'clodex:test:local': { alias: 'local', display: 'Local' },
+      'clodex:test:darwin': { alias: 'darwin', display: 'Darwin' },
+      'clodex:test:invalid': { alias: 'invalid_type', display: 'Invalid type' },
+    }, source);
+
+    expect(out).toContain(`function unrelatedResolver(){return 'case"string":return "string";case"auto":return "auto";'}`);
+    expect(out).toContain(`function unrelatedPicker(){return 'value:"string";value:"auto"'}`);
+    for (const alias of ['string', 'auto', 'local', 'darwin', 'invalid_type']) {
+      expect(out).toContain(`case"${alias}":return "${alias}";`);
+      expect(out).toContain(`value:"${alias}"`);
+    }
+    expect(out.match(/case"string":return "string";/g)).toHaveLength(2);
+    expect(out.match(/case"auto":return "auto";/g)).toHaveLength(2);
+  });
+
+  it('tops up only missing aliases before the byte-preserved PATCH 5/6 suffixes', () => {
+    const existingResolverSuffix = 'case"darwin":return "darwin";';
+    const escapedDescription = JSON.stringify('Existing "Darwin" \\ path');
+    const existingPickerSuffix = '[{value:"darwin",label:"Darwin",description:'
+      + escapedDescription
+      + '}].forEach(function(_o){if(!e.some(function(_i){return _i.value===_o.value}))e.push(_o)});';
+    const source = CLAUDE_FIXTURE
+      .replace(
+        'function rz(x){switch(x){case"best":{return "opus"}default:return null}}',
+        'function rz(x){switch(x){case"best":{return "opus"}'
+          + existingResolverSuffix
+          + 'default:return null}}',
+      )
+      .replace(
+        'Dlh(e,i,t);return e}',
+        'Dlh(e,i,t);' + existingPickerSuffix + 'return e}',
+      );
+    const config = {
+      'clodex:test:local': { alias: 'local', display: 'Local' },
+      'clodex:test:darwin': { alias: 'darwin', display: 'Darwin' },
+      'clodex:test:invalid': { alias: 'invalid_type', display: 'Invalid type' },
+    };
+
+    const first = applyClodexPatches(source, config);
+    const out = first.content;
+    expect(out).toContain(
+      'case"best":{return "opus"}case"local":return "local";'
+        + 'case"invalid_type":return "invalid_type";'
+        + existingResolverSuffix
+        + 'default:return null',
+    );
+    const localEntry = '{value:"local",label:"Local",description:"Local"}';
+    const invalidEntry = '{value:"invalid_type",label:"Invalid_type",description:"Invalid type"}';
+    const insertedPicker = '[' + localEntry + ',' + invalidEntry + '].forEach(function(_o){if(!e.some(function(_i){return _i.value===_o.value}))e.push(_o)});';
+    expect(out).toContain(insertedPicker + existingPickerSuffix);
+    expect(out.match(/case"darwin":return "darwin";/g)).toHaveLength(1);
+    expect(out.match(/value:"darwin",label:"Darwin"/g)).toHaveLength(1);
+
+    const rerun = applyClodexPatches(out, config);
+    expect(rerun.content).toBe(out);
+    expect(rerun.results.find(result => result.name === 'PATCH 6: alias resolver switch')?.status).toBe('SKIP');
+    expect(rerun.results.find(result => result.name === 'PATCH 5: model picker options')?.status).toBe('SKIP');
+  });
+
+  it('keeps PATCH 5 and PATCH 6 independent when either site has drifted', () => {
+    const config = { 'clodex:test:local': { alias: 'local', display: 'Local' } };
+    const resolverOnly = CLAUDE_FIXTURE.replace(
+      'case"best":{return "opus"}default:return null',
+      'case"best":{return "opus"}case"local":return "local";default:return null',
+    );
+    const resolverResult = applyClodexPatches(resolverOnly, config);
+    expect(resolverResult.results.find(result => result.name === 'PATCH 6: alias resolver switch')?.status).toBe('SKIP');
+    expect(resolverResult.results.find(result => result.name === 'PATCH 5: model picker options')?.status).toBe('OK');
+
+    const pickerBlock = '[{value:"local",label:"Local",description:"Local"}].forEach(function(_o){if(!e.some(function(_i){return _i.value===_o.value}))e.push(_o)});';
+    const pickerOnly = CLAUDE_FIXTURE.replace(
+      'Dlh(e,i,t);return e}',
+      'Dlh(e,i,t);' + pickerBlock + 'return e}',
+    );
+    const pickerResult = applyClodexPatches(pickerOnly, config);
+    expect(pickerResult.results.find(result => result.name === 'PATCH 6: alias resolver switch')?.status).toBe('OK');
+    expect(pickerResult.results.find(result => result.name === 'PATCH 5: model picker options')?.status).toBe('SKIP');
+  });
+
+  it('ignores unrelated duplicate resolver and picker literals', () => {
+    const source = CLAUDE_FIXTURE.replace(
+      'function rz(x){',
+      `function unrelated(){return 'case"local":return "local";case"local":return "local";value:"local";value:"local"'}\nfunction rz(x){`,
+    );
+    const out = runPatchScript({ 'clodex:test:local': { alias: 'local', display: 'Local' } }, source);
+
+    expect(out).toContain('case"best":{return "opus"}case"local":return "local";default:return null');
+    expect(out).toContain('{value:"local",label:"Local",description:"Local"}');
+    expect(out).toContain(`function unrelated(){return 'case"local":return "local";case"local":return "local";value:"local";value:"local"'}`);
+  });
+
+  it('fails required PATCH 6 on wrong or duplicate target-owned resolver cases', () => {
+    const config = { 'clodex:test:local': { alias: 'local', display: 'Local' } };
+    const wrongMap = CLAUDE_FIXTURE.replace(
+      'case"best":{return "opus"}default:return null',
+      'case"best":{return "opus"}case"local":return "darwin";default:return null',
+    );
+    expect(() => applyClodexPatches(wrongMap, config)).toThrowError(PatchApplyError);
+
+    const duplicate = CLAUDE_FIXTURE.replace(
+      'case"best":{return "opus"}default:return null',
+      'case"best":{return "opus"}case"local":return "local";case"local":return "local";default:return null',
+    );
+    expect(() => applyClodexPatches(duplicate, config)).toThrowError(PatchApplyError);
+  });
+
+  it('reports optional PATCH 5 FAIL on duplicate target-owned picker entries', () => {
+    const config = { 'clodex:test:local': { alias: 'local', display: 'Local' } };
+    const pickerBlock = '[{value:"local",label:"Local",description:"Local"}].forEach(function(_o){if(!e.some(function(_i){return _i.value===_o.value}))e.push(_o)});';
+    const source = CLAUDE_FIXTURE
+      .replace(
+        'case"best":{return "opus"}default:return null',
+        'case"best":{return "opus"}case"local":return "local";default:return null',
+      )
+      .replace(
+        'Dlh(e,i,t);return e}',
+        'Dlh(e,i,t);' + pickerBlock + pickerBlock + 'return e}',
+      );
+
+    const result = applyClodexPatches(source, config);
+    expect(result.results.find(result => result.name === 'PATCH 5: model picker options')).toEqual({
+      status: 'FAIL',
+      name: 'PATCH 5: model picker options',
+      extra: 'duplicate target-owned picker entries',
+    });
+    expect(result.content.match(/value:"local",label:"Local"/g)).toHaveLength(2);
+  });
+
+  it('reports PATCH 5/6 SKIP when every configured target entry is already present', () => {
+    const config = {
+      'clodex:test:local': { alias: 'local', display: 'Local' },
+      'clodex:test:darwin': { alias: 'darwin', display: 'Darwin' },
+    };
+    const pickerBlock = '[{value:"local",label:"Local",description:"Local"},{value:"darwin",label:"Darwin",description:"Darwin"}].forEach(function(_o){if(!e.some(function(_i){return _i.value===_o.value}))e.push(_o)});';
+    const source = CLAUDE_FIXTURE
+      .replace(
+        'case"best":{return "opus"}default:return null',
+        'case"best":{return "opus"}case"local":return "local";case"darwin":return "darwin";default:return null',
+      )
+      .replace('Dlh(e,i,t);return e}', 'Dlh(e,i,t);' + pickerBlock + 'return e}');
+
+    const result = applyClodexPatches(source, config);
+    expect(result.content.match(/case"local":return "local";/g)).toHaveLength(1);
+    expect(result.content.match(/case"darwin":return "darwin";/g)).toHaveLength(1);
+    expect(result.content.match(/value:"local",label:"Local"/g)).toHaveLength(1);
+    expect(result.content.match(/value:"darwin",label:"Darwin"/g)).toHaveLength(1);
+    expect(result.results.find(result => result.name === 'PATCH 6: alias resolver switch')?.status).toBe('SKIP');
+    expect(result.results.find(result => result.name === 'PATCH 5: model picker options')?.status).toBe('SKIP');
   });
 
   it('reports OK per site on a fresh run and SKIP/refresh on a re-run', () => {
