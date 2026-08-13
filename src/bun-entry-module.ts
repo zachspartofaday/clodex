@@ -65,9 +65,18 @@ export interface EntryModuleShim {
 }
 
 /**
- * tweakcc's own test for "this is the module holding Claude Code's JS", mirrored
- * exactly. A name this accepts needs no shim; a binary where NO module name is
- * accepted is one tweakcc cannot read or repack.
+ * tweakcc's own test for "this is the module holding Claude Code's JS". A name this
+ * accepts needs no shim; a binary where NO module name is accepted is one tweakcc
+ * cannot read or repack.
+ *
+ * This mirrors the UNPATCHED tweakcc 4.3.0 selector, and deliberately stays a strict
+ * SUBSET of the selector actually installed: `patches/tweakcc@4.3.0.patch` widens the
+ * real one with `=== '/$bunfs/root/cli'`. Do not add that name here to "resync" the
+ * mirror. The subset is the safe direction — it can only make the shim engage when it
+ * was not strictly needed, which is a no-op round trip, whereas a superset would skip
+ * the shim for a name the installed tweakcc cannot actually read. Keeping the mirror
+ * narrow is what makes patching still work if the pnpm patch is ever missing or
+ * reverse-applied.
  */
 export function tweakccRecognizesModuleName(name: string): boolean {
   return name.endsWith('/claude')
