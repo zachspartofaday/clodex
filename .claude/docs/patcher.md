@@ -31,14 +31,17 @@ capabilities/defaults, and child-command network isolation.
 
 ## Patcher invariants
 
-- **The alias IS the model identity in the binary.** For any favorite with an alias, the short name
-  (`sol`) — never the canonical `clodex:<provider>:<model>` id — is what lands in the Agent-tool zod
-  enum (PATCH 1), the known-alias validator list (PATCH 3), the `/model` picker value (PATCH 5), and
-  the context-window map (PATCH 7). Subagent/skill/agent `model:` frontmatter is validated against
-  that same enum, so injecting canonical ids made `model: sol` fail with InputValidationError.
+- **Every alias IS a model identity in the binary.** A favorite may carry several short names —
+  `luna`, `terra`, and `ds4` can all deliberately target one model — and every accepted alias, never
+  the canonical `clodex:<provider>:<model>` id, lands in the Agent-tool zod enum (PATCH 1), the
+  known-alias validator list (PATCH 3), the `/model` picker value (PATCH 5), and the context-window
+  map (PATCH 7), in saved order. Subagent/skill/agent `model:` frontmatter is validated against that
+  same enum, so injecting canonical ids made `model: sol` fail with InputValidationError — and
+  collapsing same-target names to whichever was saved last made every other name fail the same way.
   Favorites with no alias fall back to their canonical id as the identity (enum + validator +
   context map only; no resolver case, no picker entry).
-- **PATCH 6 (alias resolver switch) maps each alias to ITSELF.** The case must exist — the switch's
+- **PATCH 6 (alias resolver switch) maps every alias to ITSELF.** One case per alias, so several
+  same-target names each resolve to themselves. Each case must exist — the switch's
   `default:` returns null — but resolving to the canonical id would make Claude Code send one name
   while looking its context window up under another. That is the same mismatch as the response-echo
   bug — the MITM layer resolves short alias names as request model ids and echoes bodies unrewritten,
@@ -50,10 +53,15 @@ capabilities/defaults, and child-command network isolation.
   → the old `Custom model (<id>)` wording.
 - `buildDesiredPatchConfig()` is disk-only (preferences + registry models cache — no network, no
   credentials).
-- `computePatchConfigHash` = sha256 of `[PATCH_TRANSFORMS_VERSION, key-sorted [key, alias??null,
-  context??null, display??null, effort-levels??null, default-effort??null] array]`, plus the
-  versioned local-module content identity only while local patches are enabled. Disabled users
-  retain the exact historical hash shape. The manifest at `~/.clodex/patch-state.json` (binary path,
+- `computePatchConfigHash` = sha256 of `[PATCH_TRANSFORMS_VERSION, key-sorted [key,
+  patchEntryAliases(entry), context??null, display??null, effort-levels??null,
+  default-effort??null] array]`, plus the versioned local-module content identity only while local
+  patches are enabled. Disabled users retain a hash with no local-module element at all.
+  `patchEntryAliases()` (`src/patch-transforms.ts`) is the one normalization every consumer reads:
+  the legacy scalar `alias` first, then the ordered `aliases` array, each trimmed and lowercased —
+  so `{alias:'x'}` and `{aliases:['x']}` are the same configuration and hash identically, while
+  adding, removing, or **reordering** a name changes the hash and makes the install read as
+  `stale-config`. The manifest at `~/.clodex/patch-state.json` (binary path,
   claude version, config hash, patched size/sha256, backup path, pristine sha256 — the last absent
   in pre-content-addressed manifests) drives `evaluatePatchState` →
   `unpatched | current | stale-config | stale-binary`.
