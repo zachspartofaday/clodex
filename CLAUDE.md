@@ -161,8 +161,12 @@ These bite from outside the subsystem that owns them, so they live here rather t
   `GET /v1/models` returns `context_window` per model so the status bar is accurate.
 - **Anthropic-passthrough base URLs must NOT include `/v1`** — the Anthropic SDK appends
   `/v1/messages` itself.
-- **The alias IS the model identity** once a binary is patched: the short name is what lands in the
-  Agent-tool enum, is sent, is echoed, and keys the context-window map. Full rules in
+- **Every alias IS a model identity** once a binary is patched: each short name is what lands in the
+  Agent-tool enum, is sent, is echoed, and keys the context-window map. Several saved names may
+  deliberately target one favorite, and every one of them is patched in as a complete identity, in
+  saved order — collapsing them would make otherwise-valid `model:` frontmatter fail or silently
+  select a different model. Ordered alias arrays participate in the patch freshness hash, so adding,
+  removing, or reordering a name makes an install read as `stale-config`. Full rules in
   `.claude/docs/patcher.md`.
 - **Do not restructure `src/oauth/responses-websocket.ts` or `src/sdk-adapter.ts`.** The
   continuation and translation logic took extensive real-world testing. Surgical changes only.
