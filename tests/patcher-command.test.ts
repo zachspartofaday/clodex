@@ -39,7 +39,31 @@ const hoisted = vi.hoisted(() => ({
   sentinel: '\n#__CLAUDE_BUNDLE__\n',
   /** Paths passed to readContent, so tests can pin how MANY extractions ran. */
   readContentCalls: [] as string[],
+  failManifestRename: false,
 }));
+
+vi.mock('node:fs', async () => {
+  const actual = await vi.importActual<typeof import('node:fs')>('node:fs');
+  return {
+    ...actual,
+    renameSync: (
+      oldPath: import('node:fs').PathLike,
+      newPath: import('node:fs').PathLike,
+    ) => {
+      if (
+        hoisted.failManifestRename
+        && String(oldPath).includes('patch-state.json.tmp-')
+        && String(newPath).endsWith('patch-state.json')
+      ) {
+        hoisted.failManifestRename = false;
+        const error = new Error('injected final manifest rename failure') as NodeJS.ErrnoException;
+        error.code = 'EACCES';
+        throw error;
+      }
+      return actual.renameSync(oldPath, newPath);
+    },
+  };
+});
 
 vi.mock('tweakcc', () => ({
   tryDetectInstallation: async ({ path }: { path?: string }) => {
@@ -147,6 +171,7 @@ beforeEach(() => {
   saveFavorites();
 
   hoisted.readContentCalls.length = 0;
+  hoisted.failManifestRename = false;
   logs = [];
   vi.mocked(p.confirm).mockReset();
   vi.mocked(p.isCancel).mockReset().mockReturnValue(false);
@@ -916,6 +941,62 @@ describe('runPatchCommand poisoned backup safety', () => {
     expect(logs.join('\n')).toMatch(/already carry a clodex patch/);
     expect(sha256Of(real)).toBe(before);
     expect(backupFiles()).toEqual(['claude-2.1.220.orig']);
+  });
+});
+
+describe('runPatchCommand publication transaction', () => {
+  const publicationRemnants = (directory: string) => (
+    existsSync(directory)
+      ? readdirSync(directory).filter(name => (
+        name.includes('patch-state.json.tmp-')
+        || name.includes('.clodex-patch-rollback-')
+        || name.includes('.clodex-patch-')
+      ))
+      : []
+  );
+
+  it('restores exact live bytes and the prior manifest when final manifest publication fails', async () => {
+    const real = installClaude('2.1.220');
+    expect(await runPatchCommand({})).toBe(0);
+    const priorLiveBytes = readFileSync(real);
+    const manifestPath = join(clodexHome, 'patch-state.json');
+    const priorManifestBytes = readFileSync(manifestPath);
+    const pristineBackupPath = readPatchManifest()!.backupPath;
+    const pristineBackupBytes = readFileSync(pristineBackupPath);
+    const mirrorPath = join(tweakccDir, 'native-binary.backup');
+    const pristineMirrorBytes = readFileSync(mirrorPath);
+    saveFavorites(
+      [{ providerId: 'openai-oauth', modelId: 'gpt-5.6-sol' }],
+      [{ name: 'terra', providerId: 'openai-oauth', modelId: 'gpt-5.6-sol' }],
+    );
+    hoisted.failManifestRename = true;
+
+    expect(await runPatchCommand({})).toBe(1);
+
+    expect(readFileSync(real)).toEqual(priorLiveBytes);
+    expect(readFileSync(manifestPath)).toEqual(priorManifestBytes);
+    expect(readFileSync(pristineBackupPath)).toEqual(pristineBackupBytes);
+    expect(readFileSync(mirrorPath)).toEqual(pristineMirrorBytes);
+    expect(publicationRemnants(clodexHome)).toEqual([]);
+    expect(publicationRemnants(join(real, '..'))).toEqual([]);
+  });
+
+  it('restores exact first-install live bytes and leaves no manifest when publication fails', async () => {
+    const real = installClaude('2.1.220');
+    const priorLiveBytes = readFileSync(real);
+    const manifestPath = join(clodexHome, 'patch-state.json');
+    hoisted.failManifestRename = true;
+
+    expect(await runPatchCommand({})).toBe(1);
+
+    expect(readFileSync(real)).toEqual(priorLiveBytes);
+    expect(existsSync(manifestPath)).toBe(false);
+    const pristineBackups = backupFiles().filter(name => /^claude-.*\.orig$/.test(name));
+    expect(pristineBackups).toHaveLength(1);
+    expect(readFileSync(join(tweakccDir, pristineBackups[0]!))).toEqual(priorLiveBytes);
+    expect(readFileSync(join(tweakccDir, 'native-binary.backup'))).toEqual(priorLiveBytes);
+    expect(publicationRemnants(clodexHome)).toEqual([]);
+    expect(publicationRemnants(join(real, '..'))).toEqual([]);
   });
 });
 

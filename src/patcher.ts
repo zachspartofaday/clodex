@@ -18,10 +18,11 @@
 //    over the live binary only after it fully succeeds,
 //  - a pid lock (~/.clodex/patch.lock) so concurrent launches cannot race.
 
-import { createHash } from 'node:crypto';
+import { createHash, randomUUID } from 'node:crypto';
 import {
   copyFileSync,
   existsSync,
+  linkSync,
   mkdtempSync,
   mkdirSync,
   readFileSync,
@@ -638,6 +639,8 @@ export async function applyPatch(
   },
 ): Promise<ApplyOutcome> {
   let candidateDir: string | undefined;
+  let stagedManifestPath: string | undefined;
+  let rollbackPath: string | undefined;
   let results: PatchSiteResult[];
   let patchedSize: number;
   let patchedSha256: string;
@@ -828,7 +831,41 @@ export async function applyPatch(
     if (writeShim) restoreEntryModuleName(candidatePath, writeShim, { resign: true });
     patchedSize = statSync(candidatePath).size;
     patchedSha256 = sha256File(candidatePath);
+    const manifest: PatchManifest = {
+      binaryPath,
+      claudeVersion: version,
+      configHash,
+      patchedSize,
+      patchedSha256,
+      backupPath: backup,
+      pristineSha256,
+      patchedAt: new Date().toISOString(),
+    };
+    // Stage every fallible prerequisite before touching the live path. The hard
+    // link preserves the exact current inode on the binary's own filesystem, so
+    // a rejected manifest publication can atomically put those bytes back.
+    const manifestPath = getPatchManifestPath();
+    mkdirSync(dirname(manifestPath), { recursive: true, mode: 0o700 });
+    stagedManifestPath = join(
+      dirname(manifestPath),
+      `${basename(manifestPath)}.tmp-${process.pid}-${randomUUID()}`,
+    );
+    writePatchManifest(manifest, stagedManifestPath);
+
+    rollbackPath = join(
+      dirname(binaryPath),
+      `.clodex-patch-rollback-${process.pid}-${randomUUID()}`,
+    );
+    linkSync(binaryPath, rollbackPath);
     renameSync(candidatePath, binaryPath);
+    try {
+      renameSync(stagedManifestPath, manifestPath);
+      stagedManifestPath = undefined;
+    } catch (err) {
+      renameSync(rollbackPath, binaryPath);
+      rollbackPath = undefined;
+      throw err;
+    }
   } catch (err) {
     const detailLines = err instanceof PatchApplyError ? summarizePatchResults(err.results) : [];
     if (opts.trace && detailLines.length) {
@@ -840,6 +877,20 @@ export async function applyPatch(
       detailLines,
     };
   } finally {
+    for (const temporaryPath of [stagedManifestPath, rollbackPath]) {
+      if (temporaryPath === undefined) continue;
+      try {
+        rmSync(temporaryPath, { force: true });
+      } catch (err) {
+        if (opts.trace) {
+          process.stderr.write(
+            `clodex patch: could not remove temporary publication file: ${
+              err instanceof Error ? err.message : String(err)
+            }\n`,
+          );
+        }
+      }
+    }
     if (candidateDir !== undefined) {
       try {
         rmSync(candidateDir, { recursive: true, force: true });
@@ -857,18 +908,6 @@ export async function applyPatch(
   if (opts.trace) {
     process.stderr.write(`${summarizePatchResults(results).join('\n')}\n`);
   }
-
-  const manifest: PatchManifest = {
-    binaryPath,
-    claudeVersion: version,
-    configHash,
-    patchedSize,
-    patchedSha256,
-    backupPath: backup,
-    pristineSha256,
-    patchedAt: new Date().toISOString(),
-  };
-  writePatchManifest(manifest);
 
   const modelCount = Object.keys(desired.config).length;
   const aliasCount = Object.values(desired.config)
