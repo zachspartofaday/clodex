@@ -12,13 +12,15 @@
 // from-scratch reimplementation with a different patch mechanism and an added
 // per-model context window patch.
 //
-// The ALIAS is the model's identity inside the binary: for any entry that
-// defines one, the alias (not the canonical `clodex:<provider>:<model>` id) is
-// what lands in the Agent-tool enum, the known-alias validator, the /model
-// picker, and the context-window table — so `model: sol` in agent/skill
-// frontmatter validates. Entries with no alias fall back to their canonical id
-// as the identity (they still join the enum, validator, and context table, but
-// skip the resolver and /model picker patches).
+// Each ALIAS is a model identity inside the binary: for any entry that defines
+// one or more, every alias (not the canonical `clodex:<provider>:<model>` id)
+// lands in the Agent-tool enum, the known-alias validator, the /model picker,
+// and the context-window table — so `model: sol` in agent/skill frontmatter
+// validates, and so several saved names pointing at one favorite each stay a
+// complete identity instead of collapsing to whichever was saved last. Entries
+// with no alias fall back to their canonical id as the identity (they still
+// join the enum, validator, and context table, but skip the resolver and
+// /model picker patches).
 
 import { isReservedModelAlias } from './model-aliases.js';
 import {
@@ -38,9 +40,12 @@ import {
  * hash of the transform inputs to force that decision to be made rather than
  * forgotten.
  */
-export const PATCH_TRANSFORMS_VERSION = 6;
+export const PATCH_TRANSFORMS_VERSION = 7;
 
 export interface PatchScriptModelEntry {
+  /** Ordered native identities for this model, in saved alias order. */
+  aliases?: string[];
+  /** Legacy single-identity input, accepted while callers migrate to `aliases`. */
   alias?: string;
   context?: number;
   /** Human label for the /model picker, e.g. `GPT-5.6 Sol (OpenAI (ChatGPT))`. */
@@ -56,6 +61,19 @@ export interface PatchScriptEffort {
 
 /** Real model id (e.g. `clodex:openai-oauth:gpt-5.6-sol`) → alias/context. */
 export type PatchScriptModelConfig = Record<string, PatchScriptModelEntry>;
+
+/**
+ * The ordered aliases an entry carries, normalized the same way saved aliases
+ * are. The legacy single `alias` comes first so a mixed entry keeps a stable
+ * order, and so `{alias:'x'}` and `{aliases:['x']}` are the same configuration
+ * to every consumer — including the freshness hash.
+ */
+export function patchEntryAliases(entry: PatchScriptModelEntry): string[] {
+  return [
+    ...(entry.alias === undefined ? [] : [entry.alias]),
+    ...(entry.aliases ?? []),
+  ].map(alias => String(alias).trim().toLowerCase());
+}
 
 const NATIVE_EFFORT_LEVELS = ['low', 'medium', 'high', 'xhigh', 'max'] as const;
 const BASE_EFFORT_LEVELS = ['low', 'medium', 'high'] as const;
@@ -117,10 +135,10 @@ export function applyClodexPatches(source: string, config: PatchScriptModelConfi
   const MODEL_CONFIG = config;
 
   // ---- derive helpers ------------------------------------------------------
-  // alias -> model id (only for entries that define an alias)
+  // alias -> model id (only for entries that define aliases)
   const ALIAS_TO_ID: Record<string, string> = Object.create(null);
-  // The name Claude Code knows a model by: its alias when it has one, else its
-  // canonical id. This single value is used for the Agent-tool enum, the
+  // The names Claude Code knows a model by: every alias when it has any, else
+  // its canonical id. These values are used for the Agent-tool enum, the
   // known-alias validator, the /model picker value, and the context-window table,
   // so the name the binary validates == the name it sends upstream == the name
   // the proxy echoes back == the key its context window is stored under.
@@ -156,24 +174,42 @@ export function applyClodexPatches(source: string, config: PatchScriptModelConfi
 
   for (const [id, value] of Object.entries(MODEL_CONFIG)) {
     const spec: PatchScriptModelEntry = value && typeof value === 'object' ? value : { alias: value as unknown as string };
-    if (spec.alias !== undefined) {
-      const rawAlias = String(spec.alias).trim();
+    if (spec.aliases !== undefined && !Array.isArray(spec.aliases)) {
+      fail('clodex patch: aliases for "' + id + '" must be an array');
+    }
+    const rawAliases: unknown[] = [
+      ...(spec.alias === undefined ? [] : [spec.alias]),
+      ...(spec.aliases ?? []),
+    ];
+    const aliases: string[] = [];
+    for (const raw of rawAliases) {
+      if (typeof raw !== 'string') {
+        fail('clodex patch: alias for "' + id + '" must be a string');
+      }
+      const rawAlias = (raw as string).trim();
       const a = rawAlias.toLowerCase();
       if (!/^[a-z0-9][a-z0-9._-]*(\[1m\])?$/.test(a)) {
-        fail('clodex patch: alias "' + spec.alias + '" is not a safe lowercase alias');
+        fail('clodex patch: alias "' + raw + '" is not a safe lowercase alias');
       }
       if (isReservedModelAlias(a)) {
         fail('clodex patch: reserved alias "' + a + '" cannot be reassigned');
       }
+      // Two entries (or one entry twice) claiming a name would silently make the
+      // later one win the resolver and context lookups. Fail instead.
+      if (ALIAS_TO_ID[a] !== undefined) {
+        fail('clodex patch: alias "' + a + '" is configured more than once');
+      }
       ALIAS_TO_ID[a] = String(id);
+      aliases.push(a);
       IDENTITIES.push(a);
       if (spec.display) DISPLAY_BY_IDENTITY[a] = String(spec.display);
-    } else {
+    }
+    if (aliases.length === 0) {
       IDENTITIES.push(String(id));
       if (spec.display) DISPLAY_BY_IDENTITY[String(id)] = String(spec.display);
     }
-    if (spec.alias !== undefined) {
-      registerCapabilityKeys(String(spec.alias));
+    for (const alias of aliases) {
+      registerCapabilityKeys(alias);
     }
     registerCapabilityKeys(String(id));
 
@@ -185,12 +221,12 @@ export function applyClodexPatches(source: string, config: PatchScriptModelConfi
       // A [1m] suffix hard-codes 1M upstream (and sends the context-1m beta header
       // + raises the media cap). An explicit context on a [1m] model would win via
       // PATCH 7 while those side effects silently stayed on — so reject it.
-      if (/\[1m\]/i.test(String(spec.alias ?? '')) || /\[1m\]/i.test(id)) {
+      if (aliases.some(alias => /\[1m\]/i.test(alias)) || /\[1m\]/i.test(id)) {
         fail(
-          'clodex patch: "' + id + '" sets context but keeps the [1m] suffix — drop the suffix from both the id and the alias'
+          'clodex patch: "' + id + '" sets context but keeps the [1m] suffix — drop the suffix from the id and every alias'
         );
       }
-      if (spec.alias !== undefined) CONTEXT_BY_KEY[String(spec.alias).trim().toLowerCase()] = n;
+      for (const alias of aliases) CONTEXT_BY_KEY[alias] = n;
       CONTEXT_BY_KEY[String(id).trim().toLowerCase()] = n;
     }
 
@@ -201,8 +237,8 @@ export function applyClodexPatches(source: string, config: PatchScriptModelConfi
           `clodex patch: effort for "${id}" must include low, medium, and high with a native default`,
         );
       }
-      if (spec.alias !== undefined) {
-        for (const key of capabilityKeys(String(spec.alias))) {
+      for (const alias of aliases) {
+        for (const key of capabilityKeys(alias)) {
           EFFORT_BY_KEY[key] = effort;
         }
       }

@@ -190,10 +190,32 @@ describe('HTTP proxy routes', () => {
       () => ({ contextWindow: 1_000_000, displayName: 'Llama 3.3 70B' }),
     );
 
-    expect(routes.aliases[0]?.name).toBe(
-      patch.config['clodex:groq:llama-3.3-70b']?.alias,
+    expect(routes.aliases.map(alias => alias.name)).toEqual(
+      patch.config['clodex:groq:llama-3.3-70b']?.aliases,
     );
     expect(routes.aliases[0]?.sourceNames).toEqual(['LLaMa']);
+  });
+
+  it('keeps every same-target alias in one identical order for routing and patch identity', () => {
+    const favorite = { providerId: 'groq', modelId: 'llama-3.3-70b' };
+    const aliases = [
+      { name: 'LLaMa', ...favorite },
+      { name: 'fast', ...favorite },
+      { name: 'terra', ...favorite },
+    ];
+    const routes = buildHttpProxyRoutes(providers, [favorite], aliases);
+    const patch = buildPatchModelConfig(
+      [favorite],
+      aliases,
+      () => ({ contextWindow: 1_000_000, displayName: 'Llama 3.3 70B' }),
+    );
+
+    expect(routes.aliases.map(alias => alias.name)).toEqual(['llama', 'fast', 'terra']);
+    expect(patch.config['clodex:groq:llama-3.3-70b']?.aliases).toEqual(
+      routes.aliases.map(alias => alias.name),
+    );
+    expect(routes.unavailableAliasRejections).toEqual([]);
+    expect(patch.rejectedAliasRejections).toEqual([]);
   });
 
   it('exposes only the first saved favorites and keeps later aliases inactive', () => {
