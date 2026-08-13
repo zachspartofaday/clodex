@@ -1698,6 +1698,64 @@ describe('selective HTTP proxy', () => {
     }
   }, 20_000);
 
+  // Class closure: `response_completed` has exactly two writers — the translated
+  // adapter route below and this Anthropic passthrough route. An in-band `error`
+  // event on a normally closed 2xx stream is the documented Anthropic mid-stream
+  // failure, so the passthrough member must classify it the same way.
+  it('records a normally closed error SSE on the Anthropic passthrough route as failed', async () => {
+    const certificates = ensureHttpProxyCertificates();
+    const inferenceLogPath = join(testHome, 'passthrough-error-sse-inference.jsonl');
+    const origin = https.createServer({
+      key: certificates.serverKey,
+      cert: certificates.serverCert,
+    }, async (req, res) => {
+      req.resume();
+      await once(req, 'end');
+      res.writeHead(200, { 'Content-Type': 'text/event-stream' });
+      res.end(ERROR_SSE);
+    });
+    const originPort = await listen(origin);
+    const proxy = await startHttpProxy({
+      routes: [],
+      inferenceLogPath,
+      anthropicOrigin: `https://127.0.0.1:${originPort}`,
+      anthropicRejectUnauthorized: false,
+    });
+
+    try {
+      const response = await requestMitm(
+        proxy.port,
+        certificates.caCert,
+        '/v1/messages',
+        JSON.stringify({
+          model: 'claude-sonnet-4-6',
+          messages: [{ role: 'user', content: 'synthetic passthrough error' }],
+          stream: true,
+        }),
+      );
+
+      expect(response).toContain(ERROR_SSE);
+      await vi.waitFor(() => {
+        const current = readFileSync(inferenceLogPath, 'utf8').trim().split('\n').map(line => JSON.parse(line));
+        expect(current.some(entry =>
+          entry.event === 'response_failed' || entry.event === 'response_completed')).toBe(true);
+      });
+      const entries = readFileSync(inferenceLogPath, 'utf8').trim().split('\n').map(line => JSON.parse(line));
+      expect(entries).toContainEqual(expect.objectContaining({
+        event: 'response_failed',
+        route: 'passthrough',
+        statusCode: 200,
+        terminalOutcome: 'error',
+        terminalCategory: 'error_sse',
+        terminationSource: 'upstream_failure',
+      }));
+      expect(entries.some(entry => entry.event === 'response_completed')).toBe(false);
+    } finally {
+      await proxy.close();
+      await new Promise<void>(resolve => origin.close(() => resolve()));
+    }
+  }, 20_000);
+
   it('records a normally closed error SSE as a failed terminal without changing client bytes', async () => {
     const certificates = ensureHttpProxyCertificates();
     const inferenceLogPath = join(testHome, 'adapter-error-sse-inference.jsonl');

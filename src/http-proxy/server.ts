@@ -366,6 +366,8 @@ function forwardRawAnthropicRequest(
     let responseEnded = false;
     let failed = false;
     let clientDisconnected = false;
+    let responseTerminal: ResponseTerminal | undefined;
+    let responseInspection: Promise<void> | undefined;
     const writeLifecycle = (
       event: Parameters<typeof writeInferenceResponseLifecycleLog>[1]['event'],
       extra: Partial<Parameters<typeof writeInferenceResponseLifecycleLog>[1]> = {},
@@ -438,7 +440,13 @@ function forwardRawAnthropicRequest(
         bytes += chunk.length;
         chunks += 1;
       });
-      copyResponse(upstreamRes, res, onErrorResponse, onResponseUsage);
+      responseInspection = copyResponse(
+        upstreamRes,
+        res,
+        onErrorResponse,
+        onResponseUsage,
+        lifecycle ? terminal => { responseTerminal ??= terminal; } : undefined,
+      );
       upstreamRes.once('end', () => {
         responseEnded = true;
         lastActivityAt = Date.now();
@@ -468,15 +476,36 @@ function forwardRawAnthropicRequest(
     });
     res.once('finish', () => {
       stopProgress();
-      if (failed || clientDisconnected) return;
-      const now = Date.now();
-      writeLifecycle('response_completed', {
-        statusCode,
-        durationMs: now - startedAt,
-        ...(firstByteAt !== undefined ? { timeToFirstByteMs: firstByteAt - startedAt } : {}),
-        bytes,
-        chunks,
-      });
+      const classifyResponse = () => {
+        if (failed || clientDisconnected) return;
+        const now = Date.now();
+        if (responseTerminal) {
+          failed = true;
+          writeLifecycle('response_failed', {
+            statusCode,
+            durationMs: now - startedAt,
+            ...(firstByteAt !== undefined ? { timeToFirstByteMs: firstByteAt - startedAt } : {}),
+            bytes,
+            chunks,
+            ...responseTerminal,
+            terminationSource: 'upstream_failure',
+          });
+          return;
+        }
+        writeLifecycle('response_completed', {
+          statusCode,
+          durationMs: now - startedAt,
+          ...(firstByteAt !== undefined ? { timeToFirstByteMs: firstByteAt - startedAt } : {}),
+          bytes,
+          chunks,
+        });
+      };
+      // Same asynchronous decoded tail as the translated route.
+      if (responseInspection) {
+        void responseInspection.then(classifyResponse);
+        return;
+      }
+      classifyResponse();
     });
     res.once('close', () => {
       stopProgress();
