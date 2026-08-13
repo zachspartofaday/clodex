@@ -1009,10 +1009,21 @@ export async function runPatchCommand(opts: {
 
 // ── Launch-time check ───────────────────────────────────────────────────────
 
+function describeLaunchPatchDegradation(state: Exclude<PatchState, 'current'>): string {
+  return state === 'unpatched'
+    ? 'Claude Code\'s current clodex patch configuration is not confirmed, so aliases, favorites, context windows/auto-compaction, '
+      + 'and effort metadata may be missing or outdated. Run `clodex patch` to apply or repair the current configuration. '
+      + 'To roll back a previous patch, run `clodex patch --restore` only when a trustworthy backup exists.'
+    : 'Claude Code\'s clodex patch is not confirmed current, so aliases, favorites, context windows/auto-compaction, '
+      + 'and effort metadata may be missing or outdated. Run `clodex patch` to apply or repair the current configuration. '
+      + 'To roll back a previous patch, run `clodex patch --restore` only when a trustworthy backup exists.';
+}
+
 /**
  * Cheap patch-state probe for `clodex claude`:
  *  - TTY: offer to patch (y/N); declining continues the launch.
- *  - non-TTY (or agent stdout mode): one-line notice, never prompt, never block.
+ *  - non-TTY or dry-run: one-line notice, never prompt, never block.
+ *  - agent stdout mode: silent, never prompt, never block.
  *  - concurrent launches: the lock loser prints a notice and continues.
  */
 export async function runLaunchPatchCheck(opts: { agentStdout?: boolean; dryRun?: boolean } = {}): Promise<void> {
@@ -1053,15 +1064,13 @@ export async function runLaunchPatchCheck(opts: { agentStdout?: boolean; dryRun?
       && process.stdin.isTTY === true && process.stdout.isTTY === true;
     if (!interactive) {
       if (!opts.agentStdout) {
-        console.error(pc.dim(`clodex: claude binary is ${state === 'unpatched' ? 'not patched' : 'stale-patched'} for your favorites — run \`clodex patch\`.`));
+        console.error(pc.dim(`clodex: ${describeLaunchPatchDegradation(state)}`));
       }
       return;
     }
 
     const answer = await p.confirm({
-      message: state === 'unpatched'
-        ? 'Claude Code is not patched for your clodex favorites. Patch now?'
-        : 'The Claude Code patch is stale (config or claude version changed). Re-patch now?',
+      message: `${describeLaunchPatchDegradation(state)} Patch now?`,
       initialValue: false,
     });
     if (p.isCancel(answer) || answer !== true) return;
@@ -1069,6 +1078,8 @@ export async function runLaunchPatchCheck(opts: { agentStdout?: boolean; dryRun?
     await runPatchCommand({});
   } catch (err) {
     // The patch check must never block a launch.
-    console.error(pc.dim(`clodex: patch check skipped (${err instanceof Error ? err.message : String(err)})`));
+    if (!opts.agentStdout) {
+      console.error(pc.dim(`clodex: patch check skipped (${err instanceof Error ? err.message : String(err)})`));
+    }
   }
 }
