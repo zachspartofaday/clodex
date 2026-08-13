@@ -11,6 +11,7 @@ describe('isCredentialBearingHeader', () => {
     'X-Auth-Token',
     'X-Client-Secret',
     'X-Credential-Id',
+    ' X-API-Key ',
   ])('identifies %s as credential-bearing', (name) => {
     expect(isCredentialBearingHeader(name)).toBe(true);
   });

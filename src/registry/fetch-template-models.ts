@@ -14,6 +14,8 @@ import {
   registerTraceSecret,
 } from '../trace-log.js';
 import { classifyFreeStatus, isFreeStatus } from '../free-models.js';
+import { isCredentialBearingHeader } from '../credential-headers.js';
+import { canonicalAnthropicBaseUrl } from './url-security.js';
 
 
 type OpenAiModelListResponse = ProviderModelListRow[] | {
@@ -265,8 +267,8 @@ export async function fetchTemplateModels(
   extraHeaders?: Record<string, string>,
 ): Promise<FetchTemplateModelsResult> {
   const trimmedOverride = baseUrlOverride?.trim();
-  const baseUrl = (trimmedOverride || template.defaultBaseUrl)?.replace(/\/$/, '');
-  if (!baseUrl) {
+  const configuredBaseUrl = (trimmedOverride || template.defaultBaseUrl)?.replace(/\/$/, '');
+  if (!configuredBaseUrl) {
     return {
       models: [],
       baseUrl: '',
@@ -292,7 +294,7 @@ export async function fetchTemplateModels(
         error: `${template.name} does not support the ${template.npm || '(missing)'} SDK package.`,
       };
     }
-    if (baseUrl !== pinned) {
+    if (configuredBaseUrl !== pinned) {
       return {
         models: [],
         baseUrl: '',
@@ -300,6 +302,17 @@ export async function fetchTemplateModels(
         hint: 'This provider always uses its own endpoint. Remove the custom URL and try again.',
       };
     }
+  }
+
+  const baseUrl = template.npm === '@ai-sdk/anthropic'
+    ? canonicalAnthropicBaseUrl(configuredBaseUrl)
+    : configuredBaseUrl;
+  if (baseUrl === null) {
+    return {
+      models: [],
+      baseUrl: '',
+      error: 'Anthropic-compatible discovery requires an unambiguous HTTPS URL.',
+    };
   }
 
   // No template declares `static-seed` today, so this arm and
@@ -318,15 +331,18 @@ export async function fetchTemplateModels(
   const timer = setTimeout(() => controller.abort(), TEST_TIMEOUT_MS);
 
   const headers: Record<string, string> = { Accept: 'application/json' };
+  if (template.npm === '@ai-sdk/anthropic') headers['anthropic-version'] = '2023-06-01';
+  for (const configured of [template.headers, extraHeaders]) {
+    for (const [name, value] of Object.entries(configured ?? {})) {
+      if (!isCredentialBearingHeader(name)) headers[name] = value;
+    }
+  }
   const trimmedApiKey = apiKey.trim();
   if (template.npm === '@ai-sdk/anthropic') {
     if (trimmedApiKey) headers['x-api-key'] = trimmedApiKey;
-    headers['anthropic-version'] = '2023-06-01';
   } else if (trimmedApiKey) {
     headers['Authorization'] = `Bearer ${trimmedApiKey}`;
   }
-  if (template.headers) Object.assign(headers, template.headers);
-  if (extraHeaders) Object.assign(headers, extraHeaders);
 
   try {
     const response = await fetch(url, {

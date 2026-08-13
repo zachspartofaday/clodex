@@ -88,7 +88,11 @@ export function cachedModelToLocal(
     templateId: provider.templateId,
   });
 
-  const npm = cached.npm ?? provider.api.npm ?? '';
+  // `custom-anthropic` is the provider's persisted kind, not descriptive cache
+  // metadata. Imported, migrated, or hand-edited model rows cannot switch its
+  // credential onto another SDK/format and regain per-model destination control.
+  const customAnthropic = provider.templateId === 'custom-anthropic';
+  const npm = customAnthropic ? '@ai-sdk/anthropic' : (cached.npm ?? provider.api.npm ?? '');
   const apiUrl = resolveMaterializedApiUrl(cached, provider, npm);
   if (apiUrl === null) return null;
   const endpoint = resolveEndpoint(npm, apiUrl);
@@ -105,7 +109,11 @@ export function cachedModelToLocal(
     name: npm === '@ai-sdk/google' ? normalizeGoogleDisplayName(cached.name, id) : cached.name,
     family,
     brand: npm === '@ai-sdk/google' ? deriveBrand(family) : (cached.brand ?? deriveBrand(cached.family ?? '')),
-    modelFormat: (cached.modelFormat === 'anthropic' || cached.modelFormat === 'openai' ? cached.modelFormat : undefined) ?? endpoint.format,
+    modelFormat: customAnthropic
+      ? 'anthropic'
+      : (cached.modelFormat === 'anthropic' || cached.modelFormat === 'openai'
+          ? cached.modelFormat
+          : endpoint.format),
     upstreamModelId: normalizedUpstream,
     baseUrl: endpoint.baseUrl,
     completionsUrl: endpoint.completionsUrl,

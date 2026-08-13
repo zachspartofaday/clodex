@@ -17,6 +17,8 @@ import {
   OPENCODE_GO_ANTHROPIC_BASE_URL,
   OPENCODE_GO_COMPLETIONS_BASE_URL,
 } from '../src/data/opencode-go-models.js';
+import { localModelToRoute } from '../src/catalog.js';
+import { localProvidersToServerModels } from '../src/provider-catalog.js';
 
 describe('provider id validation', () => {
   it('accepts stable slugs', () => {
@@ -671,17 +673,41 @@ describe('materializeRegistry', () => {
     });
   });
 
-  it('uses the custom Anthropic provider authority instead of a stored model override', () => {
+  it('pins every custom Anthropic route field to provider identity across both relays', () => {
     const registry = emptyRegistry();
-    registry.providers.push(customAnthropicProvider(
+    const provider = customAnthropicProvider(
       'https://provider-authority.example/anthropic/v1/',
       'https://stored-model-override.example/v1',
-    ));
+    );
+    const cached = provider.modelsCache.models[0]!;
+    cached.npm = '@ai-sdk/openai-compatible';
+    cached.modelFormat = 'openai';
+    registry.providers.push(provider);
 
-    const model = materializeRegistry(registry, () => 'credential-sentinel')[0]?.models[0];
+    const local = materializeRegistry(registry, () => 'credential-sentinel')[0]!;
+    const model = local.models[0]!;
+    const proxyRoute = localModelToRoute(local, model);
+    const endpointModel = localProvidersToServerModels([local])[0];
 
-    expect(model?.apiBaseUrl).toBe('https://provider-authority.example/anthropic');
-    expect(model?.baseUrl).toBe('https://provider-authority.example/anthropic');
+    expect(model).toMatchObject({
+      modelFormat: 'anthropic',
+      npm: '@ai-sdk/anthropic',
+      apiBaseUrl: 'https://provider-authority.example/anthropic',
+      baseUrl: 'https://provider-authority.example/anthropic',
+    });
+    expect(proxyRoute).toMatchObject({
+      modelFormat: 'anthropic',
+      npm: '@ai-sdk/anthropic',
+      upstreamUrl: 'https://provider-authority.example/anthropic',
+      baseURL: 'https://provider-authority.example/anthropic',
+    });
+    expect(endpointModel).toMatchObject({
+      modelFormat: 'anthropic',
+      npm: '@ai-sdk/anthropic',
+      apiBaseUrl: 'https://provider-authority.example/anthropic',
+      baseUrl: 'https://provider-authority.example/anthropic',
+    });
+    expect(JSON.stringify([proxyRoute, endpointModel])).not.toContain('stored-model-override');
   });
 
   it.each([

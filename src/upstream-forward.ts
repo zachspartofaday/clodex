@@ -5,7 +5,6 @@ import { sanitizeCredential } from './server/auth.js';
 import {
   ANTHROPIC_BETA_HEADER,
   isAnthropicBetaHeaderName,
-  isRouteOwnedCredentialHeaderName,
   resolveOutboundBeta,
   type AnthropicCapabilityRequest,
   type AnthropicCapabilityRouteFacts,
@@ -31,9 +30,9 @@ import {
  * identity could represent.
  *
  * When the route owns the credential it owns it OUTRIGHT: every configured
- * spelling of `authorization` and `x-api-key` is removed before the route's own
- * canonical credential is added, so a configured value can never be appended
- * alongside it. Ordinary configured headers are untouched.
+ * credential-bearing header is removed before the route's canonical envelope
+ * is added, so a second cookie/token/secret spelling cannot ride alongside it.
+ * Ordinary configured headers are untouched.
  */
 export function anthropicUpstreamHeaders(
   apiKey: string,
@@ -54,8 +53,7 @@ export function anthropicUpstreamHeaders(
   const forwardedExtraHeaders = Object.fromEntries(
     Object.entries(extraHeaders ?? {}).filter(([name]) =>
       !isAnthropicBetaHeaderName(name)
-      && !isRouteOwnedCredentialHeaderName(name)
-      && (resolvedAuthType !== 'none' || !isCredentialBearingHeader(name)),
+      && !isCredentialBearingHeader(name),
     ),
   );
   const headers: Record<string, string> = {

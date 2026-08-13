@@ -69,6 +69,18 @@ describe('fetchTemplateModels', () => {
     expect((call.headers as Record<string, string>)['Authorization']).toBeUndefined();
   });
 
+  it.each([
+    ['HTTP', 'http://api.anthropic.example/v1'],
+    ['query', 'https://api.anthropic.example/v1?destination=other'],
+    ['userinfo', 'https://user:pass@api.anthropic.example/v1'],
+  ])('rejects an Anthropic template %s destination before discovery fetch', async (_case, baseUrl) => {
+    const result = await fetchTemplateModels(anthropicTemplate, 'credential-sentinel', baseUrl);
+
+    expect(result.models).toEqual([]);
+    expect(result.error).toMatch(/HTTPS|URL/i);
+    expect(fetch).not.toHaveBeenCalled();
+  });
+
   it('uses Bearer auth for OpenAI-compatible providers', async () => {
     vi.mocked(fetch).mockResolvedValue({
       ok: true,
@@ -116,24 +128,28 @@ describe('fetchTemplateModels', () => {
     }
   });
 
-  it('merges extra headers for custom endpoints needing plan/auth-tracking headers', async () => {
+  it('merges ordinary extra headers while stripping configured discovery credentials', async () => {
     vi.mocked(fetch).mockResolvedValue({
       ok: true,
       status: 200,
       text: async () => JSON.stringify({ data: [{ id: 'model-a', name: 'model-a' }] }),
     } as Response);
 
-    await fetchTemplateModels(openaiCompatTemplate, 'sk-test-key', undefined, { 'X-Plan': 'coding' });
+    await fetchTemplateModels(openaiCompatTemplate, 'sk-test-key', undefined, {
+      Authorization: 'Bearer configured-secret',
+      api_key: 'configured-secret',
+      Cookie: 'configured-secret',
+      'X-Auth-Token': 'configured-secret',
+      'X-Client-Secret': 'configured-secret',
+      'X-Credential': 'configured-secret',
+      'X-Plan': 'coding',
+    });
 
-    expect(fetch).toHaveBeenCalledWith(
-      expect.any(String),
-      expect.objectContaining({
-        headers: expect.objectContaining({
-          Authorization: 'Bearer sk-test-key',
-          'X-Plan': 'coding',
-        }),
-      }),
-    );
+    const init = vi.mocked(fetch).mock.calls[0]![1] as RequestInit;
+    const headers = new Headers(init.headers);
+    expect(headers.get('authorization')).toBe('Bearer sk-test-key');
+    expect(headers.get('x-plan')).toBe('coding');
+    expect(JSON.stringify([...headers])).not.toContain('configured-secret');
   });
 
   it('preserves provider-supported request parameters from model list rows', async () => {

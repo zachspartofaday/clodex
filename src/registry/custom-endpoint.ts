@@ -18,7 +18,8 @@ import {
 } from './lock.js';
 import type { CachedModel, RegistryProvider } from './types.js';
 import { customProviderId, isValidProviderId, slugifyProviderId } from './validate.js';
-import { validateCustomEndpointUrl } from './url-security.js';
+import { canonicalAnthropicBaseUrl, validateCustomEndpointUrl } from './url-security.js';
+import { isCredentialBearingHeader } from '../credential-headers.js';
 import {
   getProviderDebugLogPath,
   makeTraceLogger,
@@ -61,19 +62,30 @@ export async function fetchAnthropicModels(
   apiKey: string,
   extraHeaders?: Record<string, string>,
 ): Promise<{ models: CachedModel[]; baseUrl: string; error?: string; hint?: string }> {
-  const root = baseUrl.replace(/\/v1\/?$/, '').replace(/\/$/, '');
+  const root = canonicalAnthropicBaseUrl(baseUrl);
+  if (root === null) {
+    return {
+      models: [],
+      baseUrl: '',
+      error: 'Anthropic-compatible discovery requires an unambiguous HTTPS URL.',
+      hint: 'Remove query, fragment, userinfo, or malformed authority text and use https://.',
+    };
+  }
   const modelsUrl = `${root}/v1/models`;
   const controller = new AbortController();
   const timer = setTimeout(() => controller.abort(), 10_000);
 
   try {
+    const forwardedHeaders = Object.fromEntries(
+      Object.entries(extraHeaders ?? {}).filter(([name]) => !isCredentialBearingHeader(name)),
+    );
     const response = await fetch(modelsUrl, {
       method: 'GET',
       headers: {
-        ...(apiKey ? { 'x-api-key': apiKey } : {}),
+        ...forwardedHeaders,
         'anthropic-version': '2023-06-01',
         Accept: 'application/json',
-        ...extraHeaders,
+        ...(apiKey ? { 'x-api-key': apiKey } : {}),
       },
       redirect: 'manual',
       signal: controller.signal,
@@ -157,7 +169,17 @@ function uniqueProviderId(displayName: string, registry: { providers: RegistryPr
 }
 
 export async function addCustomEndpointProvider(input: AddCustomEndpointInput): Promise<AddCustomEndpointResult> {
-  const urlCheck = await validateCustomEndpointUrl(input.baseUrl, {
+  const destination = input.kind === 'anthropic'
+    ? canonicalAnthropicBaseUrl(input.baseUrl)
+    : input.baseUrl;
+  if (destination === null) {
+    return {
+      added: false,
+      error: 'Anthropic-compatible endpoints require an unambiguous HTTPS URL.',
+      hint: 'Remove query, fragment, userinfo, or malformed authority text and use https://.',
+    };
+  }
+  const urlCheck = await validateCustomEndpointUrl(destination, {
     allowInsecureLocal: input.allowInsecureLocal,
   });
   if (!urlCheck.ok || !urlCheck.normalizedUrl) {

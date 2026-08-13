@@ -536,6 +536,12 @@ describe('route-owned credential headers cannot collide', () => {
     'x-api-key': 'configured-secret',
     'X-API-Key': 'configured-secret-2',
     'X-Api-Key ': 'configured-secret-3',
+    api_key: 'configured-secret',
+    Cookie: 'configured-secret',
+    'Proxy-Authorization': 'Bearer configured-secret',
+    'X-Auth-Token': 'configured-secret',
+    'X-Client-Secret': 'configured-secret',
+    'X-Credential': 'configured-secret',
     'X-Plan': 'coding',
     'Anthropic-Beta': 'cfg-a',
   };

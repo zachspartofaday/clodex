@@ -98,7 +98,8 @@ vi.mock('../src/registry/lock.js', () => ({
     },
   ),
 }));
-vi.mock('../src/registry/url-security.js', () => ({
+vi.mock('../src/registry/url-security.js', async importOriginal => ({
+  ...(await importOriginal<typeof import('../src/registry/url-security.js')>()),
   validateCustomEndpointUrl: vi.fn(),
 }));
 
@@ -251,6 +252,59 @@ describe('custom endpoint credential lifecycle', () => {
     expect(result.models).toHaveLength(1);
     const requestInit = fetchMock.mock.calls[0]?.[1] as RequestInit;
     expect(new Headers(requestInit.headers).has('x-api-key')).toBe(false);
+  });
+
+  it.each([
+    ['HTTP', 'http://local.example/v1'],
+    ['query', 'https://local.example/v1?destination=other'],
+    ['fragment', 'https://local.example/v1#destination'],
+    ['userinfo', 'https://user:pass@local.example/v1'],
+    ['ambiguous authority', 'https:\\\\local.example/v1'],
+  ])('rejects an Anthropic discovery %s destination before fetch', async (_case, baseUrl) => {
+    const fetchMock = vi.fn();
+    vi.stubGlobal('fetch', fetchMock);
+
+    const result = await fetchAnthropicModels(baseUrl, 'credential-sentinel');
+
+    expect(result.models).toEqual([]);
+    expect(result.error).toMatch(/HTTPS|URL/i);
+    expect(fetchMock).not.toHaveBeenCalled();
+  });
+
+  it('rejects an invalid Anthropic add URL before the DNS-validating guard', async () => {
+    const result = await addCustomEndpointProvider({
+      ...endpointInput,
+      kind: 'anthropic',
+      baseUrl: 'http://local.example/v1',
+    });
+
+    expect(result.added).toBe(false);
+    expect(result.error).toMatch(/HTTPS|URL/i);
+    expect(validateCustomEndpointUrl).not.toHaveBeenCalled();
+    expect(fetchTemplateModels).not.toHaveBeenCalled();
+  });
+
+  it('strips every configured credential spelling before Anthropic discovery auth', async () => {
+    const fetchMock = vi.fn().mockResolvedValue(new Response(JSON.stringify({
+      data: [{ id: 'local-model', name: 'Local Model' }],
+    }), { status: 200 }));
+    vi.stubGlobal('fetch', fetchMock);
+
+    await fetchAnthropicModels('https://local.example/v1', 'authorized-key', {
+      Authorization: 'Bearer configured-secret',
+      api_key: 'configured-secret',
+      Cookie: 'configured-secret',
+      'X-Auth-Token': 'configured-secret',
+      'X-Client-Secret': 'configured-secret',
+      'X-Credential': 'configured-secret',
+      'X-Plan': 'coding',
+    });
+
+    const requestInit = fetchMock.mock.calls[0]?.[1] as RequestInit;
+    const headers = new Headers(requestInit.headers);
+    expect(headers.get('x-api-key')).toBe('authorized-key');
+    expect(headers.get('x-plan')).toBe('coding');
+    expect(JSON.stringify([...headers])).not.toContain('configured-secret');
   });
 
   it('allocates the provider id from state reloaded after discovery', async () => {

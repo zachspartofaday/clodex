@@ -12,7 +12,6 @@ import {
 import {
   ANTHROPIC_BETA_HEADER,
   isAnthropicBetaHeaderName,
-  isRouteOwnedCredentialHeaderName,
   resolveOutboundBeta,
 } from './anthropic-beta-policy.js';
 import { isCredentialBearingHeader } from './credential-headers.js';
@@ -62,14 +61,14 @@ function routeSuppliesCredential(spec: ProviderModelSpec): boolean {
 /**
  * The configured headers an SDK provider may be constructed with.
  *
- * Drops every spelling of a credential name the route itself will set, so the
- * SDK's own credential can never be appended to a configured one. Ordinary
+ * When the route supplies its credential, drops every configured credential-
+ * bearing header before the SDK adds the authorized envelope. Ordinary
  * configured headers are preserved exactly as given.
  */
 function configuredSdkHeaders(spec: ProviderModelSpec): Record<string, string> | undefined {
   if (!spec.headers || !routeSuppliesCredential(spec)) return spec.headers;
   return Object.fromEntries(
-    Object.entries(spec.headers).filter(([name]) => !isRouteOwnedCredentialHeaderName(name)),
+    Object.entries(spec.headers).filter(([name]) => !isCredentialBearingHeader(name)),
   );
 }
 
