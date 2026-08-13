@@ -26,6 +26,7 @@ restructuring.
 | `.claude/docs/registry-and-server.md` | Changing `src/registry/`, `src/server/`, model or alias resolution. |
 | `CONTRIBUTING.md` | Outside contributors: how to scope a PR. |
 | `RELEASING.md` | Maintainers: how a release is cut and staged. |
+| `docs/fork-maintenance-workflow.md` | Personal-fork branch, stack, and release/install workflow. |
 
 `.agents` is a committed symlink to `.claude`, so harnesses that look for `.agents/` find the same
 skills and docs.
