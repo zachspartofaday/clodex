@@ -1,5 +1,5 @@
 import { describe, it, expect, vi, afterEach } from 'vitest';
-import { validateCustomEndpointUrl } from '../src/registry/url-security.js';
+import { canonicalOpenAiBaseUrl, validateCustomEndpointUrl } from '../src/registry/url-security.js';
 
 describe('validateCustomEndpointUrl', () => {
   afterEach(() => {
@@ -50,5 +50,58 @@ describe('validateCustomEndpointUrl', () => {
     const result = await validateCustomEndpointUrl('http://169.254.169.254/latest/meta-data', { allowInsecureLocal: true });
     expect(result.ok).toBe(false);
     expect(result.error).toMatch(/blocked|restricted/i);
+  });
+});
+
+/*
+ * This guards the moment a stored base URL becomes a live credential
+ * destination, which is a different question from the SSRF guard above: that
+ * one asks whether a HOST may be reached, this one asks whether the URL is
+ * exactly the address it claims to be. Every rejection below is a way to make
+ * a request go somewhere other than where the visible host suggests.
+ */
+describe('canonicalOpenAiBaseUrl', () => {
+  it('canonicalizes ordinary base URLs', () => {
+    expect(canonicalOpenAiBaseUrl('https://api.openai.com/v1')).toBe('https://api.openai.com/v1');
+    expect(canonicalOpenAiBaseUrl('  https://api.openai.com/v1  ')).toBe('https://api.openai.com/v1');
+    // One terminal separator is trimmed; a bare root collapses to an empty path.
+    expect(canonicalOpenAiBaseUrl('https://api.openai.com/v1/')).toBe('https://api.openai.com/v1');
+    expect(canonicalOpenAiBaseUrl('https://api.openai.com/')).toBe('https://api.openai.com');
+    // Host case and default port are normalized by URL parsing.
+    expect(canonicalOpenAiBaseUrl('https://API.OpenAI.com:443/v1')).toBe('https://api.openai.com/v1');
+  });
+
+  it('rejects query and fragment delimiters', () => {
+    expect(canonicalOpenAiBaseUrl('https://api.openai.com/v1?x=1')).toBeNull();
+    expect(canonicalOpenAiBaseUrl('https://api.openai.com/v1#frag')).toBeNull();
+    // Rejected on the raw string, so a delimiter anywhere counts - not just one
+    // the URL parser would classify as a query or fragment.
+    expect(canonicalOpenAiBaseUrl('https://api.openai.com/v1/a?b#c')).toBeNull();
+  });
+
+  it('keeps percent-encoded delimiters as ordinary path data', () => {
+    expect(canonicalOpenAiBaseUrl('https://api.openai.com/v1%3Fx')).toBe('https://api.openai.com/v1%3Fx');
+    expect(canonicalOpenAiBaseUrl('https://api.openai.com/v1%23x')).toBe('https://api.openai.com/v1%23x');
+    expect(canonicalOpenAiBaseUrl('https://api.openai.com/v1%40x')).toBe('https://api.openai.com/v1%40x');
+  });
+
+  it('rejects non-http(s) protocols', () => {
+    expect(canonicalOpenAiBaseUrl('ftp://api.openai.com/v1')).toBeNull();
+    expect(canonicalOpenAiBaseUrl('file:///etc/passwd')).toBeNull();
+    expect(canonicalOpenAiBaseUrl('javascript:alert(1)')).toBeNull();
+    expect(canonicalOpenAiBaseUrl('not a url')).toBeNull();
+  });
+
+  it('rejects embedded userinfo, including the empty forms URL parsing erases', () => {
+    expect(canonicalOpenAiBaseUrl('https://user:pass@evil.example/v1')).toBeNull();
+    expect(canonicalOpenAiBaseUrl('https://user@evil.example/v1')).toBeNull();
+    // `new URL` drops these silently, leaving a hostname that looks clean, so the
+    // raw authority is inspected as well.
+    expect(canonicalOpenAiBaseUrl('https://@evil.example/v1')).toBeNull();
+    expect(canonicalOpenAiBaseUrl('https://:@evil.example/v1')).toBeNull();
+  });
+
+  it('rejects two or more terminal separators', () => {
+    expect(canonicalOpenAiBaseUrl('https://api.openai.com/v1//')).toBeNull();
   });
 });

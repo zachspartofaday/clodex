@@ -16,6 +16,7 @@ import {
   resolveOutboundBeta,
 } from './anthropic-beta-policy.js';
 import { isCredentialBearingHeader } from './credential-headers.js';
+import { canonicalOpenAiBaseUrl } from './registry/url-security.js';
 import type { EffortProfile } from './effort-policy.js';
 import {
   transformOpenAiCompatibleRequestBody,
@@ -332,9 +333,23 @@ export async function createLanguageModel(spec: ProviderModelSpec): Promise<Lang
 
   if (npm === '@ai-sdk/openai-compatible') {
     const { createOpenAICompatible } = await import('@ai-sdk/openai-compatible');
+    // This is where a stored base URL becomes the live destination for this
+    // route's credential, so it has to be exactly the address it claims to be.
+    // The add-time SSRF guard cannot stand in for this: registry state reaches
+    // here without passing it (imports, migrations, template defaults, a
+    // hand-edited registry file), and that guard answers a different question —
+    // whether the HOST is reachable, not whether a query, fragment, or userinfo
+    // segment is quietly choosing where the key goes. Fail closed.
+    const canonicalBase = baseURL ? canonicalOpenAiBaseUrl(baseURL) : '';
+    if (canonicalBase === null) {
+      throw new Error(
+        `Provider ${spec.providerId ?? 'openai-compatible'} has an unusable base URL. `
+        + 'It must be an http(s) URL with no query string, fragment, or embedded credentials.',
+      );
+    }
     const options = {
       name: spec.providerId ?? 'openai-compatible',
-      baseURL: baseURL ?? '',
+      baseURL: canonicalBase,
       ...(spec.authType !== 'none' && apiKey.trim() ? { apiKey } : {}),
       ...(spec.authType === 'none' ? { fetch: fetchWithoutCredentialHeaders } : {}),
       ...(sdkHeaders ? { headers: sdkHeaders } : {}),

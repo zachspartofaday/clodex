@@ -146,3 +146,49 @@ export async function validateCustomEndpointUrl(
   const normalizedUrl = `${parsed.protocol}//${parsed.host}${parsed.pathname}`.replace(/\/$/, '');
   return { ok: true, normalizedUrl };
 }
+
+/**
+ * Canonicalize an OpenAI base URL for the exact @ai-sdk/openai and
+ * @ai-sdk/openai-compatible packages. Returns null (fail closed) when the URL
+ * carries a literal query/fragment delimiter, is not http:/https:, embeds
+ * userinfo, or has two or more terminal separators. Percent-encoded
+ * delimiters (%3F, %23, %40) stay pathname data. Host and default port are
+ * canonicalized by URL parsing. A bare root ("/") collapses to an empty path.
+ * Pure function — no async or global SSRF behavior change.
+ *
+ * This is separate from `validateCustomEndpointUrl` on purpose. That guard runs
+ * when a URL is ADDED or refreshed and answers "may this host be reached at
+ * all"; this one runs where a stored URL BECOMES a live credential destination
+ * and answers "is this exactly the address it claims to be". Registry state can
+ * reach the factory without ever passing the add-time guard — imports,
+ * migrations, template defaults, or a hand-edited registry file — so the
+ * destination seam cannot assume normalization already happened.
+ */
+export function canonicalOpenAiBaseUrl(rawUrl: string): string | null {
+  const trimmed = rawUrl.trim();
+  const schemeEnd = trimmed.indexOf(':');
+  let rawAuthority = '';
+  if (schemeEnd >= 0) {
+    rawAuthority = trimmed.slice(schemeEnd + 1).replace(/^[\\/]+/, '');
+    const authorityEnd = rawAuthority.search(/[\\/]/);
+    if (authorityEnd >= 0) rawAuthority = rawAuthority.slice(0, authorityEnd);
+  }
+  if (trimmed.includes('?') || trimmed.includes('#')) return null;
+
+  let parsed: URL;
+  try {
+    parsed = new URL(trimmed);
+  } catch {
+    return null;
+  }
+
+  if (parsed.protocol !== 'http:' && parsed.protocol !== 'https:') return null;
+  // URL parsing erases empty userinfo, so inspect the raw authority too.
+  if (rawAuthority.includes('@') || parsed.username || parsed.password) return null;
+
+  let pathname = parsed.pathname;
+  if (pathname.endsWith('/')) pathname = pathname.slice(0, -1);
+  if (pathname.endsWith('/')) return null;
+
+  return `${parsed.protocol}//${parsed.host}${pathname}`;
+}

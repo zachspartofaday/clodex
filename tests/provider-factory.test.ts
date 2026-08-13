@@ -1224,3 +1224,33 @@ describe('Anthropic SDK wire boundary enforces configured betas', () => {
     expect(wire[0]!.url).toBe('https://api.anthropic.com/v1/messages');
   });
 });
+
+/*
+ * The openai-compatible branch passes a stored base URL straight to the SDK as
+ * the address this route's API key is sent to. `canonicalOpenAiBaseUrl` is unit
+ * tested on its own; these pin that the factory actually CONSULTS it, which is
+ * the part that silently regresses if the call is dropped or moved.
+ */
+describe('createLanguageModel openai-compatible destination', () => {
+  const spec = (baseURL: string) => ({
+    npm: '@ai-sdk/openai-compatible',
+    modelId: 'some-model',
+    apiKey: 'sk-test',
+    providerId: 'custom',
+    baseURL,
+  });
+
+  it.each([
+    ['a query string', 'https://api.example.com/v1?to=evil.example'],
+    ['a fragment', 'https://api.example.com/v1#evil'],
+    ['embedded credentials', 'https://user:pass@evil.example/v1'],
+    ['empty userinfo', 'https://@evil.example/v1'],
+    ['a non-http protocol', 'ftp://api.example.com/v1'],
+  ])('refuses to build a model whose base URL carries %s', async (_label, baseURL) => {
+    await expect(createLanguageModel(spec(baseURL) as never)).rejects.toThrow(/unusable base URL/i);
+  });
+
+  it('builds normally for a clean base URL', async () => {
+    await expect(createLanguageModel(spec('https://api.example.com/v1') as never)).resolves.toBeDefined();
+  });
+});
