@@ -895,6 +895,47 @@ describe('generateAnthropicResponse', () => {
 });
 
 describe('streamAnthropicResponse idle timeout', () => {
+  it('lets a productive stream outlive the former fixed total deadline and complete', async () => {
+    vi.useFakeTimers();
+    vi.resetModules();
+    async function* stream() {
+      yield { type: 'start' };
+      // Seven parts at 100s intervals span 700s — past the former 600s fixed
+      // total deadline — while each gap stays inside the 120s idle timeout.
+      for (let i = 0; i < 7; i++) {
+        await new Promise(resolve => setTimeout(resolve, 100_000));
+        yield { type: 'text-delta', text: 'x' };
+      }
+      yield { type: 'finish', finishReason: 'stop' };
+    }
+    const streamText = vi.fn(() => ({ stream: stream() }));
+    const write = vi.fn();
+    vi.doMock('ai', () => ({
+      generateText: vi.fn(),
+      streamText,
+      tool: vi.fn((spec: unknown) => spec),
+      jsonSchema: vi.fn((schema: unknown) => schema),
+    }));
+
+    try {
+      const adapter = await import('../src/sdk-adapter.js');
+      const settled = adapter.streamAnthropicResponse(
+        {} as never,
+        { messages: [] },
+        'test-model',
+        write,
+      ).then(() => undefined, (reason: unknown) => reason);
+
+      await vi.advanceTimersByTimeAsync(700_000);
+      await expect(settled).resolves.toBeUndefined();
+      expect(write).toHaveBeenCalled();
+    } finally {
+      vi.useRealTimers();
+      vi.doUnmock('ai');
+      vi.resetModules();
+    }
+  });
+
   it('passes the configured upstream retry budget to streaming requests', async () => {
     vi.resetModules();
     const previous = process.env['CLODEX_UPSTREAM_MAX_RETRIES'];
@@ -1177,6 +1218,39 @@ describe('writeAnthropicStream', () => {
     await expect(writeAnthropicStream(parts() as any, 'm', () => {})).rejects.toBe(upstreamError);
   });
 
+  it('does not complete truncated tool input when an SDK stream error terminates the response', async () => {
+    const upstreamError = { statusCode: 500, message: 'Upstream stream failed' };
+    let raw = '';
+    async function* parts() {
+      yield { type: 'start' };
+      yield { type: 'tool-input-start', id: 'call_1', toolName: 'Bash' };
+      yield { type: 'tool-input-delta', id: 'call_1', delta: '{"command":"cd /x\\nrg -' };
+      yield { type: 'error', error: upstreamError };
+    }
+
+    await expect(writeAnthropicStream(parts() as any, 'm', chunk => { raw += chunk; }))
+      .rejects.toBe(upstreamError);
+    expect(raw).toContain('"type":"tool_use"');
+    expect(raw).not.toContain('"type":"input_json_delta"');
+    expect(raw).not.toContain('event: content_block_stop');
+  });
+
+  it('completes valid buffered tool input before propagating an SDK stream error', async () => {
+    const upstreamError = { statusCode: 500, message: 'Upstream stream failed' };
+    let raw = '';
+    async function* parts() {
+      yield { type: 'start' };
+      yield { type: 'tool-input-start', id: 'call_1', toolName: 'Bash' };
+      yield { type: 'tool-input-delta', id: 'call_1', delta: '{"command":"pwd"}' };
+      yield { type: 'error', error: upstreamError };
+    }
+
+    await expect(writeAnthropicStream(parts() as any, 'm', chunk => { raw += chunk; }))
+      .rejects.toBe(upstreamError);
+    expect(raw).toContain('"type":"input_json_delta"');
+    expect(raw).toContain('event: content_block_stop');
+  });
+
   it('reports every SDK stream part to the lifecycle observer', async () => {
     const observed: string[] = [];
     async function* parts() {
@@ -1421,6 +1495,24 @@ describe('writeAnthropicStream', () => {
     expect(toolInputFromEvents(events)).toEqual({ path: 'x' });
     // The block must still be closed after the late flush.
     const start = events.find(e => e.event === 'content_block_start')!;
+    expect(events.some(e => e.event === 'content_block_stop' && e.data.index === start.data.index)).toBe(true);
+  });
+
+  it('emits malformed buffered tool input when an error-free stream ends', async () => {
+    const malformed = '{"path":"/repo';
+    const { events } = await collect([
+      { type: 'start' },
+      { type: 'tool-input-start', id: 'call_1', toolName: 'Read' },
+      { type: 'tool-input-delta', id: 'call_1', delta: malformed },
+      { type: 'finish', finishReason: 'stop' },
+    ]);
+    const start = events.find(e => e.event === 'content_block_start')!;
+    expect(events.some(e => (
+      e.event === 'content_block_delta'
+      && e.data.index === start.data.index
+      && e.data.delta.type === 'input_json_delta'
+      && e.data.delta.partial_json === malformed
+    ))).toBe(true);
     expect(events.some(e => e.event === 'content_block_stop' && e.data.index === start.data.index)).toBe(true);
   });
 

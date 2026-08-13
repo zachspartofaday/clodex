@@ -711,7 +711,10 @@ export interface AnthropicStreamObserver {
 }
 
 const SDK_STREAM_IDLE_TIMEOUT_MS = 120_000;
-const SDK_TOTAL_TIMEOUT_MS = 10 * 60_000;
+// Absolute ceiling for a NON-STREAMING provider request, where no output
+// flows and a stalled call is indistinguishable from a slow one. Streaming
+// paths deliberately have no fixed total deadline (see streamAnthropicResponse).
+const SDK_NON_STREAMING_TIMEOUT_MS = 10 * 60_000;
 
 function streamAbortError(signal?: AbortSignal): Error {
   if (signal?.reason instanceof Error) return signal.reason;
@@ -780,6 +783,23 @@ export async function writeAnthropicStream(
     }
     return json;
   };
+  /**
+   * Whether the buffered input for a tool block is a COMPLETE JSON object.
+   * Judged separately from `bufferedToolInput`, which only parses once the
+   * tool NAME is known because that is what sanitation needs — completeness
+   * is knowable without it, and a terminal stream error must decide on
+   * completeness alone.
+   */
+  const bufferedToolInputIsComplete = (id: string): boolean => {
+    const buffered = toolJsonBuffer.get(id);
+    if (!buffered) return false;
+    try {
+      const parsed = JSON.parse(buffered) as unknown;
+      return Boolean(parsed) && typeof parsed === 'object' && !Array.isArray(parsed);
+    } catch {
+      return false;
+    }
+  };
   let openToolId: string | null = null;
   let finishReason = 'end_turn';
   let usage: AnthropicUsage = {
@@ -807,7 +827,7 @@ export async function writeAnthropicStream(
     });
     started = true;
   };
-  const closeOpen = () => {
+  const closeOpen = (mode: 'normal' | 'terminal-error' = 'normal') => {
     if (openType === 'thinking') {
       emit('content_block_delta', {
         type: 'content_block_delta', index: blockIndex,
@@ -816,11 +836,17 @@ export async function writeAnthropicStream(
       pendingThinkingSig = undefined;
     }
     // Stream ended (or moved on) without a tool-call part for this block. Parse
-    // and sanitize complete buffered JSON when possible; malformed or partial
-    // JSON still passes through unchanged so the deltas are not lost.
+    // and sanitize complete buffered JSON when possible; on ordinary closure,
+    // malformed or partial JSON still passes through unchanged.
+    let suppressOpenStop = false;
     if (openType === 'tool' && openToolId !== null && !flushedTools.has(openToolId)) {
+      // A TERMINAL error is different: completing a tool block whose arguments
+      // never finished arriving hands the client a well-formed tool_use built
+      // from truncated JSON, which it will execute. Leave that block unclosed
+      // and let the error below be the stream's outcome.
+      suppressOpenStop = mode === 'terminal-error' && !bufferedToolInputIsComplete(openToolId);
       const json = bufferedToolInput(openToolId);
-      if (json) {
+      if (json && !suppressOpenStop) {
         emit('content_block_delta', {
           type: 'content_block_delta', index: blockIndex,
           delta: { type: 'input_json_delta', partial_json: json },
@@ -828,7 +854,9 @@ export async function writeAnthropicStream(
       }
       flushedTools.add(openToolId);
     }
-    if (openType) emit('content_block_stop', { type: 'content_block_stop', index: blockIndex });
+    if (openType && !suppressOpenStop) {
+      emit('content_block_stop', { type: 'content_block_stop', index: blockIndex });
+    }
     openType = null;
     openToolId = null;
   };
@@ -951,7 +979,7 @@ export async function writeAnthropicStream(
         const errMsg = e?.message || (typeof part.error === 'string' ? part.error : JSON.stringify(e?.data ?? part.error));
         const errorType = anthropicErrorType(upstreamHttpStatus(part.error, errMsg));
         log?.(() => `sdk stream error (${errorType}): ${errMsg}`);
-        closeOpen();
+        closeOpen('terminal-error');
         throw part.error instanceof Error || (part.error && typeof part.error === 'object')
           ? part.error
           : new Error(errMsg);
@@ -988,10 +1016,10 @@ export async function streamAnthropicResponse(
     () => idleAbort.abort(new Error(`no data received from provider for ${Math.round(idleTimeoutMs / 1000)}s`)),
     idleTimeoutMs,
   );
-  const totalTimer = setTimeout(
-    () => idleAbort.abort(new Error(`provider stream exceeded ${Math.round(SDK_TOTAL_TIMEOUT_MS / 1000)}s`)),
-    SDK_TOTAL_TIMEOUT_MS,
-  );
+  // No fixed total deadline on a STREAMING response: a long generation that is
+  // still producing output is healthy, and aborting it at a wall-clock ceiling
+  // discards work the user already waited for. The 120s idle timer above is the
+  // real liveness check — a stalled stream still dies promptly.
   // Do not combine streamText's total/chunk timeout signals here. In AI SDK
   // 7.0.22 that composition retains completed StreamTextResult graphs. Relay
   // owns the timers and explicitly settles its controller after consumption.
@@ -1024,7 +1052,6 @@ export async function streamAnthropicResponse(
   } finally {
     stopForwardingAbort();
     clearTimeout(idleTimer);
-    clearTimeout(totalTimer);
     // Settle the direct Relay-owned signal only after stream consumption. Do not
     // replace this with AbortSignal.any(): source-driven abort leaves Node's
     // dependent composite rooted in gcPersistentSignals on Node 24.
@@ -1061,10 +1088,9 @@ export async function generateAnthropicResponse(
       () => forceAbort.abort(new Error(`no data received from provider for ${Math.round(idleTimeoutMs / 1000)}s`)),
       idleTimeoutMs,
     );
-    const totalTimer = setTimeout(
-      () => forceAbort.abort(new Error(`provider stream exceeded ${Math.round(SDK_TOTAL_TIMEOUT_MS / 1000)}s`)),
-      SDK_TOTAL_TIMEOUT_MS,
-    );
+    // Same reasoning as the streaming path: forceStream is still a stream, and
+    // a productive one must not be cut off at a fixed ceiling. Idle detection
+    // remains.
     // See the streaming path above: Relay owns these timers and explicitly
     // settles its controller when the stream has been fully reduced.
     const r = streamText({
@@ -1111,7 +1137,6 @@ export async function generateAnthropicResponse(
     } finally {
       stopForwardingAbort();
       clearTimeout(idleTimer);
-      clearTimeout(totalTimer);
       // See the streaming path above: settle the Relay-owned signal after the
       // result is fully reduced so Node can release AI SDK's listener graph.
       if (!forceAbort.signal.aborted) forceAbort.abort();
@@ -1124,8 +1149,8 @@ export async function generateAnthropicResponse(
     const generateAbort = new AbortController();
     const stopForwardingAbort = forwardAbortSignal(options?.abortSignal, generateAbort);
     const totalTimer = setTimeout(
-      () => generateAbort.abort(new Error(`provider request exceeded ${Math.round(SDK_TOTAL_TIMEOUT_MS / 1000)}s`)),
-      SDK_TOTAL_TIMEOUT_MS,
+      () => generateAbort.abort(new Error(`provider request exceeded ${Math.round(SDK_NON_STREAMING_TIMEOUT_MS / 1000)}s`)),
+      SDK_NON_STREAMING_TIMEOUT_MS,
     );
     try {
       const r = await generateText({
