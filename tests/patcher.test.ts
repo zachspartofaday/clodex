@@ -31,6 +31,8 @@ import {
   NETWORK_ENV_CONTRACT_VAR,
   networkEnvBaseline,
 } from '../src/network-env.js';
+import { buildHttpProxyRoutes } from '../src/http-proxy/routes.js';
+import type { LocalProvider } from '../src/types.js';
 
 /**
  * The digest a pre-versioning clodex wrote into `patch-state.json`: the bare
@@ -809,8 +811,8 @@ describe('PATCH_TRANSFORMS_VERSION', () => {
       .join('\n');
     const digest = createHash('sha256').update(source).digest('hex');
     expect({ version: PATCH_TRANSFORMS_VERSION, digest }).toEqual({
-      version: 9,
-      digest: '47990fe9c9f4f0d6b33b491e999fd81932ac05bd2c7303b4a06b2e7ce3e93bbf',
+      version: 10,
+      digest: '658787435634d24e9324ad89b7adf7b0ba6b4681f823b78b11e4b428d996548c',
     });
   });
 });
@@ -1025,6 +1027,9 @@ describe('applyClodexPatches input validation', () => {
     expect(() => applyClodexPatches('var x = 1;', {
       'clodex:openai:model': { alias: 'luna', aliases: ['luna'] },
     })).toThrow(/alias "luna" is configured more than once/);
+    expect(() => applyClodexPatches('var x = 1;', {
+      'clodex:openai:model': { aliases: ['10', '10'] },
+    })).toThrow(/alias "10" is configured more than once/);
   });
 
   it('rejects an explicit context on a [1m]-suffixed id (the suffix already forces 1M)', () => {
@@ -1570,6 +1575,188 @@ describe('patch script identity naming', () => {
     },
   };
 
+  it('preserves numeric saved aliases in their explicit order', () => {
+    const out = runPatchScript({
+      'clodex:openai:same-target': { aliases: ['10', '2'] },
+      'clodex:openai:luna': { alias: 'luna' },
+    });
+
+    expect(out).toContain('.enum(["sonnet","opus","haiku","fable","10","2","luna"])');
+    expect(out).toContain(
+      'case"best":{return "opus"}case"10":return "10";case"2":return "2";'
+      + 'case"luna":return "luna";default:return null',
+    );
+    expect(out).toContain(
+      '{value:"10",label:"10",description:"Custom model (clodex:openai:same-target)"},'
+      + '{value:"2",label:"2",description:"Custom model (clodex:openai:same-target)"},'
+      + '{value:"luna",label:"Luna",description:"Custom model (clodex:openai:luna)"}',
+    );
+  });
+
+  const numericOrderConfig: PatchScriptModelConfig = {
+    'clodex:openai:same-target': {
+      aliases: ['10', '2'],
+      context: 111_111,
+      display: 'Same Target',
+      effort: {
+        levels: ['low', 'medium', 'high', 'xhigh', 'max'],
+        defaultLevel: 'high',
+      },
+    },
+    'clodex:openai:luna-target': {
+      alias: 'luna',
+      context: 222_222,
+      display: 'Luna Target',
+      effort: {
+        levels: ['low', 'medium', 'high', 'xhigh', 'max'],
+        defaultLevel: 'high',
+      },
+    },
+    'clodex:openai:100': {
+      context: 333_333,
+      display: 'Numeric Canonical',
+      effort: {
+        levels: ['low', 'medium', 'high', 'xhigh', 'max'],
+        defaultLevel: 'high',
+      },
+    },
+  };
+
+  it('keeps numeric aliases, same-target metadata, and numeric canonical fallback order byte-for-byte', () => {
+    const patched = applyClodexPatches(CLAUDE_FIXTURE, numericOrderConfig);
+    const out = patched.content;
+
+    expect(out).toContain('.enum(["sonnet","opus","haiku","fable","10","2","luna","clodex:openai:100"])');
+    expect(out).toContain(
+      '["sonnet","opus","haiku","fable","opusplan","10","2","luna","clodex:openai:100"]',
+    );
+    expect(out).toContain(
+      'Additional custom models: 10 = Same Target; 2 = Same Target; '
+      + 'luna = Luna Target; clodex:openai:100 = Numeric Canonical.',
+    );
+    expect(out).toContain(
+      'case"best":{return "opus"}case"10":return "10";case"2":return "2";'
+      + 'case"luna":return "luna";default:return null',
+    );
+    expect(out).toContain(
+      'Dlh(e,i,t);[{value:"10",label:"10",description:"Same Target"},'
+      + '{value:"2",label:"2",description:"Same Target"},'
+      + '{value:"luna",label:"Luna",description:"Luna Target"}]'
+      + '.forEach(function(_o){if(!e.some(function(_i){return _i.value===_o.value}))e.push(_o)});',
+    );
+
+    const contextTable = '{"10":111111,"2":111111,"clodex:openai:same-target":111111,'
+      + '"luna":222222,"clodex:openai:luna-target":222222,"clodex:openai:100":333333}';
+    expect(out).toContain('/*ccpatch:ctx*/var _ccw=(' + contextTable + ')');
+
+    const capabilityTable = '{"10":true,"10[1m]":true,"2":true,"2[1m]":true,'
+      + '"clodex:openai:same-target":true,"clodex:openai:same-target[1m]":true,'
+      + '"luna":true,"luna[1m]":true,"clodex:openai:luna-target":true,'
+      + '"clodex:openai:luna-target[1m]":true,"clodex:openai:100":true,"clodex:openai:100[1m]":true}';
+    expect(out).toContain('/*ccpatch:effort*/var _ccv=Object.assign(Object.create(null),'
+      + capabilityTable + ')');
+    expect(out).toContain('/*ccpatch:xhigh-effort*/var _ccv=Object.assign(Object.create(null),'
+      + capabilityTable + ')');
+    expect(out).toContain('/*ccpatch:max-effort*/var _ccv=Object.assign(Object.create(null),'
+      + capabilityTable + ')');
+
+    const defaultsTable = '{"10":"high","10[1m]":"high","2":"high","2[1m]":"high",'
+      + '"clodex:openai:same-target":"high","clodex:openai:same-target[1m]":"high",'
+      + '"luna":"high","luna[1m]":"high","clodex:openai:luna-target":"high",'
+      + '"clodex:openai:luna-target[1m]":"high","clodex:openai:100":"high",'
+      + '"clodex:openai:100[1m]":"high"}';
+    expect(out).toContain('/*ccpatch:default-effort*/var _cce=Object.assign(Object.create(null),'
+      + defaultsTable + ')');
+
+    const proofNames = captureBuiltInPatchProofs(
+      out,
+      numericOrderConfig,
+      patched.results,
+    ).map(proof => proof.name);
+    expect(proofNames.slice(3, 9)).toEqual([
+      'PATCH 6: alias resolver switch (10)',
+      'PATCH 6: alias resolver switch (2)',
+      'PATCH 6: alias resolver switch (luna)',
+      'PATCH 5: model picker options (10)',
+      'PATCH 5: model picker options (2)',
+      'PATCH 5: model picker options (luna)',
+    ]);
+    expect(builtInPatchProofsChanged(
+      out,
+      captureBuiltInPatchProofs(out, numericOrderConfig, patched.results),
+    )).toBe(false);
+  });
+
+  it('does not sort saved aliases while preserving their explicit order', () => {
+    const out = runPatchScript({
+      'clodex:openai:ordered': { aliases: ['2', '10', 'luna'] },
+    });
+    expect(out).toContain('.enum(["sonnet","opus","haiku","fable","2","10","luna"])');
+    expect(out).toContain(
+      'case"best":{return "opus"}case"2":return "2";case"10":return "10";'
+      + 'case"luna":return "luna";default:return null',
+    );
+  });
+
+  it('preserves writer, routing, and freshness-hash alias order', () => {
+    const aliases = [
+      { name: '10', providerId: 'openai', modelId: 'same-target' },
+      { name: '2', providerId: 'openai', modelId: 'same-target' },
+      { name: 'luna', providerId: 'openai', modelId: 'luna-target' },
+    ];
+    const { config } = buildPatchModelConfig(
+      [
+        { providerId: 'openai', modelId: 'same-target' },
+        { providerId: 'openai', modelId: 'luna-target' },
+        { providerId: 'openai', modelId: '100' },
+      ],
+      aliases,
+      () => undefined,
+    );
+    expect(config['clodex:openai:same-target']?.aliases).toEqual(['10', '2']);
+    expect(config['clodex:openai:luna-target']?.aliases).toEqual(['luna']);
+
+    const providers: LocalProvider[] = [{
+      id: 'openai',
+      name: 'OpenAI',
+      apiKey: 'key',
+      models: [
+        {
+          id: 'same-target',
+          upstreamModelId: 'same-target',
+          name: 'Same Target',
+          family: 'test',
+          brand: 'Test',
+          modelFormat: 'openai',
+          npm: '@ai-sdk/openai',
+        },
+        {
+          id: 'luna-target',
+          upstreamModelId: 'luna-target',
+          name: 'Luna Target',
+          family: 'test',
+          brand: 'Test',
+          modelFormat: 'openai',
+          npm: '@ai-sdk/openai',
+        },
+      ],
+    }];
+    const routed = buildHttpProxyRoutes(providers, [
+      { providerId: 'openai', modelId: 'same-target' },
+      { providerId: 'openai', modelId: 'luna-target' },
+    ], aliases);
+    expect(routed.aliases.map(alias => alias.name)).toEqual(['10', '2', 'luna']);
+
+    const reordered = {
+      ...config,
+      'clodex:openai:same-target': {
+        ...config['clodex:openai:same-target']!,
+        aliases: ['2', '10'],
+      },
+    };
+    expect(computePatchConfigHash(reordered)).not.toBe(computePatchConfigHash(config));
+  });
+
   it('injects every same-target alias as a complete native identity', () => {
     const patched = applyClodexPatches(CLAUDE_FIXTURE, multiAliasConfig);
     const out = patched.content;
@@ -1803,6 +1990,78 @@ describe('patch script identity naming', () => {
   it('falls through to the native default for an unconfigured identity', () => {
     expect(executeDefaultEffort(runPatchScript(config), 'unconfigured', 'medium')).toBe('medium');
   });
+
+  if (process.env.REVIEW_BUNDLE_DIR) {
+    for (const version of ['2.1.228', '2.1.229'] as const) {
+      it(`replays the ordered numeric patch against pristine Claude Code ${version}`, () => {
+        const bundlePath = join(process.env.REVIEW_BUNDLE_DIR!, `claude-${version}.js`);
+        expect(existsSync(bundlePath), `missing replay bundle ${bundlePath}`).toBe(true);
+        const pristine = readFileSync(bundlePath, 'utf8');
+        const patched = applyClodexPatches(pristine, numericOrderConfig);
+        const out = patched.content;
+
+        expect(patched.results.every(result => result.status === 'OK')).toBe(true);
+        expect(out).toContain('"10","2","luna","clodex:openai:100"');
+        expect(out).toContain(
+          '{value:"10",label:"10",description:"Same Target"},'
+          + '{value:"2",label:"2",description:"Same Target"},'
+          + '{value:"luna",label:"Luna",description:"Luna Target"}',
+        );
+        expect(out).toContain(
+          'case"10":return "10";case"2":return "2";case"luna":return "luna";',
+        );
+        expect(out).toContain(
+          '/*ccpatch:ctx*/var _ccw=({"10":111111,"2":111111,'
+          + '"clodex:openai:same-target":111111,"luna":222222,'
+          + '"clodex:openai:luna-target":222222,"clodex:openai:100":333333})',
+        );
+
+        const proofNames = captureBuiltInPatchProofs(
+          out,
+          numericOrderConfig,
+          patched.results,
+        ).map(proof => proof.name);
+        expect(proofNames.slice(3, 9)).toEqual([
+          'PATCH 6: alias resolver switch (10)',
+          'PATCH 6: alias resolver switch (2)',
+          'PATCH 6: alias resolver switch (luna)',
+          'PATCH 5: model picker options (10)',
+          'PATCH 5: model picker options (2)',
+          'PATCH 5: model picker options (luna)',
+        ]);
+        expect(builtInPatchProofsChanged(
+          out,
+          captureBuiltInPatchProofs(out, numericOrderConfig, patched.results),
+        )).toBe(false);
+
+        const executable = out.replace(/^#![^\n]*\n/, '');
+        expect(() => new Function(executable)).not.toThrow();
+        const resolverNeedle = 'case"10":return "10";case"2":return "2";'
+          + 'case"luna":return "luna";';
+        const resolverNeedleIndex = out.indexOf(resolverNeedle);
+        expect(resolverNeedleIndex).toBeGreaterThan(0);
+        const resolverStart = out.lastIndexOf('function ', resolverNeedleIndex);
+        const resolverEnd = out.indexOf('default:return null}}', resolverNeedleIndex);
+        expect(resolverStart).toBeGreaterThanOrEqual(0);
+        expect(resolverEnd).toBeGreaterThan(resolverNeedleIndex);
+        const resolverSource = out.slice(resolverStart, resolverEnd + 'default:return null}}'.length);
+        const resolverName = resolverSource.match(/^function ([A-Za-z_$][\w$]*)/)?.[1];
+        const resolverDependency = resolverSource.match(/\{let [A-Za-z_$][\w$]*=([A-Za-z_$][\w$]*)\(\);/)?.[1];
+        expect(resolverName).toBeDefined();
+        expect(resolverDependency).toBeDefined();
+        const resolver = new Function(
+          resolverDependency!,
+          `${resolverSource};return ${resolverName};`,
+        )(() => 'native') as unknown as ((model: string) => string | null);
+        expect(resolver('10')).toBe('10');
+        expect(resolver('2')).toBe('2');
+        expect(resolver('luna')).toBe('luna');
+
+        const rerun = applyClodexPatches(out, numericOrderConfig);
+        expect(rerun.content).toBe(out);
+      });
+    }
+  }
 
   // Claude Code 2.1.228 hoisted the settings-colour env into its own declarator
   // inside the child builder's `let` statement, between the first
@@ -2268,6 +2527,67 @@ describe('patch script identity naming', () => {
     expect(rerun.content).toBe(out);
     expect(rerun.results.find(result => result.name === 'PATCH 6: alias resolver switch')?.status).toBe('SKIP');
     expect(rerun.results.find(result => result.name === 'PATCH 5: model picker options')?.status).toBe('SKIP');
+  });
+
+  it('tops up numeric PATCH 5/6 suffixes in ordered-subset order and is byte-idempotent', () => {
+    const config = {
+      'clodex:test:same-target': { aliases: ['10', '2'], display: 'Same Target' },
+      'clodex:test:luna': { alias: 'luna', display: 'Luna' },
+    };
+    const existingResolverSuffix = 'case"2":return "2";';
+    const existingPickerSuffix = '[{value:"2",label:"2",description:"Same Target"}]'
+      + '.forEach(function(_o){if(!e.some(function(_i){return _i.value===_o.value}))e.push(_o)});';
+    const source = CLAUDE_FIXTURE
+      .replace(
+        'case"best":{return "opus"}default:return null',
+        'case"best":{return "opus"}' + existingResolverSuffix + 'default:return null',
+      )
+      .replace('Dlh(e,i,t);return e}', 'Dlh(e,i,t);' + existingPickerSuffix + 'return e}');
+
+    const first = applyClodexPatches(source, config);
+    expect(first.content).toContain(
+      'case"best":{return "opus"}case"10":return "10";case"luna":return "luna";'
+      + existingResolverSuffix + 'default:return null',
+    );
+    expect(first.content).toContain(
+      '[{value:"10",label:"10",description:"Same Target"},'
+      + '{value:"luna",label:"Luna",description:"Luna"}]'
+      + '.forEach(function(_o){if(!e.some(function(_i){return _i.value===_o.value}))e.push(_o)});'
+      + existingPickerSuffix,
+    );
+
+    const rerun = applyClodexPatches(first.content, config);
+    expect(rerun.content).toBe(first.content);
+    expect(rerun.results.find(result => result.name === 'PATCH 6: alias resolver switch')?.status)
+      .toBe('SKIP');
+    expect(rerun.results.find(result => result.name === 'PATCH 5: model picker options')?.status)
+      .toBe('SKIP');
+  });
+
+  it('rejects a wrong numeric self-map and reports wrong numeric picker metadata as optional FAIL', () => {
+    const config = {
+      'clodex:test:same-target': { aliases: ['10', '2'], display: 'Same Target' },
+    };
+    const wrongResolver = CLAUDE_FIXTURE.replace(
+      'case"best":{return "opus"}default:return null',
+      'case"best":{return "opus"}case"10":return "wrong";default:return null',
+    );
+    expect(() => applyClodexPatches(wrongResolver, config)).toThrowError(PatchApplyError);
+
+    const wrongEntry = '{value:"10",label:"Wrong",description:"Same Target"}';
+    const wrongPicker = '[' + wrongEntry
+      + '].forEach(function(_o){if(!e.some(function(_i){return _i.value===_o.value}))e.push(_o)});';
+    const result = applyClodexPatches(
+      CLAUDE_FIXTURE.replace('Dlh(e,i,t);return e}', 'Dlh(e,i,t);' + wrongPicker + 'return e}'),
+      config,
+    );
+    expect(result.results.find(entry => entry.name === 'PATCH 5: model picker options')).toEqual({
+      status: 'FAIL',
+      name: 'PATCH 5: model picker options',
+      extra: 'invalid target-owned picker entries',
+    });
+    expect(result.content).toContain(wrongPicker);
+    expect(result.content).not.toContain('{value:"10",label:"10",description:"Same Target"}');
   });
 
   it('keeps PATCH 5 and PATCH 6 independent when either site has drifted', () => {

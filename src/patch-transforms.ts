@@ -40,7 +40,7 @@ import {
  * hash of the transform inputs to force that decision to be made rather than
  * forgotten.
  */
-export const PATCH_TRANSFORMS_VERSION = 9;
+export const PATCH_TRANSFORMS_VERSION = 10;
 
 export interface PatchScriptModelEntry {
   /** Ordered native identities for this model, in saved alias order. */
@@ -133,10 +133,12 @@ export function formatPatchSiteLine(result: PatchSiteResult): string {
 export function applyClodexPatches(source: string, config: PatchScriptModelConfig): ApplyPatchesOutcome {
   let js = source;
   const MODEL_CONFIG = config;
+  const MODEL_ENTRIES = Object.entries(MODEL_CONFIG);
 
   // ---- derive helpers ------------------------------------------------------
   // alias -> model id (only for entries that define aliases)
   const ALIAS_TO_ID: Record<string, string> = Object.create(null);
+  const ALIASES: string[] = [];
   // The names Claude Code knows a model by: every alias when it has any, else
   // its canonical id. These values are used for the Agent-tool enum, the
   // known-alias validator, the /model picker value, and the context-window table,
@@ -147,15 +149,18 @@ export function applyClodexPatches(source: string, config: PatchScriptModelConfi
   const DISPLAY_BY_IDENTITY: Record<string, string> = Object.create(null);
   // lowercased alias AND id -> context-window tokens (only for models that set it)
   const CONTEXT_BY_KEY: Record<string, number> = Object.create(null);
+  const CONTEXT_KEYS: string[] = [];
   // lowercased alias AND id for every configured model. Capability verdicts
   // must distinguish configured-false from an unknown identity that may use
   // the native fallback.
   const CONFIGURED_CAPABILITY_KEYS = new Set<string>();
+  const CAPABILITY_KEYS: string[] = [];
   // lowercased alias AND id -> effort metadata for Claude Code's capability gates.
   const EFFORT_BY_KEY = Object.create(null) as Record<
     string,
     PatchScriptModelEntry['effort']
   >;
+  const EFFORT_KEYS: string[] = [];
 
   const report: PatchSiteResult[] = [];
   const fail = (message: string): never => {
@@ -168,11 +173,21 @@ export function applyClodexPatches(source: string, config: PatchScriptModelConfi
   };
   const registerCapabilityKeys = (value: string): void => {
     for (const key of capabilityKeys(value)) {
+      if (!CONFIGURED_CAPABILITY_KEYS.has(key)) CAPABILITY_KEYS.push(key);
       CONFIGURED_CAPABILITY_KEYS.add(key);
     }
   };
+  const registerOrderedValue = <T>(
+    keys: string[],
+    values: Record<string, T>,
+    key: string,
+    value: T,
+  ): void => {
+    if (!Object.prototype.hasOwnProperty.call(values, key)) keys.push(key);
+    values[key] = value;
+  };
 
-  for (const [id, value] of Object.entries(MODEL_CONFIG)) {
+  for (const [id, value] of MODEL_ENTRIES) {
     const spec: PatchScriptModelEntry = value && typeof value === 'object' ? value : { alias: value as unknown as string };
     if (spec.aliases !== undefined && !Array.isArray(spec.aliases)) {
       fail('clodex patch: aliases for "' + id + '" must be an array');
@@ -181,13 +196,14 @@ export function applyClodexPatches(source: string, config: PatchScriptModelConfi
       ...(spec.alias === undefined ? [] : [spec.alias]),
       ...(spec.aliases ?? []),
     ];
-    const aliases: string[] = [];
     for (const raw of rawAliases) {
       if (typeof raw !== 'string') {
         fail('clodex patch: alias for "' + id + '" must be a string');
       }
-      const rawAlias = (raw as string).trim();
-      const a = rawAlias.toLowerCase();
+    }
+    const aliases = patchEntryAliases(spec);
+    for (const [index, a] of aliases.entries()) {
+      const raw = rawAliases[index] as string;
       if (!/^[a-z0-9][a-z0-9._-]*(\[1m\])?$/.test(a)) {
         fail('clodex patch: alias "' + raw + '" is not a safe lowercase alias');
       }
@@ -200,7 +216,7 @@ export function applyClodexPatches(source: string, config: PatchScriptModelConfi
         fail('clodex patch: alias "' + a + '" is configured more than once');
       }
       ALIAS_TO_ID[a] = String(id);
-      aliases.push(a);
+      ALIASES.push(a);
       IDENTITIES.push(a);
       if (spec.display) DISPLAY_BY_IDENTITY[a] = String(spec.display);
     }
@@ -226,8 +242,15 @@ export function applyClodexPatches(source: string, config: PatchScriptModelConfi
           'clodex patch: "' + id + '" sets context but keeps the [1m] suffix — drop the suffix from the id and every alias'
         );
       }
-      for (const alias of aliases) CONTEXT_BY_KEY[alias] = n;
-      CONTEXT_BY_KEY[String(id).trim().toLowerCase()] = n;
+      for (const alias of aliases) {
+        registerOrderedValue(CONTEXT_KEYS, CONTEXT_BY_KEY, alias, n);
+      }
+      registerOrderedValue(
+        CONTEXT_KEYS,
+        CONTEXT_BY_KEY,
+        String(id).trim().toLowerCase(),
+        n,
+      );
     }
 
     if (spec.effort) {
@@ -239,17 +262,15 @@ export function applyClodexPatches(source: string, config: PatchScriptModelConfi
       }
       for (const alias of aliases) {
         for (const key of capabilityKeys(alias)) {
-          EFFORT_BY_KEY[key] = effort;
+          registerOrderedValue(EFFORT_KEYS, EFFORT_BY_KEY, key, effort);
         }
       }
       for (const key of capabilityKeys(String(id))) {
-        EFFORT_BY_KEY[key] = effort;
+        registerOrderedValue(EFFORT_KEYS, EFFORT_BY_KEY, key, effort);
       }
     }
   }
-  const ALIASES = Object.keys(ALIAS_TO_ID);
-  const MODELS = Object.keys(MODEL_CONFIG);
-  if (MODELS.length === 0) fail('clodex patch: MODEL_CONFIG is empty');
+  if (MODEL_ENTRIES.length === 0) fail('clodex patch: MODEL_CONFIG is empty');
 
   /** Picker/description label for an identity; falls back to the old wording. */
   function displayFor(identity: string, fallbackId: string): string {
@@ -258,6 +279,8 @@ export function applyClodexPatches(source: string, config: PatchScriptModelConfi
 
   const reEsc = (s: string) => s.replace(/[.*+?^$\{\}()|[\]\\]/g, '\\$&');
   const q = (s: string) => JSON.stringify(s); // safe JS string literal
+  const orderedRecordLiteral = <T>(keys: string[], values: Record<string, T>): string =>
+    '{' + keys.map(key => q(key) + ':' + JSON.stringify(values[key])).join(',') + '}';
 
   // ---- reporting -----------------------------------------------------------
   function log(status: PatchSiteStatus, name: string, extra?: string) {
@@ -506,10 +529,10 @@ export function applyClodexPatches(source: string, config: PatchScriptModelConfi
   // Anchor: the resolver's exact body shape. Identifiers are wildcarded (they
   // churn per build); the (e,t) arity + 3-statement shape matches once.
   // ---------------------------------------------------------------------------
-  if (Object.keys(CONTEXT_BY_KEY).length) {
+  if (CONTEXT_KEYS.length) {
     const MARKER = '/*ccpatch:ctx*/';
     const SNIPPET =
-      MARKER + 'var _ccw=(' + JSON.stringify(CONTEXT_BY_KEY) + ')[String(e||"").trim().toLowerCase()];if(_ccw!==void 0)return _ccw;';
+      MARKER + 'var _ccw=(' + orderedRecordLiteral(CONTEXT_KEYS, CONTEXT_BY_KEY) + ')[String(e||"").trim().toLowerCase()];if(_ccw!==void 0)return _ccw;';
 
     if (js.includes(MARKER)) {
       // Re-patching an already-patched binary: refresh the baked table in place
@@ -544,24 +567,20 @@ export function applyClodexPatches(source: string, config: PatchScriptModelConfi
     name: string,
     anchor: RegExp,
   ): void {
-    const verdicts = Object.fromEntries(
-      [...CONFIGURED_CAPABILITY_KEYS].map(key => {
-        const effort = EFFORT_BY_KEY[key];
-        return [
-          key,
-          effort !== undefined && (
-            capability === 'effort'
-            || effort.levels.includes(capability === 'xhigh_effort' ? 'xhigh' : 'max')
-          ),
-        ];
-      }),
-    );
+    const verdicts: Record<string, boolean> = Object.create(null);
+    for (const key of CAPABILITY_KEYS) {
+      const effort = EFFORT_BY_KEY[key];
+      verdicts[key] = effort !== undefined && (
+        capability === 'effort'
+        || effort.levels.includes(capability === 'xhigh_effort' ? 'xhigh' : 'max')
+      );
+    }
     const hasMarker = js.includes(marker);
-    if (Object.keys(verdicts).length === 0 && !hasMarker) return;
+    if (CAPABILITY_KEYS.length === 0 && !hasMarker) return;
 
     const snippet = (arg: string) =>
       marker
-      + 'var _ccv=Object.assign(Object.create(null),' + JSON.stringify(verdicts)
+      + 'var _ccv=Object.assign(Object.create(null),' + orderedRecordLiteral(CAPABILITY_KEYS, verdicts)
       + ')[String(' + arg + '||"").trim().toLowerCase()];'
       + 'if(_ccv!==void 0)return _ccv;';
 
@@ -612,13 +631,12 @@ export function applyClodexPatches(source: string, config: PatchScriptModelConfi
   // PATCH 9 — per-model default effort.
   // ---------------------------------------------------------------------------
   const DEFAULT_EFFORT_MARKER = '/*ccpatch:default-effort*/';
-  const defaults = Object.fromEntries(
-    Object.entries(EFFORT_BY_KEY).map(([key, effort]) => [key, effort!.defaultLevel]),
-  );
-  if (Object.keys(defaults).length || js.includes(DEFAULT_EFFORT_MARKER)) {
+  const defaults: Record<string, string> = Object.create(null);
+  for (const key of EFFORT_KEYS) defaults[key] = EFFORT_BY_KEY[key]!.defaultLevel;
+  if (EFFORT_KEYS.length || js.includes(DEFAULT_EFFORT_MARKER)) {
     const snippet = (arg: string) =>
       DEFAULT_EFFORT_MARKER
-      + 'var _cce=Object.assign(Object.create(null),' + JSON.stringify(defaults)
+      + 'var _cce=Object.assign(Object.create(null),' + orderedRecordLiteral(EFFORT_KEYS, defaults)
       + ')[String(' + arg + '||"").trim().toLowerCase()];'
       + 'if(_cce!==void 0)return _cce;';
 
