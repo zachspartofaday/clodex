@@ -2,3 +2,5 @@
 # Supply-chain guard: refuse to install any direct or transitive dependency
 # version published less than 10 days ago (value is in MINUTES: 10d = 14400).
 minimumReleaseAge: 14400
+patchedDependencies:
+  tweakcc@4.3.0: patches/tweakcc@4.3.0.patch
