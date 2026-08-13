@@ -70,6 +70,9 @@ const PRISTINE_BUNDLE = [
   'var EM2={...To&&{supportsEffort:!0,supportedEffortLevels:PM.filter((Fo)=>{if(Fo==="max"&&!eqe(Et))return!1;if(Fo==="xhigh"&&!I_e(Et))return!1;return!0})}};',
   'function nEu(e,t){let r=e;if(typeof r==="string"&&a_e(r))r=IDe(r,t);if(r==="max"&&!eqe(t))r="high";if(r==="xhigh"&&!I_e(t))r="high";return r}',
   'function ait(e){return ww(lo(e))?.default_effort??"high"}',
+  // PATCH 10 is required too, so the fixture carries the child-env builder.
+  'function cwdOf(){let p=process.env.PWD;return p}',
+  'function childEnv(){let e=extra(),t=Object.keys(e).length>0,n=Object.keys(e).length>0,s=flag(process.env.CLAUDE_CODE_REMOTE)?remote():{};let o=[process.env.CLAUDE_CODE_OAUTH_TOKEN,process.env.CLAUDE_CODE_SUBSCRIPTION_TYPE,process.env.CLAUDE_BG_PTY_AUTH,"OTEL_",process.env.CLAUDE_CODE_OTEL_DIAG_STDERR],u=["CLAUDE_CODE_OAUTH_TOKEN"];if(!t&&!n&&!o[0])return process.env;let v={...process.env,...e,...s};for(let k of u)delete v[k],delete v[`INPUT_${k}`];return v}function mcpAllow(){let e=process.env.CLAUDE_CODE_MCP_ALLOWLIST_ENV;return e}',
 ].join('\n');
 
 let home: string;

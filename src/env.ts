@@ -47,6 +47,7 @@ import {
 } from './registry/lock.js';
 import type { BuiltinAliasName, ConflictInfo } from './types.js';
 import { removeAnthropicProxyBypass } from './wrapper-env.js';
+import { networkEnvBaseline, recordNetworkEnvMutation } from './network-env.js';
 
 export function detectConflicts(): ConflictInfo[] {
   return CONFLICTING_ENV_VARS.filter(name => process.env[name] !== undefined).map(name => ({
@@ -113,14 +114,23 @@ export function buildChildEnv(
  * Child env for transparent HTTP-proxy mode. Keep normal Anthropic credentials
  * intact, remove only endpoint modes that would bypass api.anthropic.com, and
  * trust the per-user clodex CA for this child process.
+ *
+ * The network values this repoints are also inherited by every command Claude
+ * Code spawns, so the child carries a compare-before-revert snapshot of the
+ * external baseline (`src/network-env.ts`) that PATCH 10 consumes.
  */
 export function buildHttpProxyChildEnv(
   proxyPort: number,
   caCertPath: string,
   builtinOverrides?: Partial<Record<BuiltinAliasName, string>>,
+  baseEnv: NodeJS.ProcessEnv = process.env,
 ): NodeJS.ProcessEnv {
-  const env: NodeJS.ProcessEnv = { ...process.env };
-  const explicit: NodeJS.ProcessEnv = { ...process.env };
+  // Recover the external network baseline first: a nested launch inherits the
+  // outer clodex injection, and recording THAT as the original would make child
+  // commands "revert" to a listener rather than to the user's own settings.
+  const baseline = networkEnvBaseline(baseEnv);
+  const env: NodeJS.ProcessEnv = { ...baseline };
+  const explicit: NodeJS.ProcessEnv = { ...baseEnv };
   for (const name of CONFLICTING_ENV_VARS) {
     if (name === 'ANTHROPIC_API_KEY' || name === 'ANTHROPIC_AUTH_TOKEN' || name === 'ANTHROPIC_MODEL') continue;
     delete env[name];
@@ -136,6 +146,7 @@ export function buildHttpProxyChildEnv(
   env[SESSION_PROXY_ENV] = `${proxyPort}:${process.pid}`;
   env['NODE_EXTRA_CA_CERTS'] = caCertPath;
   removeAnthropicProxyBypass(env);
+  recordNetworkEnvMutation(baseline, env);
   return env;
 }
 

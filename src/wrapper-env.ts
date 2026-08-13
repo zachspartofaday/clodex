@@ -8,8 +8,12 @@
 import type { ServerRuntimeState } from './server-runtime.js';
 import type { BuiltinAliasName } from './types.js';
 import { applyBuiltinModelOverridesWithProvenance, clearInheritedBuiltinOverrides, insideSessionProxy, SESSION_PROXY_ENV } from './builtin-alias-env.js';
+import {
+  networkEnvBaseline,
+  PROXY_ENV_VARS,
+  recordNetworkEnvMutation,
+} from './network-env.js';
 
-const PROXY_ENV_VARS = ['HTTPS_PROXY', 'HTTP_PROXY', 'https_proxy', 'http_proxy'] as const;
 export const REQUIRE_SERVER_ENV = 'CLODEX_REQUIRE_SERVER';
 
 export function removeAnthropicProxyBypass(env: NodeJS.ProcessEnv): void {
@@ -67,7 +71,6 @@ export function computeWrapperEnv(
   builtinOverrides?: Partial<Record<BuiltinAliasName, string>>,
   opts?: { isAlive?: (pid: number) => boolean; sessionProxyActive?: boolean },
 ): NodeJS.ProcessEnv {
-  const env: NodeJS.ProcessEnv = { ...baseEnv };
   // A verified private session is the parent Claude process's routing
   // authority. It must outrank every independently discovered standalone
   // server, or a background agent can silently switch profile snapshots and
@@ -77,19 +80,35 @@ export function computeWrapperEnv(
   // fallback for this pure helper.
   const sessionProxyActive = opts?.sessionProxyActive
     ?? insideSessionProxy(baseEnv, opts?.isAlive ?? sessionProxyOwnerAlive);
-  if (sessionProxyActive) return env;
+  // The session's own contract must pass through untouched: the nested claude is
+  // still bridged by the SAME listener, so its child commands still need the
+  // outer snapshot to revert against.
+  if (sessionProxyActive) return { ...baseEnv };
 
-  // Every remaining path repoints or drops the routing this marker described.
-  // That includes the proxy vars themselves: a dead session's
-  // HTTP(S)_PROXY would strand claude on a port nobody is listening on,
-  // defeating the no-server fallback. Only vars that still point at the
-  // MARKED session port are cleared — anything else (a corp proxy, a
-  // user-set value) is not ours to touch.
+  // Every remaining path repoints or drops the routing the outer launch
+  // installed, so recover the external network baseline first: a value that
+  // still equals a prior clodex injection is ours to hand back, and anything an
+  // operator or an intervening layer changed since stays authoritative. The
+  // inherited contract dies with it — either this launch writes a fresh one for
+  // the routing it installs, or claude runs unbridged and its child commands
+  // should see the plain external environment.
+  const baseline = networkEnvBaseline(baseEnv);
+  const env: NodeJS.ProcessEnv = { ...baseline };
+
+  // The same is true of the routing this marker described, and the marker path
+  // stays as the fallback for a value the baseline could not hand back (a dead
+  // session that published no contract). A dead session's HTTP(S)_PROXY would
+  // strand claude on a port nobody is listening on, defeating the no-server
+  // fallback. Only vars that still point at the MARKED session port are cleared
+  // — anything else (a corp proxy, a user-set value) is not ours to touch.
   const marker = /^(\d+)(?::\d+)?$/.exec((baseEnv[SESSION_PROXY_ENV] ?? '').trim());
   if (marker) {
     const marked = `http://127.0.0.1:${marker[1]}`;
     for (const name of PROXY_ENV_VARS) {
-      if (env[name] === marked) delete env[name];
+      if (env[name] === marked) {
+        delete env[name];
+        delete baseline[name];
+      }
     }
   }
   delete env[SESSION_PROXY_ENV];
@@ -110,6 +129,7 @@ export function computeWrapperEnv(
     // set explicitly still wins.
     applyBuiltinModelOverridesWithProvenance(env, builtinOverrides, baseEnv);
     removeAnthropicProxyBypass(env);
+    recordNetworkEnvMutation(baseline, env);
     return env;
   }
 
@@ -117,5 +137,6 @@ export function computeWrapperEnv(
   for (const name of PROXY_ENV_VARS) delete env[name];
   env['ANTHROPIC_BASE_URL'] = `http://127.0.0.1:${state.port}/anthropic`;
   env['ANTHROPIC_API_KEY'] = LOCAL_GATEWAY_API_KEY;
+  recordNetworkEnvMutation(baseline, env);
   return env;
 }
