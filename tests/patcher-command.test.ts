@@ -26,6 +26,15 @@ import { tmpdir } from 'node:os';
 import { basename, join } from 'node:path';
 import { runLaunchPatchCheck, runPatchCommand, readPatchManifest } from '../src/patcher.js';
 
+vi.mock('@clack/prompts', async () => {
+  const actual = await vi.importActual<typeof import('@clack/prompts')>('@clack/prompts');
+  return {
+    ...actual,
+    confirm: vi.fn(),
+    isCancel: vi.fn(actual.isCancel),
+  };
+});
+
 const hoisted = vi.hoisted(() => ({
   sentinel: '\n#__CLAUDE_BUNDLE__\n',
   /** Paths passed to readContent, so tests can pin how MANY extractions ran. */
@@ -190,6 +199,11 @@ const CAPACITY_SKIPPED_FAVORITE = {
   modelId: 'gpt-5.6-sol',
 };
 
+const UNPATCHED_WARNING = 'Claude Code is unpatched: aliases, favorites, context windows/auto-compaction, '
+  + 'and effort metadata are not patched. Repair with `clodex patch`; rollback with `clodex patch --restore`.';
+const STALE_WARNING = 'Claude Code has a stale patch: aliases, favorites, context windows/auto-compaction, '
+  + 'and effort metadata are not patched. Repair with `clodex patch`; rollback with `clodex patch --restore`.';
+
 function saveDroppedCapacityWindow(): void {
   mkdirSync(clodexHome, { recursive: true });
   writeFileSync(join(clodexHome, 'config.json'), JSON.stringify({
@@ -228,6 +242,8 @@ beforeEach(() => {
 
   hoisted.readContentCalls.length = 0;
   logs = [];
+  vi.mocked(p.confirm).mockReset();
+  vi.mocked(p.isCancel).mockReset().mockReturnValue(false);
   for (const level of ['info', 'warn', 'error', 'success', 'step', 'message'] as const) {
     vi.spyOn(p.log, level).mockImplementation((message?: unknown) => {
       logs.push(`${level}: ${String(message)}`);
@@ -237,6 +253,8 @@ beforeEach(() => {
 
 afterEach(() => {
   vi.restoreAllMocks();
+  Reflect.deleteProperty(process.stdin, 'isTTY');
+  Reflect.deleteProperty(process.stdout, 'isTTY');
   delete process.env.TWEAKCC_CONFIG_DIR;
   delete process.env.CLODEX_CLAUDE_PATH;
   delete process.env.TWEAKCC_CC_INSTALLATION_PATH;
@@ -326,6 +344,8 @@ describe('runPatchCommand version resolution', () => {
     expect(logs.join('\n')).toContain('saved favorite target is no longer exposed');
     expect(logs.join('\n')).toContain('clodex:opencode-go:gpt-5.6-luna');
     expect(logs.join('\n')).toContain('clodex patch --restore');
+    expect(logs.join('\n')).not.toContain('claude binary is not patched');
+    expect(logs.join('\n')).not.toContain('claude binary is stale-patched');
     expect(readPatchManifest()).toBeNull();
   });
 
@@ -342,6 +362,8 @@ describe('runPatchCommand version resolution', () => {
     );
     expect(output).toContain('The first 20 saved positions retain priority');
     expect(output).toContain('No exposed favorite models remain to patch');
+    expect(output).not.toContain('claude binary is not patched');
+    expect(output).not.toContain('claude binary is stale-patched');
     expect(readPatchManifest()).toBeNull();
   });
 
@@ -360,6 +382,8 @@ describe('runPatchCommand version resolution', () => {
     expect(output).toContain('a previous clodex patch is recorded');
     expect(output).toContain('if Claude Code still shows an old removed entry');
     expect(output).toContain('clodex patch --restore');
+    expect(output).not.toContain('claude binary is not patched');
+    expect(output).not.toContain('claude binary is stale-patched');
     expect(output).not.toContain('is still installed');
     expect(readFileSync(real)).toEqual(patchedBytes);
     expect(readPatchManifest()).not.toBeNull();
@@ -382,6 +406,8 @@ describe('runPatchCommand version resolution', () => {
     );
     expect(output).toContain('The first 20 saved positions retain priority');
     expect(output).toContain('a previous clodex patch is recorded');
+    expect(output).not.toContain('claude binary is not patched');
+    expect(output).not.toContain('claude binary is stale-patched');
     expect(readFileSync(real)).toEqual(patchedBytes);
     expect(readPatchManifest()).toEqual(priorManifest);
   });
@@ -414,6 +440,176 @@ describe('runPatchCommand version resolution', () => {
     expect(output).not.toContain('remains in the old Claude Code patch');
     expect(readFileSync(real)).toEqual(patchedBytes);
     expect(readPatchManifest()?.configHash).toBe(priorHash);
+  });
+});
+
+describe('runLaunchPatchCheck degraded warnings', () => {
+  it('reports the exact unpatched degradation once without prompting or writing on non-TTY', async () => {
+    const real = installClaude('2.1.220');
+    const before = readFileSync(real);
+    const stderr = vi.spyOn(console, 'error').mockImplementation(() => {});
+    const confirm = vi.mocked(p.confirm);
+
+    await expect(runLaunchPatchCheck({})).resolves.toBeUndefined();
+
+    expect(stderr).toHaveBeenCalledTimes(1);
+    expect(stderr.mock.calls[0]?.[0]).toBe(`clodex: ${UNPATCHED_WARNING}`);
+    expect(confirm).not.toHaveBeenCalled();
+    expect(readFileSync(real)).toEqual(before);
+    expect(readPatchManifest()).toBeNull();
+  });
+
+  it('keeps dry-run non-mutating and non-prompting even on a TTY', async () => {
+    const real = installClaude('2.1.220');
+    const before = readFileSync(real);
+    const stderr = vi.spyOn(console, 'error').mockImplementation(() => {});
+    const confirm = vi.mocked(p.confirm);
+    Object.defineProperty(process.stdin, 'isTTY', { configurable: true, value: true });
+    Object.defineProperty(process.stdout, 'isTTY', { configurable: true, value: true });
+
+    await expect(runLaunchPatchCheck({ dryRun: true })).resolves.toBeUndefined();
+
+    expect(stderr).toHaveBeenCalledTimes(1);
+    expect(stderr.mock.calls[0]?.[0]).toBe(`clodex: ${UNPATCHED_WARNING}`);
+    expect(confirm).not.toHaveBeenCalled();
+    expect(readFileSync(real)).toEqual(before);
+    expect(readPatchManifest()).toBeNull();
+  });
+
+  it('reports a stale patch with the exact degradation once without prompting or writing', async () => {
+    const real = installClaude('2.1.220');
+    expect(await runPatchCommand({})).toBe(0);
+    const before = readFileSync(real);
+    writeFileSync(join(clodexHome, 'config.json'), JSON.stringify({
+      favoriteModels: [{ providerId: 'openai-oauth', modelId: 'gpt-5.6-sol' }],
+      modelAliases: [{ name: 'terra', providerId: 'openai-oauth', modelId: 'gpt-5.6-sol' }],
+    }));
+    const stderr = vi.spyOn(console, 'error').mockImplementation(() => {});
+    const confirm = vi.mocked(p.confirm);
+
+    await expect(runLaunchPatchCheck({})).resolves.toBeUndefined();
+
+    expect(stderr).toHaveBeenCalledTimes(1);
+    expect(stderr.mock.calls[0]?.[0]).toBe(`clodex: ${STALE_WARNING}`);
+    expect(confirm).not.toHaveBeenCalled();
+    expect(readFileSync(real)).toEqual(before);
+    expect(readPatchManifest()).not.toBeNull();
+  });
+
+  it('keeps current patch state silent', async () => {
+    installClaude('2.1.220');
+    expect(await runPatchCommand({})).toBe(0);
+    const stderr = vi.spyOn(console, 'error').mockImplementation(() => {});
+    const confirm = vi.mocked(p.confirm);
+
+    await expect(runLaunchPatchCheck({})).resolves.toBeUndefined();
+
+    expect(stderr).not.toHaveBeenCalled();
+    expect(confirm).not.toHaveBeenCalled();
+  });
+
+  it('keeps unpatched agent stdout silent', async () => {
+    installClaude('2.1.220');
+    const stderr = vi.spyOn(console, 'error').mockImplementation(() => {});
+    const confirm = vi.mocked(p.confirm);
+
+    await expect(runLaunchPatchCheck({ agentStdout: true })).resolves.toBeUndefined();
+
+    expect(stderr).not.toHaveBeenCalled();
+    expect(confirm).not.toHaveBeenCalled();
+  });
+
+  it('keeps stale agent stdout silent', async () => {
+    const real = installClaude('2.1.220');
+    expect(await runPatchCommand({})).toBe(0);
+    writeFileSync(join(clodexHome, 'config.json'), JSON.stringify({
+      favoriteModels: [{ providerId: 'openai-oauth', modelId: 'gpt-5.6-sol' }],
+      modelAliases: [{ name: 'terra', providerId: 'openai-oauth', modelId: 'gpt-5.6-sol' }],
+    }));
+    const stderr = vi.spyOn(console, 'error').mockImplementation(() => {});
+    const before = readFileSync(real);
+
+    await expect(runLaunchPatchCheck({ agentStdout: true })).resolves.toBeUndefined();
+
+    expect(stderr).not.toHaveBeenCalled();
+    expect(readFileSync(real)).toEqual(before);
+  });
+
+  it('declines the interactive unpatched offer without patching', async () => {
+    const real = installClaude('2.1.220');
+    const before = readFileSync(real);
+    const stderr = vi.spyOn(console, 'error').mockImplementation(() => {});
+    const confirm = vi.mocked(p.confirm).mockResolvedValue(false);
+    Object.defineProperty(process.stdin, 'isTTY', { configurable: true, value: true });
+    Object.defineProperty(process.stdout, 'isTTY', { configurable: true, value: true });
+
+    await expect(runLaunchPatchCheck({})).resolves.toBeUndefined();
+
+    expect(confirm).toHaveBeenCalledWith({ message: `${UNPATCHED_WARNING} Patch now?`, initialValue: false });
+    expect(stderr).not.toHaveBeenCalled();
+    expect(readFileSync(real)).toEqual(before);
+    expect(readPatchManifest()).toBeNull();
+  });
+
+  it('continues without patching when the interactive offer is canceled', async () => {
+    const real = installClaude('2.1.220');
+    const before = readFileSync(real);
+    const stderr = vi.spyOn(console, 'error').mockImplementation(() => {});
+    const confirm = vi.mocked(p.confirm).mockResolvedValue(false);
+    vi.mocked(p.isCancel).mockReturnValue(true);
+    Object.defineProperty(process.stdin, 'isTTY', { configurable: true, value: true });
+    Object.defineProperty(process.stdout, 'isTTY', { configurable: true, value: true });
+
+    await expect(runLaunchPatchCheck({})).resolves.toBeUndefined();
+
+    expect(confirm).toHaveBeenCalledWith({ message: `${UNPATCHED_WARNING} Patch now?`, initialValue: false });
+    expect(stderr).not.toHaveBeenCalled();
+    expect(readFileSync(real)).toEqual(before);
+    expect(readPatchManifest()).toBeNull();
+  });
+
+  it('patches only after an interactive yes answer', async () => {
+    const real = installClaude('2.1.220');
+    const stderr = vi.spyOn(console, 'error').mockImplementation(() => {});
+    const confirm = vi.mocked(p.confirm).mockResolvedValue(true);
+    Object.defineProperty(process.stdin, 'isTTY', { configurable: true, value: true });
+    Object.defineProperty(process.stdout, 'isTTY', { configurable: true, value: true });
+
+    await expect(runLaunchPatchCheck({})).resolves.toBeUndefined();
+
+    expect(confirm).toHaveBeenCalledWith({ message: `${UNPATCHED_WARNING} Patch now?`, initialValue: false });
+    expect(stderr).not.toHaveBeenCalled();
+    expect(bundleOf(real)).toContain('"sol"');
+    expect(readPatchManifest()).not.toBeNull();
+  });
+
+  it('keeps a version-read failure silent for agent stdout', async () => {
+    const real = installClaude('2.1.220');
+    writeFileSync(real, 'not an executable at all');
+    const stderr = vi.spyOn(console, 'error').mockImplementation(() => {});
+
+    await expect(runLaunchPatchCheck({ agentStdout: true })).resolves.toBeUndefined();
+
+    expect(stderr).not.toHaveBeenCalled();
+  });
+
+  it('keeps a caught patch-check error nonblocking and silent for agent stdout', async () => {
+    writeFileSync(join(clodexHome, 'config.json'), JSON.stringify({ favoriteModels: 'not-an-array' }));
+    const stderr = vi.spyOn(console, 'error').mockImplementation(() => {});
+
+    await expect(runLaunchPatchCheck({ agentStdout: true })).resolves.toBeUndefined();
+
+    expect(stderr).not.toHaveBeenCalled();
+  });
+
+  it('reports a caught patch-check error without blocking an ordinary launch', async () => {
+    writeFileSync(join(clodexHome, 'config.json'), JSON.stringify({ favoriteModels: 'not-an-array' }));
+    const stderr = vi.spyOn(console, 'error').mockImplementation(() => {});
+
+    await expect(runLaunchPatchCheck({})).resolves.toBeUndefined();
+
+    expect(stderr).toHaveBeenCalledTimes(1);
+    expect(stderr.mock.calls[0]?.[0]).toContain('clodex: patch check skipped');
   });
 });
 
@@ -546,7 +742,7 @@ describe('runPatchCommand local patches', () => {
     const stderr = vi.spyOn(console, 'error').mockImplementation(() => {});
 
     await expect(runLaunchPatchCheck({ dryRun: true })).resolves.toBeUndefined();
-    expect(stderr.mock.calls.join('\n')).toContain('stale-patched');
+    expect(stderr.mock.calls.join('\n')).toContain(`clodex: ${STALE_WARNING}`);
     expect(existsSync(proofPath)).toBe(false);
     expect(bundleOf(real)).toContain('/*clodex-local:first*/');
     expect(bundleOf(real)).not.toContain('/*clodex-local:second*/');
