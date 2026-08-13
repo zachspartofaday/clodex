@@ -86,6 +86,8 @@ interface RequestContext {
   emittedModelData: boolean;
   emittedDownstreamData: boolean;
   transportRetryPending: boolean;
+  /** Retained so a terminal record names the transport failure that led to it. */
+  transportRetrySource?: string;
   outputByIndex: Map<number, OutputAccumulator>;
   outputIndexByItemId: Map<string, number>;
   reasoningPartsByItemId: Map<string, Map<number, ReasoningPartState>>;
@@ -930,6 +932,7 @@ function emitContextDiagnostic(
   ctx: RequestContext,
   details: { event: string } & Record<string, unknown>,
 ): void {
+  const source = typeof details.source === 'string' ? details.source : ctx.transportRetrySource;
   ctx.emitDiagnostic?.({
     connectionId: entry.debugId,
     generation: entry.generation,
@@ -938,11 +941,16 @@ function emitContextDiagnostic(
     frameCount: ctx.frameCount,
     emittedModelData: ctx.emittedModelData,
     emittedDownstreamData: ctx.emittedDownstreamData,
+    replaySafe: transportReplaySafe(ctx),
+    outputBegan: ctx.emittedModelData || ctx.emittedDownstreamData || ctx.outputByIndex.size > 0,
+    attemptCount: ctx.retried ? 2 : 1,
+    replayCount: ctx.retried ? 1 : 0,
     responseIdReceived: Boolean(ctx.responseId),
     inFlightMs: entry.inFlightStartedAt === undefined
       ? undefined
       : Math.max(0, entry.options.now() - entry.inFlightStartedAt),
     ...details,
+    ...(source ? { source } : {}),
   });
 }
 
@@ -951,7 +959,11 @@ function emitResponseErrorDiagnostic(
   ctx: RequestContext,
   details: Record<string, unknown>,
 ): void {
-  emitContextDiagnostic(entry, ctx, { event: 'ws_response_error', ...details });
+  emitContextDiagnostic(entry, ctx, {
+    event: 'ws_response_error',
+    outcome: details.willRetry === true ? 'retrying' : 'terminal',
+    ...details,
+  });
 }
 
 function diagnosticItemIdHash(value: unknown): string | undefined {
@@ -1353,6 +1365,9 @@ function retryTransportFailure(
 
   ctx.retried = true;
   ctx.transportRetryPending = true;
+  ctx.transportRetrySource = typeof diagnosticDetails.source === 'string'
+    ? diagnosticDetails.source
+    : undefined;
   entry.debug('transport failed before downstream output; retrying once with full context');
   emitContextDiagnostic(entry, ctx, {
     event: 'ws_transport_retry',

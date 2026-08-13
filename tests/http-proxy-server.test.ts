@@ -8,13 +8,49 @@ import * as net from 'node:net';
 import * as tls from 'node:tls';
 import { EventEmitter, once } from 'node:events';
 import { PassThrough } from 'node:stream';
-import { gzipSync } from 'node:zlib';
+import { brotliCompressSync, deflateSync, gzipSync } from 'node:zlib';
 import { HttpsProxyAgent } from 'https-proxy-agent';
 import { ensureHttpProxyCaBundle, ensureHttpProxyCertificates } from '../src/http-proxy/ca.js';
 import { shouldInterceptConnect, startHttpProxy } from '../src/http-proxy/server.js';
 
 const testHome = mkdtempSync(join(tmpdir(), 'clodex-http-proxy-'));
 const previousRelayHome = process.env['CLODEX_HOME'];
+const TRANSLATED_ROUTE = {
+  aliasId: 'clodex:test:translated-model',
+  realModelId: 'translated-model',
+  displayName: 'Translated Model',
+  upstreamUrl: '',
+  apiKey: 'provider-key',
+  modelFormat: 'openai' as const,
+  npm: '@ai-sdk/openai-compatible',
+  providerId: 'test-provider',
+};
+const ERROR_SSE = [
+  'event: message_start',
+  'data: {"type":"message_start","message":{"usage":{"input_tokens":0,"output_tokens":0}}}',
+  '',
+  'event: error',
+  'data: {"type":"error","error":{"type":"api_error","message":"synthetic failure"}}',
+  '',
+  '',
+].join('\n');
+const SUCCESS_SSE = [
+  'event: message_start',
+  'data: {"type":"message_start","message":{"usage":{"input_tokens":1,"output_tokens":0}}}',
+  '',
+  'event: message_stop',
+  'data: {"type":"message_stop"}',
+  '',
+  '',
+].join('\n');
+const compressedSseLifecycleCases = [
+  { encodingName: 'gzip', contentEncoding: 'gzip', encode: gzipSync },
+  { encodingName: 'deflate', contentEncoding: 'deflate', encode: deflateSync },
+  { encodingName: 'Brotli', contentEncoding: 'br', encode: brotliCompressSync },
+].flatMap(encoding => [
+  { outcomeName: 'error', sse: ERROR_SSE },
+  { outcomeName: 'success', sse: SUCCESS_SSE },
+].map(outcome => ({ ...encoding, ...outcome })));
 const outboundProxyEnvNames = [
   'HTTPS_PROXY',
   'https_proxy',
@@ -67,16 +103,16 @@ async function connectMitm(proxyPort: number, ca: string): Promise<tls.TLSSocket
   return secure;
 }
 
-async function requestMitm(
+async function requestMitmBuffer(
   proxyPort: number,
   ca: string,
   path: string,
   body: string | Buffer,
   headers: Record<string, string> = {},
-): Promise<string> {
+): Promise<Buffer> {
   const socket = await connectMitm(proxyPort, ca);
-  let response = '';
-  socket.on('data', chunk => { response += chunk.toString(); });
+  const response: Buffer[] = [];
+  socket.on('data', chunk => { response.push(Buffer.from(chunk)); });
   const payload = Buffer.isBuffer(body) ? body : Buffer.from(body);
   socket.write([
     `POST ${path} HTTP/1.1`,
@@ -91,7 +127,17 @@ async function requestMitm(
   ].join('\r\n'));
   socket.write(payload);
   await once(socket, 'close');
-  return response;
+  return Buffer.concat(response);
+}
+
+async function requestMitm(
+  proxyPort: number,
+  ca: string,
+  path: string,
+  body: string | Buffer,
+  headers: Record<string, string> = {},
+): Promise<string> {
+  return (await requestMitmBuffer(proxyPort, ca, path, body, headers)).toString();
 }
 
 function activeProxySockets(proxyPort: number): net.Socket[] {
@@ -1651,6 +1697,158 @@ describe('selective HTTP proxy', () => {
       await proxy.close();
     }
   }, 20_000);
+
+  it('records a normally closed error SSE as a failed terminal without changing client bytes', async () => {
+    const certificates = ensureHttpProxyCertificates();
+    const inferenceLogPath = join(testHome, 'adapter-error-sse-inference.jsonl');
+    const errorSse = ERROR_SSE;
+    const adapterServer = http.createServer(async (req, res) => {
+      const ended = once(req, 'end');
+      req.resume();
+      await ended;
+      res.writeHead(200, {
+        'Content-Type': 'text/event-stream',
+        'Content-Length': Buffer.byteLength(errorSse),
+        'Connection': 'close',
+      });
+      res.end(errorSse);
+    });
+    const adapterPort = await listen(adapterServer);
+    const proxy = await startHttpProxy({
+      routes: [TRANSLATED_ROUTE],
+      adapterHandle: {
+        port: adapterPort,
+        token: 'adapter-local-token',
+        close: () => {
+          adapterServer.closeAllConnections();
+          adapterServer.close();
+        },
+      },
+      inferenceLogPath,
+    });
+
+    try {
+      const response = await requestMitm(
+        proxy.port,
+        certificates.caCert,
+        '/v1/messages',
+        JSON.stringify({
+          model: TRANSLATED_ROUTE.aliasId,
+          messages: [{ role: 'user', content: 'synthetic error terminal' }],
+          stream: true,
+        }),
+      );
+
+      // The client still receives the upstream stream byte-for-byte.
+      expect(response).toContain(errorSse);
+      const entries = readFileSync(inferenceLogPath, 'utf8').trim().split('\n').map(line => JSON.parse(line));
+      const requestEntry = entries.find(entry => !entry.event);
+      expect(entries).toContainEqual(expect.objectContaining({
+        event: 'response_failed',
+        requestId: requestEntry.requestId,
+        statusCode: 200,
+        terminalOutcome: 'error',
+        terminalCategory: 'error_sse',
+        terminationSource: 'upstream_failure',
+      }));
+      expect(entries.some(entry => entry.event === 'response_completed')).toBe(false);
+    } finally {
+      await proxy.close();
+    }
+  }, 20_000);
+
+  it.each(compressedSseLifecycleCases)(
+    'classifies a compressed $encodingName $outcomeName SSE only after decoded inspection',
+    async ({ outcomeName, sse, contentEncoding, encode }) => {
+      const certificates = ensureHttpProxyCertificates();
+      const inferenceLogPath = join(
+        testHome,
+        `adapter-${contentEncoding}-${outcomeName}-sse-inference.jsonl`,
+      );
+      const encodedSse = encode(sse);
+      const adapterServer = http.createServer(async (req, res) => {
+        const ended = once(req, 'end');
+        req.resume();
+        await ended;
+        res.writeHead(200, {
+          'Content-Type': 'text/event-stream',
+          'Content-Encoding': contentEncoding,
+          'Content-Length': encodedSse.length,
+          'Connection': 'close',
+        });
+        // The client can finish consuming these compressed bytes before the
+        // native zlib transform asynchronously emits its final decoded bytes.
+        res.end(encodedSse);
+      });
+      const adapterPort = await listen(adapterServer);
+      const proxy = await startHttpProxy({
+        routes: [TRANSLATED_ROUTE],
+        adapterHandle: {
+          port: adapterPort,
+          token: 'adapter-local-token',
+          close: () => {
+            adapterServer.closeAllConnections();
+            adapterServer.close();
+          },
+        },
+        inferenceLogPath,
+      });
+
+      try {
+        const response = await requestMitmBuffer(
+          proxy.port,
+          certificates.caCert,
+          '/v1/messages',
+          JSON.stringify({
+            model: TRANSLATED_ROUTE.aliasId,
+            messages: [{ role: 'user', content: `synthetic compressed ${outcomeName}` }],
+            stream: true,
+          }),
+        );
+        const headerBoundary = response.indexOf('\r\n\r\n');
+        const headers = response.subarray(0, headerBoundary).toString();
+        const responseBody = response.subarray(headerBoundary + 4);
+
+        expect(headers).toContain(`Content-Encoding: ${contentEncoding}`);
+        expect(responseBody.equals(encodedSse)).toBe(true);
+        // The client closes on delivery of the compressed bytes. Classification
+        // may follow only once native zlib emits its asynchronous decoded end.
+        await vi.waitFor(() => {
+          const currentEntries = readFileSync(inferenceLogPath, 'utf8')
+            .trim()
+            .split('\n')
+            .map(line => JSON.parse(line));
+          expect(currentEntries.some(entry =>
+            entry.event === 'response_failed' || entry.event === 'response_completed')).toBe(true);
+        });
+        const entries = readFileSync(inferenceLogPath, 'utf8').trim().split('\n').map(line => JSON.parse(line));
+        const requestEntry = entries.find(entry => !entry.event);
+        const lifecycleTerminals = entries.filter(entry =>
+          entry.event === 'response_failed' || entry.event === 'response_completed');
+
+        expect(lifecycleTerminals).toHaveLength(1);
+        if (outcomeName === 'error') {
+          expect(lifecycleTerminals[0]).toMatchObject({
+            event: 'response_failed',
+            requestId: requestEntry.requestId,
+            statusCode: 200,
+            terminalOutcome: 'error',
+            terminalCategory: 'error_sse',
+            terminationSource: 'upstream_failure',
+          });
+        } else {
+          expect(lifecycleTerminals[0]).toMatchObject({
+            event: 'response_completed',
+            requestId: requestEntry.requestId,
+            statusCode: 200,
+          });
+        }
+      } finally {
+        await proxy.close();
+      }
+    },
+    20_000,
+  );
 
   it('terminates and logs a translated response when the adapter closes before end', async () => {
     const certificates = ensureHttpProxyCertificates();

@@ -305,6 +305,10 @@ describe('createResponsesWebSocketFetch', () => {
       socketErrorCode: 'ECONNRESET',
       frameCount: 0,
       emittedModelData: false,
+      replaySafe: true,
+      outputBegan: false,
+      attemptCount: 2,
+      replayCount: 1,
       errorMessageBytes: 21,
       errorMessageHash: expect.stringMatching(/^[a-f0-9]{16}$/),
     }));
@@ -313,8 +317,15 @@ describe('createResponsesWebSocketFetch', () => {
       outcome: 'recovered',
       requestId: 'req-socket-error',
       connectionId: 2,
+      // Retained from the failure that caused this replay: the recovery record
+      // itself carries no source of its own.
+      source: 'socket_error',
       frameCount: 1,
       emittedModelData: false,
+      replaySafe: true,
+      outputBegan: false,
+      attemptCount: 2,
+      replayCount: 1,
     }));
     expect(JSON.stringify(diagnostics)).not.toContain('secret socket failure');
   });
@@ -527,7 +538,10 @@ describe('createResponsesWebSocketFetch', () => {
   });
 
   it('does not retry after model output has reached the downstream stream', async () => {
-    const wsFetch = createResponsesWebSocketFetch(WS_URL);
+    const diagnostics: ResponsesWebSocketDiagnosticEvent[] = [];
+    const wsFetch = createResponsesWebSocketFetch(WS_URL, undefined, {
+      onDiagnostic: event => diagnostics.push(event),
+    });
     const res = await wsFetch('https://x', {
       method: 'POST',
       headers: {},
@@ -548,6 +562,54 @@ describe('createResponsesWebSocketFetch', () => {
     const body = await readAll(res);
     expect(body).toContain('partial output');
     expect(body).toContain('websocket_transport_error');
+    expect(diagnostics).toContainEqual(expect.objectContaining({
+      event: 'ws_response_error',
+      outcome: 'terminal',
+      source: 'socket_error',
+      replaySafe: false,
+      outputBegan: true,
+      attemptCount: 1,
+      replayCount: 0,
+    }));
+    expect(diagnostics).not.toContainEqual(expect.objectContaining({
+      event: 'ws_transport_retry',
+    }));
+  });
+
+  it('records close 1006 after output as terminal and never replays it', async () => {
+    const diagnostics: ResponsesWebSocketDiagnosticEvent[] = [];
+    const wsFetch = createResponsesWebSocketFetch(WS_URL, undefined, {
+      onDiagnostic: event => diagnostics.push(event),
+    });
+    const res = await wsFetch('https://x', {
+      method: 'POST',
+      headers: {},
+      body: JSON.stringify(sessionPayload([])),
+    });
+    const socket = lastSocket();
+    socket.emit('open');
+    socket.emit('message', Buffer.from(JSON.stringify({
+      type: 'response.output_text.delta',
+      delta: 'partial output',
+    })));
+    socket.emit('close', 1006, Buffer.from('SENTINEL-PRIVATE-CLOSE-REASON'));
+
+    expect(fakeSockets).toHaveLength(1);
+    expect(await readAll(res)).toContain('websocket_transport_error');
+    expect(diagnostics).toContainEqual(expect.objectContaining({
+      event: 'ws_response_error',
+      outcome: 'terminal',
+      source: 'socket_close',
+      closeCode: 1006,
+      replaySafe: false,
+      outputBegan: true,
+      attemptCount: 1,
+      replayCount: 0,
+    }));
+    expect(diagnostics).not.toContainEqual(expect.objectContaining({
+      event: 'ws_transport_retry',
+    }));
+    expect(JSON.stringify(diagnostics)).not.toContain('SENTINEL-PRIVATE-CLOSE-REASON');
   });
 
   it('retries a failed incremental continuation with the complete original context', async () => {

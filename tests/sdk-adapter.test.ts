@@ -13,6 +13,7 @@ import {
   supportsOpenAiPromptCacheBreakpoints,
   extractClaudeSessionId,
   claudeSessionPromptCacheKey,
+  sdkTimeoutDetails,
   sdkTranslationErrorSignature,
   resetServiceTierWarningForTests,
   silenceSdkWarnings,
@@ -1063,6 +1064,111 @@ describe('streamAnthropicResponse idle timeout', () => {
       { idleTimeoutMs: 50 },
     )).rejects.toThrow('no data received from provider');
   }, 10_000);
+
+  it('classifies the streaming idle abort as a content-free idle_timeout', async () => {
+    const hangingModel = {
+      specificationVersion: 'v3' as const,
+      provider: 'test',
+      modelId: 'test-model',
+      supportedUrls: {},
+      async doStream(options: { abortSignal?: AbortSignal }) {
+        return new Promise((_resolve, reject) => {
+          options.abortSignal?.addEventListener('abort', () => {
+            reject(options.abortSignal?.reason ?? new DOMException('Aborted', 'AbortError'));
+          });
+        });
+      },
+      async doGenerate(): Promise<never> {
+        throw new Error('not used');
+      },
+    };
+
+    const error = await streamAnthropicResponse(
+      hangingModel as never,
+      { messages: [{ role: 'user', content: [{ type: 'text', text: 'hi' }] }] as never },
+      'test-model',
+      () => {},
+      undefined,
+      { idleTimeoutMs: 50 },
+    ).then(() => undefined, reason => reason);
+
+    expect(error).toBeInstanceOf(Error);
+    expect(sdkTimeoutDetails(error)).toMatchObject({
+      category: 'idle_timeout',
+      limitMs: 50,
+      outputBegan: false,
+    });
+    expect(sdkTimeoutDetails(error)?.elapsedMs).toBeGreaterThanOrEqual(40);
+  }, 10_000);
+
+  it('leaves an ordinary upstream failure unclassified as a timeout', async () => {
+    const failingModel = {
+      specificationVersion: 'v3' as const,
+      provider: 'test',
+      modelId: 'test-model',
+      supportedUrls: {},
+      async doStream(): Promise<never> {
+        const error = new Error('socket hang up');
+        (error as NodeJS.ErrnoException).code = 'ECONNRESET';
+        throw error;
+      },
+      async doGenerate(): Promise<never> {
+        throw new Error('not used');
+      },
+    };
+
+    const error = await streamAnthropicResponse(
+      failingModel as never,
+      { messages: [{ role: 'user', content: [{ type: 'text', text: 'hi' }] }] as never },
+      'test-model',
+      () => {},
+    ).then(() => undefined, reason => reason);
+
+    expect(error).toBeInstanceOf(Error);
+    expect(sdkTimeoutDetails(error)).toBeUndefined();
+  }, 10_000);
+});
+
+describe('generateAnthropicResponse non-streaming total timeout', () => {
+  it('classifies the fixed non-streaming ceiling as a total_timeout with no output', async () => {
+    vi.useFakeTimers();
+    vi.resetModules();
+    const generateText = vi.fn((options: { abortSignal?: AbortSignal }) =>
+      new Promise((_resolve, reject) => {
+        options.abortSignal?.addEventListener('abort', () => {
+          reject(options.abortSignal?.reason ?? new Error('aborted'));
+        });
+      }));
+    vi.doMock('ai', () => ({
+      generateText,
+      streamText: vi.fn(),
+      tool: vi.fn((spec: unknown) => spec),
+      jsonSchema: vi.fn((schema: unknown) => schema),
+    }));
+
+    try {
+      const adapter = await import('../src/sdk-adapter.js');
+      const settled = adapter.generateAnthropicResponse(
+        {} as never,
+        { messages: [] },
+        'test-model',
+      ).then(() => undefined, reason => reason);
+
+      await vi.advanceTimersByTimeAsync(10 * 60_000);
+      const error = await settled;
+      expect((error as Error).message).toContain('provider request exceeded 600s');
+      expect(adapter.sdkTimeoutDetails(error)).toEqual({
+        category: 'total_timeout',
+        elapsedMs: 10 * 60_000,
+        limitMs: 10 * 60_000,
+        outputBegan: false,
+      });
+    } finally {
+      vi.useRealTimers();
+      vi.doUnmock('ai');
+      vi.resetModules();
+    }
+  });
 });
 
 // ── streaming translation ────────────────────────────────────────────────────

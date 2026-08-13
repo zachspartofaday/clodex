@@ -676,13 +676,14 @@ async function launchClaudeViaCatalog(
   effortPolicy: UnsupportedEffortPolicy,
 ): Promise<number> {
   reportInactiveCatalogAliases(modelAliases);
+  const inferenceLogPath = getInferenceSessionLogPath('claude-endpoint-proxy');
   let proxyHandle: ProxyHandle;
   try {
     proxyHandle = await startProxyCatalog(
       catalogRoutes,
       startingRoute.aliasId,
       trace,
-      undefined,
+      inferenceLogPath,
       undefined,
       undefined,
       modelAliases,
@@ -692,6 +693,7 @@ async function launchClaudeViaCatalog(
       `Switch menu active — proxy on port ${proxyHandle.port} ` +
       pc.dim(`(${catalogRoutes.length} model${catalogRoutes.length !== 1 ? 's' : ''} in /model)`),
     );
+    p.log.info(`Inference request log: ${inferenceLogPath}`);
   } catch (err) {
     p.log.error(`Failed to start proxy: ${err instanceof Error ? err.message : String(err)}`);
     return 1;

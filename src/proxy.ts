@@ -24,6 +24,7 @@ import {
   resetTraceLog,
   writeInferenceResponseLifecycleLog,
   writeInferenceResponseErrorLog,
+  writeInferenceWebSocketDiagnosticLog,
   writeWebSocketDiagnosticLog,
 } from './trace-log.js';
 import {
@@ -45,6 +46,7 @@ import {
   streamAnthropicResponse,
   generateAnthropicResponse,
   extractClaudeSessionId,
+  sdkTimeoutDetails,
   sdkTranslationErrorSignature,
   silenceSdkWarnings,
 } from './sdk-adapter.js';
@@ -169,15 +171,24 @@ function createTranslationLifecycle(
       clearInterval(timer);
       write('translation_cancelled', snapshot(Date.now()));
     },
-    fail(errorType: string, errorSignature?: string, errorCode?: string) {
+    fail(
+      errorType: string,
+      terminal: Pick<
+        Partial<Parameters<typeof writeInferenceResponseLifecycleLog>[1]>,
+        'elapsedMs' | 'errorCode' | 'errorSignature' | 'limitMs' | 'outputBegan' | 'terminalCategory'
+      > = {},
+    ) {
       if (stopped) return;
       stopped = true;
       clearInterval(timer);
       write('translation_failed', {
         ...snapshot(Date.now()),
         errorType,
-        errorSignature,
-        errorCode,
+        terminalOutcome: 'error',
+        // Default from what this lifecycle actually relayed; a timeout-derived
+        // value below overrides it with the adapter's own observation.
+        outputBegan: translatedBytes > 0,
+        ...terminal,
       });
     },
   };
@@ -415,7 +426,11 @@ export async function startProxyCatalog(
       const originalModel = anthropicBody.model;
       const clientWantsStream = Boolean(anthropicBody.stream);
       const relayRequestIdRaw = req.headers['x-relay-request-id'];
-      const relayRequestId = Array.isArray(relayRequestIdRaw) ? relayRequestIdRaw[0] : relayRequestIdRaw;
+      // Without a correlation id the translation lifecycle records nothing at
+      // all, so a request that reaches the adapter directly (no http-proxy hop
+      // to stamp the header) would have no terminal record. Mint one instead.
+      const relayRequestId = (Array.isArray(relayRequestIdRaw) ? relayRequestIdRaw[0] : relayRequestIdRaw)
+        ?? randomUUID();
 
       // Per-request route resolution: look up the alias, fall back to default
       const resolvedRoute = typeof originalModel === 'string'
@@ -675,8 +690,18 @@ export async function startProxyCatalog(
             preferWebSockets: route.preferWebSockets,
             compatibility: route.compatibility,
             onDebug: (msg: string) => plog(() => msg),
-            onWebSocketDiagnostic: webSocketDiagnosticsLogPath
-              ? event => writeWebSocketDiagnosticLog(webSocketDiagnosticsLogPath, event)
+            // Two distinct sinks: the always-on inference session log receives
+            // only the allowlisted terminal facts, while the opt-in diagnostics
+            // log keeps the full structured event it has always carried.
+            onWebSocketDiagnostic: inferenceLogPath || webSocketDiagnosticsLogPath
+              ? event => {
+                  if (inferenceLogPath) {
+                    writeInferenceWebSocketDiagnosticLog(inferenceLogPath, event);
+                  }
+                  if (webSocketDiagnosticsLogPath) {
+                    writeWebSocketDiagnosticLog(webSocketDiagnosticsLogPath, event);
+                  }
+                }
               : undefined,
           });
           translationLifecycle?.dispatched();
@@ -790,10 +815,20 @@ export async function startProxyCatalog(
             plog(() => 'sdk oauth credential replaced after 401; retrying once');
             return 'retry';
           }
+          const timeout = sdkTimeoutDetails(err);
           translationLifecycle?.fail(
             err instanceof Error ? err.name : 'UpstreamError',
-            sdkTranslationErrorSignature(err),
-            details?.transportCode,
+            {
+              errorSignature: sdkTranslationErrorSignature(err),
+              errorCode: details?.transportCode,
+              terminalCategory: timeout?.category
+                ?? (details ? 'upstream_error' : 'local_adapter_exception'),
+              ...(timeout ? {
+                elapsedMs: timeout.elapsedMs,
+                limitMs: timeout.limitMs,
+                outputBegan: timeout.outputBegan,
+              } : {}),
+            },
           );
           const contextLengthExceeded = upstreamStatus === 400
             && isContextLengthExceededError(err, message);

@@ -1011,6 +1011,9 @@ describe('SDK translated error logging', () => {
         phase: 'preparing_translation',
         sdkParts: 0,
         translatedBytes: 0,
+        terminalOutcome: 'error',
+        terminalCategory: 'local_adapter_exception',
+        outputBegan: false,
       }));
     } finally {
       handle.close();
@@ -1086,6 +1089,9 @@ describe('SDK translated error logging', () => {
         event: 'translation_failed',
         requestId: 'req-error-1',
         lastPartType: 'error',
+        terminalOutcome: 'error',
+        terminalCategory: 'upstream_error',
+        outputBegan: false,
       }));
     } finally {
       if (previousRequestPreview === undefined) delete process.env['CLODEX_LOG_REQUEST_PREVIEW'];
@@ -1369,6 +1375,10 @@ describe('SDK translated error logging', () => {
       expect(completed.sdkParts).toBeGreaterThan(0);
       expect(completed.translatedBytes).toBeGreaterThan(0);
       expect(completed.translatedChunks).toBeGreaterThan(0);
+      // Terminal classification is failure-only; a success must carry none of it.
+      expect(completed).not.toHaveProperty('terminalOutcome');
+      expect(completed).not.toHaveProperty('terminalCategory');
+      expect(completed).not.toHaveProperty('outputBegan');
     } finally {
       handle.close();
       await new Promise<void>(resolve => upstream.close(() => resolve()));
@@ -1464,6 +1474,66 @@ describe('SDK translated error logging', () => {
       else process.env.CLODEX_STREAM_KEEPALIVE_INTERVAL_MS = prevKeepAlive;
       handle.close();
       upstream.closeAllConnections();
+      await new Promise<void>(resolve => upstream.close(() => resolve()));
+      rmSync(dir, { recursive: true, force: true });
+    }
+  }, 20_000);
+
+  it('mints a correlation id when no relay request id header is present', async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'clodex-sdk-generated-id-'));
+    const inferenceLogPath = join(dir, 'inference.jsonl');
+    const upstream = http.createServer((req, res) => {
+      req.resume();
+      res.writeHead(200, { 'Content-Type': 'application/json', 'Connection': 'close' });
+      res.end(JSON.stringify({
+        id: 'chatcmpl-generated',
+        object: 'chat.completion',
+        created: 1,
+        model: 'translated-model',
+        choices: [{ index: 0, message: { role: 'assistant', content: 'hello' }, finish_reason: 'stop' }],
+        usage: { prompt_tokens: 3, completion_tokens: 1, total_tokens: 4 },
+      }));
+    });
+    await new Promise<void>((resolve, reject) => {
+      upstream.once('error', reject);
+      upstream.listen(0, '127.0.0.1', () => resolve());
+    });
+    const address = upstream.address();
+    if (!address || typeof address === 'string') throw new Error('test upstream did not bind');
+    const route: ProxyRoute = {
+      aliasId: 'clodex:test:translated-model',
+      realModelId: 'translated-model',
+      displayName: 'Translated Model',
+      upstreamUrl: '',
+      apiKey: 'provider-key',
+      modelFormat: 'openai',
+      npm: '@ai-sdk/openai-compatible',
+      baseURL: `http://127.0.0.1:${address.port}/v1`,
+      providerId: 'test-provider',
+    };
+    const handle = await startProxyCatalog([route], route.aliasId, false, inferenceLogPath);
+
+    try {
+      // No x-relay-request-id: before the fallback this produced NO translation
+      // lifecycle records at all, so a terminal could never be correlated.
+      const res = await postToProxy(handle.port, handle.token, {
+        model: route.aliasId,
+        max_tokens: 100,
+        messages: [{ role: 'user', content: 'hi' }],
+        stream: false,
+      });
+
+      expect(res.status).toBe(200);
+      const entries = readFileSync(inferenceLogPath, 'utf8').trim().split('\n').map(line => JSON.parse(line));
+      const dispatched = entries.find(entry => entry.event === 'translation_dispatched');
+      expect(dispatched?.requestId).toMatch(/^[0-9a-f-]{36}$/);
+      expect(entries).toContainEqual(expect.objectContaining({
+        event: 'translation_completed',
+        requestId: dispatched.requestId,
+        phase: 'waiting_for_sdk',
+      }));
+    } finally {
+      handle.close();
       await new Promise<void>(resolve => upstream.close(() => resolve()));
       rmSync(dir, { recursive: true, force: true });
     }
