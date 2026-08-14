@@ -1,4 +1,10 @@
+import { createServer, type IncomingMessage, type Server } from 'node:http';
+import { createServer as createHttpsServer, type Server as HttpsServer } from 'node:https';
+import { mkdtempSync, rmSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
 import { describe, it, expect, vi, afterEach } from 'vitest';
+import { Agent, getGlobalDispatcher, setGlobalDispatcher } from 'undici';
 import {
   createLanguageModel,
   deepMergeProviderOptions,
@@ -13,6 +19,7 @@ import {
 } from '../src/provider-factory.js';
 import { VERTEX_ANTHROPIC_NPM } from '../src/constants.js';
 import { buildOpenCodeGoModels } from '../src/data/opencode-go-models.js';
+import { ensureHttpProxyCertificates } from '../src/http-proxy/ca.js';
 
 async function expectCredentialHeadersStripped(
   fetchImpl: typeof fetch,
@@ -683,6 +690,7 @@ describe('createLanguageModel', () => {
     expect(createOpenAI).toHaveBeenCalledWith({
       apiKey: 'provider-key',
       headers: { 'X-Plan': 'paid' },
+      fetch: expect.any(Function),
     });
     expect(responses).toHaveBeenCalledWith('authenticated-model');
     vi.doUnmock('@ai-sdk/openai');
@@ -847,6 +855,7 @@ describe('createLanguageModel', () => {
       apiKey: 'sk-test',
       baseURL: 'https://api.z.ai/api/coding/paas/v4',
       headers: { 'X-Plan': 'coding' },
+      fetch: expect.any(Function),
     });
     vi.doUnmock('@ai-sdk/openai-compatible');
   });
@@ -966,6 +975,210 @@ describe('createLanguageModel', () => {
       fetch: expect.any(Function),
     });
     vi.doUnmock('@ai-sdk/anthropic');
+  });
+});
+
+type SdkRedirectBranch =
+  | 'OpenAI API'
+  | 'OpenAI OAuth chat'
+  | 'anonymous SDK'
+  | 'Anthropic API'
+  | 'OpenAI-compatible API'
+  | 'dynamic API';
+
+async function captureSdkFetch(branch: SdkRedirectBranch): Promise<typeof fetch> {
+  vi.resetModules();
+  let captured: typeof fetch | undefined;
+  let mockedPackage: string;
+  let spec: Parameters<typeof createLanguageModel>[0];
+
+  if (branch === 'OpenAI API' || branch === 'OpenAI OAuth chat' || branch === 'anonymous SDK') {
+    mockedPackage = '@ai-sdk/openai';
+    const createOpenAI = (options: { fetch?: typeof fetch }) => {
+      captured = options.fetch;
+      return {
+        responses: (modelId: string) => ({ modelId }),
+        chat: (modelId: string) => ({ modelId }),
+      };
+    };
+    vi.doMock(mockedPackage, () => ({ createOpenAI }));
+    spec = {
+      npm: mockedPackage,
+      modelId: branch === 'OpenAI OAuth chat' ? 'davinci-002' : 'gpt-5.5',
+      apiKey: branch === 'anonymous SDK' ? '' : 'credential-sentinel',
+      authType: branch === 'OpenAI OAuth chat'
+        ? 'oauth'
+        : branch === 'anonymous SDK' ? 'none' : 'api',
+    };
+  } else if (branch === 'Anthropic API') {
+    mockedPackage = '@ai-sdk/anthropic';
+    const createAnthropic = (options: { fetch?: typeof fetch }) => {
+      captured = options.fetch;
+      return (modelId: string) => ({ modelId });
+    };
+    vi.doMock(mockedPackage, () => ({ createAnthropic }));
+    spec = {
+      npm: mockedPackage,
+      modelId: 'claude-sonnet-4-6',
+      apiKey: 'credential-sentinel',
+      authType: 'api',
+    };
+  } else if (branch === 'OpenAI-compatible API') {
+    mockedPackage = '@ai-sdk/openai-compatible';
+    const createOpenAICompatible = (options: { fetch?: typeof fetch }) => {
+      captured = options.fetch;
+      return (modelId: string) => ({ modelId });
+    };
+    vi.doMock(mockedPackage, () => ({ createOpenAICompatible }));
+    spec = {
+      npm: mockedPackage,
+      modelId: 'compatible-model',
+      apiKey: 'credential-sentinel',
+      authType: 'api',
+      baseURL: 'https://compatible.example/v1',
+    };
+  } else {
+    mockedPackage = 'picocolors';
+    function createDynamicProvider(options: { fetch?: typeof fetch }) {
+      captured = options.fetch;
+      return (modelId: string) => ({ modelId });
+    }
+    vi.doMock(mockedPackage, () => ({ createDynamicProvider }));
+    spec = {
+      npm: mockedPackage,
+      modelId: 'dynamic-model',
+      apiKey: 'credential-sentinel',
+      authType: 'api',
+    };
+  }
+
+  try {
+    const { createLanguageModel: create } = await import('../src/provider-factory.js');
+    await create(spec);
+  } finally {
+    vi.doUnmock(mockedPackage);
+  }
+
+  expect(captured).toEqual(expect.any(Function));
+  return captured!;
+}
+
+interface SdkRedirectServer {
+  server: Server | HttpsServer;
+  url: string;
+  close: () => Promise<void>;
+}
+
+async function listenForSdkRedirect(
+  server: Server | HttpsServer,
+  scheme: 'http' | 'https',
+): Promise<SdkRedirectServer> {
+  await new Promise<void>((resolve, reject) => {
+    server.once('error', reject);
+    server.listen(0, '127.0.0.1', () => resolve());
+  });
+  const address = server.address();
+  if (!address || typeof address === 'string') throw new Error('missing test server address');
+  return {
+    server,
+    url: `${scheme}://127.0.0.1:${address.port}`,
+    close: () => new Promise<void>((resolve, reject) => {
+      server.close(error => (error ? reject(error) : resolve()));
+    }),
+  };
+}
+
+async function startSdkRedirectTarget(): Promise<SdkRedirectServer & { requests: { count: number } }> {
+  const requests = { count: 0 };
+  const server = createServer((_req, res) => {
+    requests.count += 1;
+    res.writeHead(200);
+    res.end('target');
+  });
+  return { ...(await listenForSdkRedirect(server, 'http')), requests };
+}
+
+async function startSdkRedirectSource(
+  status: 307 | 308,
+  location: string,
+  certificates?: ReturnType<typeof ensureHttpProxyCertificates>,
+): Promise<SdkRedirectServer> {
+  const handler = (_req: IncomingMessage, res: import('node:http').ServerResponse) => {
+    res.writeHead(status, { Location: location });
+    res.end();
+  };
+  const server = certificates
+    ? createHttpsServer({ cert: certificates.serverCert, key: certificates.serverKey }, handler)
+    : createServer(handler);
+  return listenForSdkRedirect(server, certificates ? 'https' : 'http');
+}
+
+async function expectSdkRedirectBlocked(
+  fetchImpl: typeof fetch,
+  status: 307 | 308,
+  certificates?: ReturnType<typeof ensureHttpProxyCertificates>,
+): Promise<void> {
+  const target = await startSdkRedirectTarget();
+  const redirect = await startSdkRedirectSource(status, `${target.url}/leak`, certificates);
+  try {
+    const error = await fetchImpl(`${redirect.url}/sdk`, {
+      method: 'POST',
+      headers: { Authorization: 'Bearer credential-sentinel' },
+      body: 'confidential-body',
+    }).catch(caught => caught);
+    expect(error).toMatchObject({
+      name: 'RedirectBlockedError',
+      message: `Redirect blocked (${status})`,
+    });
+    expect(String(error)).toBe(`RedirectBlockedError: Redirect blocked (${status})`);
+    expect(target.requests.count).toBe(0);
+  } finally {
+    await redirect.close();
+    await target.close();
+  }
+}
+
+describe('SDK construction blocks credential-bearing redirects', () => {
+  const branches: SdkRedirectBranch[] = [
+    'OpenAI API',
+    'OpenAI OAuth chat',
+    'anonymous SDK',
+    'Anthropic API',
+    'OpenAI-compatible API',
+    'dynamic API',
+  ];
+  const cases = branches.flatMap(branch => ([307, 308] as const).map(status => [branch, status] as const));
+
+  it.each(cases)('%s rejects a cross-origin %s before the target request', async (branch, status) => {
+    const sdkFetch = await captureSdkFetch(branch);
+    await expectSdkRedirectBlocked(sdkFetch, status);
+  });
+
+  it('does not downgrade an SDK credential-bearing request from HTTPS to HTTP', async () => {
+    const tlsHome = mkdtempSync(join(tmpdir(), 'clodex-provider-factory-redirect-tls-'));
+    const previousHome = process.env.CLODEX_HOME;
+    process.env.CLODEX_HOME = tlsHome;
+    let certificates: ReturnType<typeof ensureHttpProxyCertificates>;
+    try {
+      certificates = ensureHttpProxyCertificates();
+    } finally {
+      if (previousHome === undefined) delete process.env.CLODEX_HOME;
+      else process.env.CLODEX_HOME = previousHome;
+    }
+
+    const previousDispatcher = getGlobalDispatcher();
+    const dispatcher = new Agent({
+      connect: { ca: certificates.caCert, servername: 'api.anthropic.com' },
+    });
+    setGlobalDispatcher(dispatcher);
+    try {
+      const sdkFetch = await captureSdkFetch('Anthropic API');
+      await expectSdkRedirectBlocked(sdkFetch, 308, certificates);
+    } finally {
+      setGlobalDispatcher(previousDispatcher);
+      await dispatcher.close();
+      rmSync(tlsHome, { recursive: true, force: true });
+    }
   });
 });
 

@@ -20,6 +20,7 @@ import {
   canonicalOpenAiBaseUrl,
 } from './registry/url-security.js';
 import type { EffortProfile } from './effort-policy.js';
+import { fetchWithoutRedirects } from './redirect-policy.js';
 import {
   transformOpenAiCompatibleRequestBody,
   type ModelRuntimeCompatibility,
@@ -102,7 +103,7 @@ const fetchWithoutCredentialHeaders: typeof fetch = (input, init) => {
   for (const name of [...headers.keys()]) {
     if (isCredentialBearingHeader(name)) headers.delete(name);
   }
-  return fetch(input, { ...init, headers });
+  return fetchWithoutRedirects(input, { ...init, headers });
 };
 
 /**
@@ -124,7 +125,10 @@ const fetchWithoutCredentialHeaders: typeof fetch = (input, init) => {
  * wrapped `inner` keeps each branch's existing fetch behavior (the anonymous
  * route still strips credential-bearing headers underneath this).
  */
-function anthropicWireFetch(spec: ProviderModelSpec, inner: typeof fetch = fetch): typeof fetch {
+function anthropicWireFetch(
+  spec: ProviderModelSpec,
+  inner: typeof fetch = fetchWithoutRedirects,
+): typeof fetch {
   const outboundBeta = resolveOutboundBeta(spec.headers);
   return (input, init) => {
     const headers = new Headers(
@@ -285,15 +289,13 @@ export async function createLanguageModel(spec: ProviderModelSpec): Promise<Lang
           // persistent WebSocket transport. Models flagged prefer_websockets
           // require it; the remaining OAuth Responses models benefit from the
           // same connection-local previous_response_id continuation cache.
-          ...(useResponsesEndpoint
-            ? {
-                fetch: createResponsesWebSocketFetch(CODEX_RESPONSES_LITE_WS_URL, spec.onDebug, {
-                  providerId: spec.providerId ?? 'openai',
-                  accountId,
-                  onDiagnostic: spec.onWebSocketDiagnostic,
-                }),
-              }
-            : {}),
+          fetch: useResponsesEndpoint
+            ? createResponsesWebSocketFetch(CODEX_RESPONSES_LITE_WS_URL, spec.onDebug, {
+                providerId: spec.providerId ?? 'openai',
+                accountId,
+                onDiagnostic: spec.onWebSocketDiagnostic,
+              })
+            : fetchWithoutRedirects,
         }
       : spec.authType === 'none'
         ? {
@@ -301,7 +303,7 @@ export async function createLanguageModel(spec: ProviderModelSpec): Promise<Lang
             ...(sdkHeaders ? { headers: sdkHeaders } : {}),
             fetch: fetchWithoutCredentialHeaders,
           }
-        : { apiKey, ...(sdkHeaders ? { headers: sdkHeaders } : {}) };
+        : { apiKey, ...(sdkHeaders ? { headers: sdkHeaders } : {}), fetch: fetchWithoutRedirects };
     const openai = createOpenAI(oauthOptions);
     return useResponsesEndpoint ? openai.responses(modelId) : openai.chat(modelId);
   }
@@ -359,7 +361,7 @@ export async function createLanguageModel(spec: ProviderModelSpec): Promise<Lang
       name: spec.providerId ?? 'openai-compatible',
       baseURL: canonicalBase,
       ...(spec.authType !== 'none' && apiKey.trim() ? { apiKey } : {}),
-      ...(spec.authType === 'none' ? { fetch: fetchWithoutCredentialHeaders } : {}),
+      fetch: spec.authType === 'none' ? fetchWithoutCredentialHeaders : fetchWithoutRedirects,
       ...(sdkHeaders ? { headers: sdkHeaders } : {}),
       ...(spec.compatibility
         ? {
@@ -375,7 +377,7 @@ export async function createLanguageModel(spec: ProviderModelSpec): Promise<Lang
     const create = await loadSdkProviderFactory(npm);
     const provider = create({
       apiKey: spec.authType === 'none' ? '' : apiKey,
-      ...(spec.authType === 'none' ? { fetch: fetchWithoutCredentialHeaders } : {}),
+      fetch: spec.authType === 'none' ? fetchWithoutCredentialHeaders : fetchWithoutRedirects,
       ...(baseURL ? { baseURL } : {}),
       ...(sdkHeaders ? { headers: sdkHeaders } : {}),
     });
