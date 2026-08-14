@@ -951,97 +951,113 @@ function runRestoreCommand(target: ClaudePatchTarget): number {
     p.log.error(describePatchTargetFailure(target));
     return 1;
   }
-  const binaryPath = target.binaryPath;
-  const manifest = readPatchManifest();
-
-  let version: string;
-  if (target.ok) {
-    version = target.version;
-  } else if (manifest?.binaryPath === binaryPath && manifest.claudeVersion) {
-    version = manifest.claudeVersion;
-    p.log.warn(
-      `Could not read the version of ${binaryPath} (\`claude --version\` failed) — using claude `
-      + `${version} from the patch manifest, which recorded it when this binary was patched. `
-      + 'This is expected when a bad patch left the install unable to run.',
-    );
-  } else {
-    p.log.error(
-      `Could not determine the version of ${binaryPath} (\`claude --version\` failed), and `
-      + 'no patch manifest records a pristine backup for it, so clodex cannot tell which backup '
-      + `belongs to this install. Restore it by hand from ${backupDir()} (or reinstall Claude Code).`,
-    );
-    return 1;
-  }
-
-  // Prepare the verified bytes beside the live binary, then rename them into place.
-  // The staged copy keeps a short or corrupted restore from touching the install.
-  const plan = planRestoreOnly(collectPristineFacts({ version, binaryPath, manifest }));
-  if (plan.action === 'error') {
-    p.log.error(plan.message);
-    return 1;
-  }
-  for (const note of plan.notes) p.log.warn(note);
-  const verified = verifyPristineSource(plan, version);
-  if (!verified.ok) {
-    p.log.error(verified.message);
-    return 1;
-  }
-
-  const manifestPath = getPatchManifestPath();
-  const stagedRestorePath = join(
-    dirname(binaryPath),
-    `.clodex-patch-restore-${process.pid}-${randomUUID()}`,
-  );
-  let restoreStagePath: string | undefined = stagedRestorePath;
-  let restoreOperation = `copy pristine bytes from ${plan.backupPath}`;
-  try {
-    copyFileSync(plan.backupPath, stagedRestorePath);
-    restoreOperation = 'validate staged restore size';
-    const backupSize = statSync(plan.backupPath).size;
-    const stagedSize = statSync(stagedRestorePath).size;
-    if (stagedSize !== backupSize) {
-      throw new Error(`staged size ${stagedSize} does not match backup size ${backupSize}`);
-    }
-    restoreOperation = 'validate staged restore hash';
-    const stagedSha256 = sha256File(stagedRestorePath);
-    if (stagedSha256 !== plan.pristineSha256) {
-      throw new Error(`staged sha256 ${stagedSha256} does not match expected ${plan.pristineSha256}`);
-    }
-    restoreOperation = `rename staged restore over ${binaryPath}`;
-    renameSync(stagedRestorePath, binaryPath);
-    restoreStagePath = undefined;
-  } catch (err) {
-    let retainedStage = '';
-    if (restoreStagePath !== undefined) {
-      try {
-        rmSync(restoreStagePath, { force: true });
-        restoreStagePath = undefined;
-      } catch (cleanupError) {
-        retainedStage = ` Retained staged restore at ${restoreStagePath} after cleanup failed: ${
-          cleanupError instanceof Error ? cleanupError.message : String(cleanupError)
-        }.`;
-      }
-    }
-    p.log.error(
-      `Could not ${restoreOperation}: ${err instanceof Error ? err.message : String(err)}.${retainedStage}`,
-    );
+  const release = tryAcquirePatchLock();
+  if (!release) {
+    p.log.warn('Another clodex process is patching the claude binary right now — skipped.');
     return 1;
   }
 
   try {
-    unlinkSync(manifestPath);
-  } catch (err) {
-    if ((err as NodeJS.ErrnoException).code !== 'ENOENT') {
+    const binaryPath = target.binaryPath;
+    const manifest = readPatchManifest();
+
+    let version: string;
+    if (target.ok) {
+      version = target.version;
+    } else if (manifest?.binaryPath === binaryPath && manifest.claudeVersion) {
+      version = manifest.claudeVersion;
+      p.log.warn(
+        `Could not read the version of ${binaryPath} (\`claude --version\` failed) — using claude `
+        + `${version} from the patch manifest, which recorded it when this binary was patched. `
+        + 'This is expected when a bad patch left the install unable to run.',
+      );
+    } else {
       p.log.error(
-        `Binary restored at ${binaryPath}, but could not remove manifest ${manifestPath}: `
-          + `${err instanceof Error ? err.message : String(err)}. Remove the stale manifest before rerunning `
-          + '`clodex patch`.',
+        `Could not determine the version of ${binaryPath} (\`claude --version\` failed), and `
+        + 'no patch manifest records a pristine backup for it, so clodex cannot tell which backup '
+        + `belongs to this install. Restore it by hand from ${backupDir()} (or reinstall Claude Code).`,
       );
       return 1;
     }
+
+    // Prepare the verified bytes beside the live binary, then rename them into place.
+    // The staged copy keeps a short or corrupted restore from touching the install.
+    const plan = planRestoreOnly(collectPristineFacts({ version, binaryPath, manifest }));
+    if (plan.action === 'error') {
+      p.log.error(plan.message);
+      return 1;
+    }
+    for (const note of plan.notes) p.log.warn(note);
+    const verified = verifyPristineSource(plan, version);
+    if (!verified.ok) {
+      p.log.error(verified.message);
+      return 1;
+    }
+
+    const manifestPath = getPatchManifestPath();
+    const stagedRestorePath = join(
+      dirname(binaryPath),
+      `.clodex-patch-restore-${process.pid}-${randomUUID()}`,
+    );
+    let restoreStagePath: string | undefined = stagedRestorePath;
+    let restoreOperation = `copy pristine bytes from ${plan.backupPath}`;
+    try {
+      copyFileSync(plan.backupPath, stagedRestorePath);
+      restoreOperation = 'validate staged restore size';
+      const backupSize = statSync(plan.backupPath).size;
+      const stagedSize = statSync(stagedRestorePath).size;
+      if (stagedSize !== backupSize) {
+        throw new Error(`staged size ${stagedSize} does not match backup size ${backupSize}`);
+      }
+      restoreOperation = 'validate staged restore hash';
+      const stagedSha256 = sha256File(stagedRestorePath);
+      if (stagedSha256 !== plan.pristineSha256) {
+        throw new Error(`staged sha256 ${stagedSha256} does not match expected ${plan.pristineSha256}`);
+      }
+      restoreOperation = `rename staged restore over ${binaryPath}`;
+      renameSync(stagedRestorePath, binaryPath);
+      restoreStagePath = undefined;
+    } catch (err) {
+      let retainedStage = '';
+      if (restoreStagePath !== undefined) {
+        try {
+          rmSync(restoreStagePath, { force: true });
+          restoreStagePath = undefined;
+        } catch (cleanupError) {
+          retainedStage = ` Retained staged restore at ${restoreStagePath} after cleanup failed: ${
+            cleanupError instanceof Error ? cleanupError.message : String(cleanupError)
+          }.`;
+        }
+      }
+      p.log.error(
+        `Could not ${restoreOperation}: ${err instanceof Error ? err.message : String(err)}.${retainedStage}`,
+      );
+      return 1;
+    }
+
+    if (manifest === null || manifest.binaryPath === binaryPath) {
+      try {
+        unlinkSync(manifestPath);
+      } catch (err) {
+        if ((err as NodeJS.ErrnoException).code !== 'ENOENT') {
+          p.log.error(
+            `Binary restored at ${binaryPath}, but could not remove manifest ${manifestPath}: `
+              + `${err instanceof Error ? err.message : String(err)}. Remove the stale manifest before rerunning `
+              + '`clodex patch`.',
+          );
+          return 1;
+        }
+      }
+    } else {
+      p.log.warn(
+        `Manifest ${manifestPath} records a patch of ${manifest.binaryPath}, not ${binaryPath}; left it in place.`,
+      );
+    }
+    p.log.success(`Restored pristine claude ${version} from ${plan.backupPath}.`);
+    return 0;
+  } finally {
+    release();
   }
-  p.log.success(`Restored pristine claude ${version} from ${plan.backupPath}.`);
-  return 0;
 }
 
 export async function runPatchCommand(opts: {

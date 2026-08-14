@@ -44,6 +44,9 @@ const hoisted = vi.hoisted(() => ({
   failRestoreRename: false,
   failManifestUnlink: false,
   restoreCopyMutation: null as 'short' | 'wrong-hash' | null,
+  nestedRestoreOnCandidateRename: false,
+  equalSizeAfterNestedRestore: false,
+  nestedRestoreResult: null as Promise<number> | null,
 }));
 
 vi.mock('node:fs', async () => {
@@ -95,7 +98,26 @@ vi.mock('node:fs', async () => {
         error.code = 'EIO';
         throw error;
       }
-      return actual.renameSync(oldPath, newPath);
+      const result = actual.renameSync(oldPath, newPath);
+      if (
+        hoisted.nestedRestoreOnCandidateRename
+        && oldText.includes('.clodex-patch-')
+        && !oldText.includes('.clodex-patch-restore-')
+        && !oldText.includes('.clodex-patch-rollback-')
+      ) {
+        hoisted.nestedRestoreOnCandidateRename = false;
+        const candidateBytes = hoisted.equalSizeAfterNestedRestore
+          ? actual.readFileSync(newPath)
+          : undefined;
+        hoisted.nestedRestoreResult = runPatchCommand({ restore: true });
+        if (candidateBytes !== undefined) {
+          const liveBytes = actual.readFileSync(newPath);
+          const equalSizeBytes = Buffer.alloc(candidateBytes.length);
+          liveBytes.copy(equalSizeBytes);
+          actual.writeFileSync(newPath, equalSizeBytes);
+        }
+      }
+      return result;
     },
     unlinkSync: (path: import('node:fs').PathLike) => {
       if (hoisted.failManifestUnlink && String(path).endsWith('patch-state.json')) {
@@ -220,6 +242,9 @@ beforeEach(() => {
   hoisted.failRestoreRename = false;
   hoisted.failManifestUnlink = false;
   hoisted.restoreCopyMutation = null;
+  hoisted.nestedRestoreOnCandidateRename = false;
+  hoisted.equalSizeAfterNestedRestore = false;
+  hoisted.nestedRestoreResult = null;
   logs = [];
   vi.mocked(p.confirm).mockReset();
   vi.mocked(p.isCancel).mockReset().mockReturnValue(false);
@@ -886,6 +911,47 @@ describe('runPatchCommand legacy backup compatibility', () => {
 });
 
 describe('runPatchCommand --restore', () => {
+  it('does not interleave restore with publication of a patch candidate', async () => {
+    const real = installClaude('2.1.220');
+    expect(await runPatchCommand({})).toBe(0);
+    saveFavorites(
+      [{ providerId: 'openai-oauth', modelId: 'gpt-5.6-sol' }],
+      [{ name: 'terra', providerId: 'openai-oauth', modelId: 'gpt-5.6-sol' }],
+    );
+    hoisted.nestedRestoreOnCandidateRename = true;
+
+    expect(await runPatchCommand({})).toBe(0);
+    expect(hoisted.nestedRestoreResult).not.toBeNull();
+    expect(await hoisted.nestedRestoreResult!).toBe(1);
+    expect(logs.join('\\n')).toContain('Another clodex process is patching the claude binary right now — skipped.');
+
+    const manifest = readPatchManifest();
+    expect(manifest).not.toBeNull();
+    expect(manifest!.binaryPath).toBe(real);
+    expect(manifest!.patchedSize).toBe(readFileSync(real).byteLength);
+    expect(manifest!.patchedSha256).toBe(sha256Of(real));
+  });
+
+  it('does not publish a false-current manifest after an equal-size interleaving', async () => {
+    const real = installClaude('2.1.220');
+    expect(await runPatchCommand({})).toBe(0);
+    saveFavorites(
+      [{ providerId: 'openai-oauth', modelId: 'gpt-5.6-sol' }],
+      [{ name: 'terra', providerId: 'openai-oauth', modelId: 'gpt-5.6-sol' }],
+    );
+    hoisted.nestedRestoreOnCandidateRename = true;
+    hoisted.equalSizeAfterNestedRestore = true;
+
+    expect(await runPatchCommand({})).toBe(0);
+    expect(hoisted.nestedRestoreResult).not.toBeNull();
+    expect(await hoisted.nestedRestoreResult!).toBe(1);
+
+    const manifest = readPatchManifest();
+    expect(manifest).not.toBeNull();
+    expect(manifest!.patchedSize).toBe(readFileSync(real).byteLength);
+    expect(manifest!.patchedSha256).toBe(sha256Of(real));
+  });
+
   it('restores the pristine binary and drops the manifest', async () => {
     const real = installClaude('2.1.220');
     const pristineBytes = readFileSync(real);
@@ -895,6 +961,27 @@ describe('runPatchCommand --restore', () => {
     expect(await runPatchCommand({ restore: true })).toBe(0);
     expect(readFileSync(real)).toEqual(pristineBytes);
     expect(readPatchManifest()).toBeNull();
+  });
+
+  it('leaves another target manifest in place when restoring a same-version binary', async () => {
+    const realA = installClaude('2.1.220');
+    const pristineBytes = readFileSync(realA);
+    expect(await runPatchCommand({})).toBe(0);
+    const manifestPath = join(clodexHome, 'patch-state.json');
+    const manifestBytes = readFileSync(manifestPath);
+    const manifest = readPatchManifest()!;
+
+    const realB = join(home, '.local', 'share', 'claude', 'other-version', 'claude');
+    writeFakeClaude(realB, '2.1.220');
+    const resolvedB = realpathSync(realB);
+    process.env.TWEAKCC_CC_INSTALLATION_PATH = realB;
+
+    expect(await runPatchCommand({ restore: true })).toBe(0);
+    expect(readFileSync(realB)).toEqual(pristineBytes);
+    expect(readFileSync(manifestPath)).toEqual(manifestBytes);
+    const output = logs.join('\\n');
+    expect(output).toContain(`Manifest ${manifestPath} records a patch of ${manifest.binaryPath}, not ${resolvedB}`);
+    expect(output).toContain('left it in place');
   });
 
   it.each(['short', 'wrong-hash'] as const)(
