@@ -47,6 +47,13 @@ export function resolveEndpoint(
 
 export interface MaterializeOptions {
   agent?: CompatibilityAgent;
+  /**
+   * Same channel `loadRegistryProviders` already hands to
+   * `applySelectedOAuthAccount`. Materialization drops a model whose endpoint
+   * fails URL/credential-destination validation; without this the drop is
+   * invisible and the model simply never appears in the picker.
+   */
+  warn?: (message: string) => void;
 }
 
 export { openCodeGoPinnedApiUrl } from './resolve-template.js';
@@ -78,9 +85,30 @@ function resolveMaterializedApiUrl(
   return cached.apiUrl ?? provider.api.url ?? '';
 }
 
+/**
+ * Explain a fail-closed materialization drop without echoing the rejected
+ * value. The endpoint that failed validation is exactly the string not to put
+ * on the console — an untrusted destination, and on custom providers a URL that
+ * can carry credential material — so the notice names the failing check and the
+ * repair, never the URL, the key, or the resolved endpoint.
+ */
+function reportOmittedModel(
+  cached: CachedModel,
+  provider: RegistryProvider,
+  reason: string,
+  repair: string,
+  warn?: (message: string) => void,
+): null {
+  warn?.(
+    `Model "${cached.id}" from provider "${provider.id}" was omitted: ${reason}. ${repair}`,
+  );
+  return null;
+}
+
 export function cachedModelToLocal(
   cached: CachedModel,
   provider: RegistryProvider,
+  warn?: (message: string) => void,
 ): LocalProviderModel | null {
   const freeStatus = classifyFreeStatus({
     model: cached,
@@ -94,9 +122,29 @@ export function cachedModelToLocal(
   const customAnthropic = provider.templateId === 'custom-anthropic';
   const npm = customAnthropic ? '@ai-sdk/anthropic' : (cached.npm ?? provider.api.npm ?? '');
   const apiUrl = resolveMaterializedApiUrl(cached, provider, npm);
-  if (apiUrl === null) return null;
+  if (apiUrl === null) {
+    return reportOmittedModel(
+      cached,
+      provider,
+      `its retained OpenCode Go identity has no pinned API URL for SDK package "${npm}"`,
+      `Refresh the provider's models with: clodex providers refresh-models ${provider.id}`,
+      warn,
+    );
+  }
   const endpoint = resolveEndpoint(npm, apiUrl);
-  if (endpoint === null) return null;
+  if (endpoint === null) {
+    return reportOmittedModel(
+      cached,
+      provider,
+      npm === '@ai-sdk/anthropic'
+        ? 'its Anthropic base URL failed the credential-destination check'
+        : npm
+          ? 'no API URL is configured for its endpoint'
+          : 'it names no SDK package, so no trusted endpoint can be resolved for it',
+      `Re-add the provider with a trusted endpoint: clodex providers remove ${provider.id}, then clodex providers add`,
+      warn,
+    );
+  }
 
   const retainedOpenCodeGo = isRetainedOpenCodeGoProvider(provider);
   const modelsDev = retainedOpenCodeGo ? null : findModelsDevModel(provider.id, cached.id);
@@ -263,6 +311,7 @@ function materializeOne(
   provider: RegistryProvider,
   resolveCredential: CredentialResolver,
   agent: CompatibilityAgent,
+  warn?: (message: string) => void,
 ): LocalProvider | null {
   if (!provider.enabled) return null;
   if (!isValidProviderId(provider.id)) return null;
@@ -282,7 +331,7 @@ function materializeOne(
       templateId: provider.templateId,
     });
     if (freeOnly && !isFreeStatus(freeStatus)) continue;
-    const model = cachedModelToLocal(cached, provider);
+    const model = cachedModelToLocal(cached, provider, warn);
     if (!model) continue;
     if (shouldHideModel({
       providerId: provider.id,
@@ -316,7 +365,7 @@ export function materializeRegistry(
   const agent = opts?.agent ?? 'claude';
   const result: LocalProvider[] = [];
   for (const provider of registry.providers) {
-    const local = materializeOne(provider, resolveCredential, agent);
+    const local = materializeOne(provider, resolveCredential, agent, opts?.warn);
     if (local) result.push(local);
   }
   return result;

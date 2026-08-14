@@ -11,6 +11,7 @@ import {
   slugifyProviderId,
   toggleProviderEnabled,
 } from '../src/registry/index.js';
+import { cachedModelToLocal } from '../src/registry/materialize.js';
 import { loadRegistryStrict } from '../src/registry/io.js';
 import { withRegistryWriteLockSync } from '../src/registry/lock.js';
 import {
@@ -725,6 +726,106 @@ describe('materializeRegistry', () => {
     registry.providers.push(customAnthropicProvider(providerUrl));
 
     expect(materializeRegistry(registry, () => 'credential-sentinel')).toEqual([]);
+  });
+
+  it('reports a rejected custom Anthropic destination without echoing the URL or credential', () => {
+    const registry = emptyRegistry();
+    registry.providers.push(customAnthropicProvider('https://user:pass@provider.example/v1?destination=other'));
+    const warnings: string[] = [];
+
+    // Still fail-closed: the notice explains the omission, it does not restore the model.
+    expect(materializeRegistry(
+      registry,
+      () => 'credential-sentinel',
+      { warn: message => warnings.push(message) },
+    )).toEqual([]);
+
+    expect(warnings).toEqual([
+      'Model "custom-model" from provider "custom-anthropic-test" was omitted: '
+      + 'its Anthropic base URL failed the credential-destination check. '
+      + 'Re-add the provider with a trusted endpoint: clodex providers remove custom-anthropic-test, '
+      + 'then clodex providers add',
+    ]);
+    expect(warnings[0]).not.toContain('provider.example');
+    expect(warnings[0]).not.toContain('user:pass');
+    expect(warnings[0]).not.toContain('credential-sentinel');
+  });
+
+  it('reports an OpenAI-compatible model that resolves to no endpoint at all', () => {
+    const registry = emptyRegistry();
+    registry.providers.push({
+      id: 'custom-openai-test',
+      templateId: 'custom-openai',
+      name: 'Custom OpenAI Test',
+      enabled: true,
+      authRef: 'keyring:provider:custom-openai-test',
+      authType: 'api',
+      api: { npm: '@ai-sdk/openai-compatible' },
+      addedAt: '2026-08-13T00:00:00.000Z',
+      modelsCache: {
+        fetchedAt: '2026-08-13T00:00:00.000Z',
+        models: [{
+          id: 'endpointless-model',
+          name: 'Endpointless Model',
+          upstreamModelId: 'endpointless-model',
+          modelFormat: 'openai',
+          npm: '@ai-sdk/openai-compatible',
+        }],
+      },
+    });
+    const warnings: string[] = [];
+
+    expect(materializeRegistry(
+      registry,
+      () => 'credential-sentinel',
+      { warn: message => warnings.push(message) },
+    )).toEqual([]);
+
+    expect(warnings).toEqual([
+      'Model "endpointless-model" from provider "custom-openai-test" was omitted: '
+      + 'no API URL is configured for its endpoint. '
+      + 'Re-add the provider with a trusted endpoint: clodex providers remove custom-openai-test, '
+      + 'then clodex providers add',
+    ]);
+    expect(warnings[0]).not.toContain('credential-sentinel');
+  });
+
+  // Exercised directly rather than through materializeRegistry: the retained
+  // OpenCode allowlist projection pins every surviving row's SDK package, so
+  // this rejection is unreachable through the registry today. It stays covered
+  // because cachedModelToLocal is exported and callable with an unprojected row.
+  it('reports a retained OpenCode model with no pinned API URL for its SDK package', () => {
+    const warnings: string[] = [];
+
+    const model = cachedModelToLocal(
+      {
+        id: 'unsupported-sentinel',
+        name: 'Unsupported Sentinel',
+        upstreamModelId: 'unsupported-sentinel',
+        modelFormat: 'openai',
+        npm: '@ai-sdk/openai',
+        apiUrl: 'https://model-sentinel.invalid/v1',
+      } as never,
+      {
+        id: 'opencode-go',
+        templateId: 'opencode-go',
+        name: 'OpenCode Go',
+        enabled: true,
+        authRef: 'keyring:provider:opencode-go',
+        authType: 'api',
+        api: { npm: '@ai-sdk/openai-compatible', url: 'https://provider-sentinel.invalid/v1' },
+        addedAt: '2026-08-11T00:00:00.000Z',
+      } as never,
+      message => warnings.push(message),
+    );
+
+    expect(model).toBeNull();
+    expect(warnings).toEqual([
+      'Model "unsupported-sentinel" from provider "opencode-go" was omitted: '
+      + 'its retained OpenCode Go identity has no pinned API URL for SDK package "@ai-sdk/openai". '
+      + "Refresh the provider's models with: clodex providers refresh-models opencode-go",
+    ]);
+    expect(warnings[0]).not.toContain('.invalid');
   });
 
   it('pins OpenCode OpenAI-compatible models to the reviewed completions authority', () => {
