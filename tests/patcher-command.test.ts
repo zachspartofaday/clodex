@@ -40,27 +40,71 @@ const hoisted = vi.hoisted(() => ({
   /** Paths passed to readContent, so tests can pin how MANY extractions ran. */
   readContentCalls: [] as string[],
   failManifestRename: false,
+  failRollbackRename: false,
+  failRestoreRename: false,
+  failManifestUnlink: false,
+  restoreCopyMutation: null as 'short' | 'wrong-hash' | null,
 }));
 
 vi.mock('node:fs', async () => {
   const actual = await vi.importActual<typeof import('node:fs')>('node:fs');
   return {
     ...actual,
+    copyFileSync: (
+      from: import('node:fs').PathLike,
+      to: import('node:fs').PathLike,
+    ) => {
+      actual.copyFileSync(from, to);
+      if (hoisted.restoreCopyMutation && String(to).includes('.clodex-patch-restore-')) {
+        const bytes = actual.readFileSync(to);
+        if (hoisted.restoreCopyMutation === 'short') {
+          actual.writeFileSync(to, bytes.subarray(0, Math.max(0, bytes.length - 1)));
+        } else {
+          const wrongHash = Buffer.from(bytes);
+          wrongHash[0] = (wrongHash[0] ?? 0) ^ 0xff;
+          actual.writeFileSync(to, wrongHash);
+        }
+        hoisted.restoreCopyMutation = null;
+      }
+    },
     renameSync: (
       oldPath: import('node:fs').PathLike,
       newPath: import('node:fs').PathLike,
     ) => {
+      const oldText = String(oldPath);
+      const newText = String(newPath);
       if (
         hoisted.failManifestRename
-        && String(oldPath).includes('patch-state.json.tmp-')
-        && String(newPath).endsWith('patch-state.json')
+        && oldText.includes('patch-state.json.tmp-')
+        && newText.endsWith('patch-state.json')
       ) {
         hoisted.failManifestRename = false;
         const error = new Error('injected final manifest rename failure') as NodeJS.ErrnoException;
         error.code = 'EACCES';
         throw error;
       }
+      if (hoisted.failRollbackRename && oldText.includes('.clodex-patch-rollback-')) {
+        hoisted.failRollbackRename = false;
+        const error = new Error('injected rollback rename failure') as NodeJS.ErrnoException;
+        error.code = 'EIO';
+        throw error;
+      }
+      if (hoisted.failRestoreRename && oldText.includes('.clodex-patch-restore-')) {
+        hoisted.failRestoreRename = false;
+        const error = new Error('injected restore rename failure') as NodeJS.ErrnoException;
+        error.code = 'EIO';
+        throw error;
+      }
       return actual.renameSync(oldPath, newPath);
+    },
+    unlinkSync: (path: import('node:fs').PathLike) => {
+      if (hoisted.failManifestUnlink && String(path).endsWith('patch-state.json')) {
+        hoisted.failManifestUnlink = false;
+        const error = new Error('injected manifest unlink failure') as NodeJS.ErrnoException;
+        error.code = 'EACCES';
+        throw error;
+      }
+      return actual.unlinkSync(path);
     },
   };
 });
@@ -172,6 +216,10 @@ beforeEach(() => {
 
   hoisted.readContentCalls.length = 0;
   hoisted.failManifestRename = false;
+  hoisted.failRollbackRename = false;
+  hoisted.failRestoreRename = false;
+  hoisted.failManifestUnlink = false;
+  hoisted.restoreCopyMutation = null;
   logs = [];
   vi.mocked(p.confirm).mockReset();
   vi.mocked(p.isCancel).mockReset().mockReturnValue(false);
@@ -849,6 +897,59 @@ describe('runPatchCommand --restore', () => {
     expect(readPatchManifest()).toBeNull();
   });
 
+  it.each(['short', 'wrong-hash'] as const)(
+    'leaves live bytes and manifest unchanged when the staged restore is %s',
+    async mutation => {
+      const real = installClaude('2.1.220');
+      expect(await runPatchCommand({})).toBe(0);
+      const liveBytes = readFileSync(real);
+      const manifestPath = join(clodexHome, 'patch-state.json');
+      const manifestBytes = readFileSync(manifestPath);
+      hoisted.restoreCopyMutation = mutation;
+
+      expect(await runPatchCommand({ restore: true })).toBe(1);
+
+      expect(readFileSync(real)).toEqual(liveBytes);
+      expect(readFileSync(manifestPath)).toEqual(manifestBytes);
+      expect(logs.join('\\n')).toMatch(/staged restore/);
+      expect(logs.join('\\n')).not.toContain('success: Restored pristine');
+    },
+  );
+
+  it('leaves live bytes and manifest unchanged when the restore rename fails', async () => {
+    const real = installClaude('2.1.220');
+    expect(await runPatchCommand({})).toBe(0);
+    const liveBytes = readFileSync(real);
+    const manifestPath = join(clodexHome, 'patch-state.json');
+    const manifestBytes = readFileSync(manifestPath);
+    hoisted.failRestoreRename = true;
+
+    expect(await runPatchCommand({ restore: true })).toBe(1);
+
+    expect(readFileSync(real)).toEqual(liveBytes);
+    expect(readFileSync(manifestPath)).toEqual(manifestBytes);
+    expect(logs.join('\\n')).toContain('injected restore rename failure');
+    expect(logs.join('\\n')).not.toContain('success: Restored pristine');
+  });
+
+  it('reports manifest divergence after restoring pristine bytes', async () => {
+    const real = installClaude('2.1.220');
+    expect(await runPatchCommand({})).toBe(0);
+    const pristineBytes = readFileSync(readPatchManifest()!.backupPath);
+    const manifestPath = join(clodexHome, 'patch-state.json');
+    hoisted.failManifestUnlink = true;
+
+    expect(await runPatchCommand({ restore: true })).toBe(1);
+
+    expect(readFileSync(real)).toEqual(pristineBytes);
+    expect(existsSync(manifestPath)).toBe(true);
+    const output = logs.join('\\n');
+    expect(output).toContain(`Binary restored at ${real}`);
+    expect(output).toContain(manifestPath);
+    expect(output).toMatch(/Remove the stale manifest before rerunning `clodex patch`/);
+    expect(output).not.toContain('success: Restored pristine');
+  });
+
   it('reports an error instead of restoring when no trustworthy backup exists', async () => {
     const real = installClaude('2.1.220');
     const before = sha256Of(real);
@@ -997,6 +1098,34 @@ describe('runPatchCommand publication transaction', () => {
     expect(readFileSync(join(tweakccDir, 'native-binary.backup'))).toEqual(priorLiveBytes);
     expect(publicationRemnants(clodexHome)).toEqual([]);
     expect(publicationRemnants(join(real, '..'))).toEqual([]);
+  });
+
+  it('reports both publication and rollback failures while retaining the rescue hardlink', async () => {
+    const real = installClaude('2.1.220');
+    expect(await runPatchCommand({})).toBe(0);
+    const priorLiveBytes = readFileSync(real);
+    saveFavorites(
+      [{ providerId: 'openai-oauth', modelId: 'gpt-5.6-sol' }],
+      [{ name: 'terra', providerId: 'openai-oauth', modelId: 'gpt-5.6-sol' }],
+    );
+    hoisted.failManifestRename = true;
+    hoisted.failRollbackRename = true;
+
+    expect(await runPatchCommand({})).toBe(1);
+
+    const rollbackPaths = publicationRemnants(join(real, '..')).filter(name => (
+      name.includes('.clodex-patch-rollback-')
+    ));
+    expect(rollbackPaths).toHaveLength(1);
+    expect(readFileSync(join(real, '..', rollbackPaths[0]!))).toEqual(priorLiveBytes);
+    expect(readFileSync(real)).not.toEqual(priorLiveBytes);
+    expect(bundleOf(real)).toContain('"terra"');
+    const output = logs.join('\\n');
+    expect(output).toContain('injected final manifest rename failure');
+    expect(output).toContain('injected rollback rename failure');
+    expect(output).toContain(real);
+    expect(output).toContain(join(real, '..', rollbackPaths[0]!));
+    expect(output).toMatch(/rename .* over .* before rerunning `clodex patch`/);
   });
 });
 
