@@ -7,10 +7,12 @@ import {
   OPENCODE_GO_COMPLETIONS_BASE_URL,
   OPENCODE_GO_SOURCE,
   OPENCODE_GO_SOURCE_FETCHED_AT,
+  OPENCODE_GO_SOURCE_ASSET_SHA256,
   OPENCODE_GO_SOURCE_MODELS_SHA256,
   OPENCODE_GO_SOURCE_RELEASE_COMMIT,
   OPENCODE_GO_SOURCE_VERSION,
 } from '../src/data/opencode-go-models.js';
+import snapshot from '../src/data/opencode-go-cli-snapshot.json';
 import { TEST_TIMEOUT_MS } from '../src/constants.js';
 import { buildHttpProxyRoutes } from '../src/http-proxy/routes.js';
 import { getTemplateById, verifyOpenCodeGoCredential } from '../src/provider-templates.js';
@@ -51,15 +53,33 @@ describe('OpenCode Go catalog', () => {
    * update:opencode-go`, the right move is to check the diff and update these
    * numbers on purpose — not to loosen them.
    */
+  it('mirrors every provenance constant from the committed snapshot', () => {
+    // The constants are a MIRROR of the snapshot, so a hand-edited constant that
+    // no longer names the capture it claims must fail here rather than being
+    // read as provenance for bytes it did not come from.
+    const meta = (snapshot as { _meta: Record<string, string> })._meta;
+    expect(OPENCODE_GO_SOURCE).toBe(meta.sourceCommand);
+    expect(OPENCODE_GO_SOURCE_FETCHED_AT).toBe(meta.capturedAt);
+    expect(OPENCODE_GO_SOURCE_VERSION).toBe(meta.openCodeVersion);
+    expect(OPENCODE_GO_SOURCE_RELEASE_COMMIT).toBe(meta.releaseCommit);
+    expect(OPENCODE_GO_SOURCE_ASSET_SHA256).toBe(meta.releaseAssetSha256);
+    expect(OPENCODE_GO_SOURCE_MODELS_SHA256).toBe(meta.normalizedModelsSha256);
+  });
+
   it('records its OpenCode catalog source and excludes Responses-only models', () => {
     const models = buildOpenCodeGoModels();
     const ids = models.map(model => model.id);
 
+    // EXACT, not shape-matched. A shape assertion passes for any well-formed
+    // hash, so a regeneration from a different capture would ship silently —
+    // which is the one thing these tripwires exist to stop. Update them on
+    // purpose after reading the diff.
     expect(OPENCODE_GO_SOURCE).toBe('opencode --pure models opencode-go --verbose');
-    expect(Number.isNaN(Date.parse(OPENCODE_GO_SOURCE_FETCHED_AT))).toBe(false);
+    expect(new Date(OPENCODE_GO_SOURCE_FETCHED_AT).toISOString()).toBe('2026-08-09T17:47:18.000Z');
     expect(OPENCODE_GO_SOURCE_VERSION).toBe('1.18.15');
-    expect(OPENCODE_GO_SOURCE_RELEASE_COMMIT).toMatch(/^[0-9a-f]{40}$/);
-    expect(OPENCODE_GO_SOURCE_MODELS_SHA256).toMatch(/^[0-9a-f]{64}$/);
+    expect(OPENCODE_GO_SOURCE_RELEASE_COMMIT).toBe('d7b115f623760e68a4749d16508a9eca350f246f');
+    expect(OPENCODE_GO_SOURCE_ASSET_SHA256).toBe('bd60b57cb9fe0494a5352c807424d36d6d7853cf6dbddb97065c7ccd3c5d391c');
+    expect(OPENCODE_GO_SOURCE_MODELS_SHA256).toBe('fa41e01da5fe41fb08e75b37adf1c5404902489c4dc76d390e5209f555897cb4');
     expect(models).toHaveLength(17);
     expect(new Set(ids).size).toBe(models.length);
     expect(ids).not.toContain('grok-4.5');

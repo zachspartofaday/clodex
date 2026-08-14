@@ -342,6 +342,7 @@ const PROVENANCE_CONSTANTS = [
   ['OPENCODE_GO_SOURCE_FETCHED_AT', meta => meta.capturedAt],
   ['OPENCODE_GO_SOURCE_VERSION', meta => meta.openCodeVersion],
   ['OPENCODE_GO_SOURCE_RELEASE_COMMIT', meta => meta.releaseCommit],
+  ['OPENCODE_GO_SOURCE_ASSET_SHA256', meta => meta.releaseAssetSha256],
   ['OPENCODE_GO_SOURCE_MODELS_SHA256', meta => meta.normalizedModelsSha256],
 ];
 

@@ -21,11 +21,19 @@ export const OPENCODE_GO_ANTHROPIC_BASE_URL = 'https://opencode.ai/zen/go';
  * normalized rows: an integrity/reproducibility marker for which capture the
  * catalog was generated from. It authenticates nothing about the upstream
  * release, and nothing here fetches or verifies one.
+ *
+ * `OPENCODE_GO_SOURCE_ASSET_SHA256` names the exact release asset the capture
+ * was taken from, and is exactly as strong: it records WHICH bytes a maintainer
+ * ran, so a later capture claiming the same version can be told apart from this
+ * one. It is a provenance record of a reviewed local run, not an authenticity
+ * claim about the upstream project — nothing here downloads or verifies the
+ * asset, and no code path treats a matching digest as trust.
  */
 export const OPENCODE_GO_SOURCE = 'opencode --pure models opencode-go --verbose';
 export const OPENCODE_GO_SOURCE_FETCHED_AT = '2026-08-09T17:47:18Z';
 export const OPENCODE_GO_SOURCE_VERSION = '1.18.15';
 export const OPENCODE_GO_SOURCE_RELEASE_COMMIT = 'd7b115f623760e68a4749d16508a9eca350f246f';
+export const OPENCODE_GO_SOURCE_ASSET_SHA256 = 'bd60b57cb9fe0494a5352c807424d36d6d7853cf6dbddb97065c7ccd3c5d391c';
 export const OPENCODE_GO_SOURCE_MODELS_SHA256 = 'fa41e01da5fe41fb08e75b37adf1c5404902489c4dc76d390e5209f555897cb4';
 
 type OpenCodeGoModel = Pick<CachedModel, 'id' | 'name'>
