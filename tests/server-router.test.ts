@@ -17,7 +17,7 @@ import { ensureHttpProxyCertificates, type HttpProxyCertificates } from '../src/
 const TEST_HELPER_REF = `helper:v1:${'a'.repeat(64)}:oauth:provider:oauth-provider`;
 const upstreamTlsHome = mkdtempSync(join(tmpdir(), 'clodex-server-router-tls-'));
 const previousDispatcher = getGlobalDispatcher();
-const upstreamDispatcher = new Agent({ connect: { rejectUnauthorized: false } });
+let upstreamDispatcher: Agent;
 let upstreamCertificates: HttpProxyCertificates;
 
 beforeAll(() => {
@@ -29,6 +29,14 @@ beforeAll(() => {
     if (previousHome === undefined) delete process.env.CLODEX_HOME;
     else process.env.CLODEX_HOME = previousHome;
   }
+  // Keep TLS verification ON for the loopback upstreams below: trust exactly
+  // the CA generated into this file's throwaway CLODEX_HOME, and check the
+  // certificate against the name it was actually issued for (the listeners are
+  // reached over 127.0.0.1, which is not in its SAN). Disabling verification
+  // file-wide instead would let a genuine certificate regression pass here.
+  upstreamDispatcher = new Agent({
+    connect: { ca: upstreamCertificates.caCert, servername: 'api.anthropic.com' },
+  });
   setGlobalDispatcher(upstreamDispatcher);
 });
 
