@@ -1028,6 +1028,223 @@ describe('relayAnthropicMessages streaming', () => {
   });
 });
 
+/**
+ * A direct launch reads throttling state straight off the upstream response.
+ * Behind the relay the client only ever sees what this boundary re-emits, so
+ * dropping the rate-limit/request metadata makes an inline proxy strictly worse
+ * at the one moment it matters most — being throttled.
+ */
+describe('relayAnthropicMessages relays upstream rate-limit metadata', () => {
+  afterEach(() => {
+    vi.unstubAllGlobals();
+  });
+
+  const META = {
+    'anthropic-ratelimit-requests-remaining': '0',
+    'anthropic-ratelimit-requests-reset': '2026-08-13T00:00:00Z',
+    'anthropic-ratelimit-input-tokens-limit': '80000',
+    'x-ratelimit-limit-requests': '4000',
+    'request-id': 'req_abc123',
+    'x-request-id': 'xreq_abc123',
+  };
+
+  function makeRes() {
+    const chunks: Buffer[] = [];
+    let headers: Record<string, string> = {};
+    let status = 0;
+    const res = {
+      writeHead(code: number, hdrs: Record<string, string>) { status = code; headers = hdrs; return res; },
+      write(chunk: unknown) { chunks.push(Buffer.from(chunk as Buffer)); return true; },
+      end(chunk?: unknown) { if (chunk) chunks.push(Buffer.from(chunk as Buffer)); },
+      destroy() { /* noop */ },
+      on() { return res; },
+      once() { return res; },
+      emit() { return false; },
+      removeListener() { return res; },
+      body: () => Buffer.concat(chunks).toString('utf8'),
+      status: () => status,
+      headers: () => headers,
+    };
+    return res;
+  }
+
+  function makeStreamRes() {
+    const chunks: Buffer[] = [];
+    let status = 0;
+    let headers: Record<string, string> = {};
+    const res = new Writable({
+      write(chunk: Buffer, _enc, cb) { chunks.push(Buffer.from(chunk)); cb(); },
+    }) as Writable & {
+      writeHead: (code: number, hdrs?: Record<string, string>) => unknown;
+      status: () => number;
+      headers: () => Record<string, string>;
+    };
+    res.writeHead = (code, hdrs) => { status = code; headers = hdrs ?? {}; return res; };
+    res.status = () => status;
+    res.headers = () => headers;
+    return res;
+  }
+
+  it('relays the metadata on the JSON success exit', async () => {
+    vi.stubGlobal('fetch', vi.fn(async () => new Response(
+      JSON.stringify({ id: 'msg_1', type: 'message', model: 'qwen3.8-max', content: [] }),
+      { status: 200, headers: { 'Content-Type': 'application/json', ...META } },
+    )));
+    const res = makeRes();
+    await relayAnthropicMessages(
+      res as never,
+      'https://upstream.example/v1/messages',
+      { model: 'qwen3.8-max' },
+      'key',
+      false,
+      {},
+    );
+    const headers = res.headers();
+    expect(headers['anthropic-ratelimit-requests-remaining']).toBe('0');
+    expect(headers['anthropic-ratelimit-requests-reset']).toBe('2026-08-13T00:00:00Z');
+    expect(headers['anthropic-ratelimit-input-tokens-limit']).toBe('80000');
+    expect(headers['x-ratelimit-limit-requests']).toBe('4000');
+    expect(headers['request-id']).toBe('req_abc123');
+    expect(headers['x-request-id']).toBe('xreq_abc123');
+    // The JSON exit still owns its own framing.
+    expect(headers['Content-Type']).toBe('application/json');
+    expect(headers['Content-Length']).toBe(String(Buffer.byteLength(res.body())));
+  });
+
+  it('relays the metadata on the streaming success exit without losing SSE framing', async () => {
+    vi.stubGlobal('fetch', vi.fn(async () => new Response('event: message_stop\ndata: {}\n\n', {
+      status: 200,
+      headers: { 'Content-Type': 'text/event-stream', ...META },
+    })));
+    const res = makeStreamRes();
+    const done = new Promise<void>(resolve => res.on('finish', () => resolve()));
+    await relayAnthropicMessages(
+      res as never,
+      'https://upstream.example/v1/messages',
+      { model: 'qwen3.8-max', stream: true },
+      'key',
+      true,
+      {},
+    );
+    await done;
+    const headers = res.headers();
+    expect(headers['anthropic-ratelimit-requests-remaining']).toBe('0');
+    expect(headers['request-id']).toBe('req_abc123');
+    expect(headers['Content-Type']).toBe('text/event-stream');
+    expect(headers['Cache-Control']).toBe('no-cache');
+    expect(headers['Connection']).toBe('keep-alive');
+  });
+
+  it('relays the metadata on the upstream-error exit', async () => {
+    vi.stubGlobal('fetch', vi.fn(async () => new Response(
+      JSON.stringify({ type: 'error', error: { type: 'overloaded_error', message: 'busy' } }),
+      { status: 529, headers: { 'Content-Type': 'application/json', ...META } },
+    )));
+    const res = makeRes();
+    await relayAnthropicMessages(
+      res as never,
+      'https://upstream.example/v1/messages',
+      { model: 'qwen3.8-max' },
+      'key',
+      false,
+      {},
+    );
+    expect(res.status()).toBe(529);
+    expect(res.headers()['anthropic-ratelimit-requests-remaining']).toBe('0');
+    expect(res.headers()['x-request-id']).toBe('xreq_abc123');
+  });
+
+  it('never copies credential- or session-bearing response headers', async () => {
+    vi.stubGlobal('fetch', vi.fn(async () => new Response('{}', {
+      status: 200,
+      headers: {
+        'Content-Type': 'application/json',
+        'set-cookie': 'session=secret; Path=/',
+        'authorization': 'Bearer upstream-secret',
+        'x-api-key': 'upstream-secret',
+        'anthropic-organization-id': 'org_123',
+      },
+    })));
+    const res = makeRes();
+    await relayAnthropicMessages(
+      res as never,
+      'https://upstream.example/v1/messages',
+      { model: 'qwen3.8-max' },
+      'key',
+      false,
+      {},
+    );
+    const names = Object.keys(res.headers()).map(name => name.toLowerCase());
+    expect(names).not.toContain('set-cookie');
+    expect(names).not.toContain('authorization');
+    expect(names).not.toContain('x-api-key');
+    expect(names).not.toContain('anthropic-organization-id');
+  });
+
+  describe('429 retry-after is clamped, never forwarded verbatim', () => {
+    async function relay429(retryAfter?: string): Promise<Record<string, string>> {
+      vi.stubGlobal('fetch', vi.fn(async () => new Response(
+        JSON.stringify({ type: 'error', error: { type: 'rate_limit_error', message: 'slow down' } }),
+        {
+          status: 429,
+          headers: {
+            'Content-Type': 'application/json',
+            ...(retryAfter === undefined ? {} : { 'retry-after': retryAfter }),
+          },
+        },
+      )));
+      const res = makeRes();
+      await relayAnthropicMessages(
+        res as never,
+        'https://upstream.example/v1/messages',
+        { model: 'qwen3.8-max' },
+        'key',
+        false,
+        {},
+      );
+      expect(res.status()).toBe(429);
+      return res.headers();
+    }
+
+    it('passes a hint already inside the bound', async () => {
+      expect((await relay429('12'))['retry-after']).toBe('12');
+    });
+
+    it('clamps an unsafely long hint to the 60s ceiling', async () => {
+      expect((await relay429('86400'))['retry-after']).toBe('60');
+    });
+
+    it('substitutes the default for an HTTP-date hint it cannot bound', async () => {
+      expect((await relay429('Wed, 13 Aug 2026 00:00:00 GMT'))['retry-after']).toBe('5');
+    });
+
+    it('substitutes the default when the upstream sends none', async () => {
+      expect((await relay429())['retry-after']).toBe('5');
+    });
+
+    it('rounds a fractional hint', async () => {
+      expect((await relay429('2.6'))['retry-after']).toBe('3');
+    });
+  });
+
+  it('adds no retry-after to a non-429 response', async () => {
+    vi.stubGlobal('fetch', vi.fn(async () => new Response('{}', {
+      status: 200,
+      headers: { 'Content-Type': 'application/json', 'retry-after': '900' },
+    })));
+    const res = makeRes();
+    await relayAnthropicMessages(
+      res as never,
+      'https://upstream.example/v1/messages',
+      { model: 'qwen3.8-max' },
+      'key',
+      false,
+      {},
+    );
+    expect(res.headers()['retry-after']).toBeUndefined();
+  });
+});
+
 describe('relayAnthropicMessages outbound headers', () => {
   afterEach(() => {
     vi.unstubAllGlobals();

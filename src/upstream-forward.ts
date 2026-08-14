@@ -10,6 +10,7 @@ import {
   type AnthropicCapabilityRouteFacts,
 } from './anthropic-beta-policy.js';
 import { isCredentialBearingHeader } from './credential-headers.js';
+import { clampRetryAfterSeconds } from './upstream-error.js';
 import {
   ANTHROPIC_X_API_KEY_ONLY_AUTH_MODE,
   type AnthropicAuthMode,
@@ -175,6 +176,50 @@ export interface RelayAnthropicOptions {
 }
 
 /**
+ * Response metadata a direct launch would have received from the upstream, and
+ * which the relay must not swallow.
+ *
+ * Two kinds only: the request/rate-limit identifiers a client needs to reason
+ * about throttling and to quote back in a support request, and — on a 429 — a
+ * bounded backoff hint. Nothing else is copied, so credential/session-bearing
+ * response headers (`set-cookie`, auth echoes) never cross the boundary.
+ *
+ * The retry hint is CLAMPED rather than forwarded: an upstream is free to name
+ * a multi-hour delay, and relaying that verbatim parks a Claude Code session
+ * well past clodex's own stream budget. `clampRetryAfterSeconds` bounds it to
+ * [0, 60]s and substitutes the 5s default for a missing or non-numeric value,
+ * so a throttled client always gets an actionable, finite hint.
+ *
+ * Response ids are FORWARDED, never retained: nothing here logs or persists
+ * them.
+ */
+function anthropicRelayResponseHeaders(
+  upstreamRes: Response,
+  fallbackContentType: string,
+): Record<string, string> {
+  const headers: Record<string, string> = {
+    'Content-Type': upstreamRes.headers.get('content-type') || fallbackContentType,
+  };
+  upstreamRes.headers.forEach((value, name) => {
+    const lower = name.toLowerCase();
+    if (
+      lower === 'request-id'
+      || lower === 'x-request-id'
+      || /^anthropic-ratelimit-[a-z0-9-]+$/.test(lower)
+      || /^x-ratelimit-[a-z0-9-]+$/.test(lower)
+    ) {
+      headers[lower] = value;
+    }
+  });
+  if (upstreamRes.status === 429) {
+    const raw = upstreamRes.headers.get('retry-after')?.trim();
+    const numeric = raw && /^\d+(?:\.\d+)?$/.test(raw) ? Number(raw) : undefined;
+    headers['retry-after'] = String(clampRetryAfterSeconds(numeric));
+  }
+  return headers;
+}
+
+/**
  * An event-stream line ends with CRLF, LF, or a bare CR. Splitting on \n alone
  * finds no boundary at all in a CR-framed stream: every byte accumulates in the
  * tail buffer and the client sees nothing until the upstream closes, which
@@ -276,13 +321,17 @@ export async function relayAnthropicMessages(
     const errBody = await upstreamRes.text();
     options.log?.(`anthropic upstream ${upstreamRes.status}: ${errBody}`);
     options.onUpstreamError?.(upstreamRes.status, errBody);
-    res.writeHead(upstreamRes.status, { 'Content-Type': upstreamRes.headers.get('content-type') || 'application/json' });
+    res.writeHead(
+      upstreamRes.status,
+      anthropicRelayResponseHeaders(upstreamRes, 'application/json'),
+    );
     res.end(errBody);
     return;
   }
 
   if (clientWantsStream && upstreamRes.body) {
     res.writeHead(200, {
+      ...anthropicRelayResponseHeaders(upstreamRes, 'text/event-stream'),
       'Content-Type': 'text/event-stream',
       'Cache-Control': 'no-cache',
       'Connection': 'keep-alive',
@@ -330,6 +379,7 @@ export async function relayAnthropicMessages(
     text = JSON.stringify(parsed);
   }
   res.writeHead(200, {
+    ...anthropicRelayResponseHeaders(upstreamRes, 'application/json'),
     'Content-Type': 'application/json',
     'Content-Length': Buffer.byteLength(text).toString(),
   });
