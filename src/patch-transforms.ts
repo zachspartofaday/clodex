@@ -40,7 +40,7 @@ import {
  * hash of the transform inputs to force that decision to be made rather than
  * forgotten.
  */
-export const PATCH_TRANSFORMS_VERSION = 10;
+export const PATCH_TRANSFORMS_VERSION = 11;
 
 export interface PatchScriptModelEntry {
   /** Ordered native identities for this model, in saved alias order. */
@@ -77,6 +77,113 @@ export function patchEntryAliases(entry: PatchScriptModelEntry): string[] {
 
 const NATIVE_EFFORT_LEVELS = ['low', 'medium', 'high', 'xhigh', 'max'] as const;
 const BASE_EFFORT_LEVELS = ['low', 'medium', 'high'] as const;
+
+// PATCH 8d/8e markers, hoisted so discovery and application share one grammar.
+const effortHelperMarker = '/*ccpatch:effort-level-list*/';
+const effortMetadataMarker = '/*ccpatch:effort-level-consumer*/';
+
+// A scan sees at most this prefix plus one character proving its left boundary.
+// Longer assignment tails deliberately fail closed instead of admitting a suffix
+// of an oversized identifier as the ladder binding.
+const EFFORT_BINDING_PREFIX_LENGTH = 4096;
+
+/**
+ * Locate the retained native effort ladder by its exact five-level contents and
+ * the helper/consumer topology bound to it. Claude 2.1.228+ declares the binding
+ * first, assigns the ladder later, and retains an unrelated lookalike ladder.
+ * Exactly one binding with one helper and two consumers qualifies.
+ */
+function findEffortLadderBinding(source: string): {
+  binding: string | undefined;
+  occurrenceCount: number;
+} {
+  const identifier = '[A-Za-z_$][\\w$]*';
+  const ladder = /\[\s*"low"\s*,\s*"medium"\s*,\s*"high"\s*,\s*"xhigh"\s*,\s*"max"\s*\]/g;
+  const escapeRegex = (value: string): string =>
+    value.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+  const indexCounts = (regex: RegExp, bindingGroup: number): Map<string, number> => {
+    const counts = new Map<string, number>();
+    for (const match of source.matchAll(regex)) {
+      const name = match[bindingGroup]!;
+      counts.set(name, (counts.get(name) ?? 0) + 1);
+    }
+    return counts;
+  };
+
+  const declarationCounts = indexCounts(
+    new RegExp('(?:var|let|const)\\s+(' + identifier + ')[,;=]', 'g'),
+    1,
+  );
+  const freshHelperCounts = indexCounts(
+    new RegExp(
+      '(function [\\w$]+\\(([\\w$]+)\\)\\{)(return (' + identifier + ')'
+      + '\\.filter\\(\\(([\\w$]+)\\)=>([\\w$]+)\\(\\5,\\2\\)\\)\\})',
+      'g',
+    ),
+    4,
+  );
+  const markedHelperCounts = indexCounts(
+    new RegExp(
+      '(function [\\w$]+\\(([\\w$]+)\\)\\{)'
+      + escapeRegex(effortHelperMarker)
+      + 'var _ccl=Object\\.assign\\(Object\\.create\\(null\\),\\{[^{}]*\\}\\)'
+      + '\\[String\\(\\2\\|\\|""\\)\\.trim\\(\\)\\.toLowerCase\\(\\)\\];'
+      + 'if\\(_ccl!==void 0\\)return _ccl\\.filter\\(function\\(_cclv\\)\\{return '
+      + '([\\w$]+)\\(_cclv,\\2\\)\\}\\);'
+      + '(?=return (' + identifier + ')\\.filter\\(\\(([\\w$]+)\\)=>\\3\\(\\5,\\2\\)\\)\\})',
+      'g',
+    ),
+    4,
+  );
+  const freshConsumerCounts = indexCounts(
+    new RegExp(
+      'supportedEffortLevels:(' + identifier + ')'
+      + '(\\.filter\\(\\(([\\w$]+)\\)=>\\{if\\(\\3==="max"&&!([\\w$]+)\\(([\\w$]+)\\)\\)'
+      + 'return!1;if\\(\\3==="xhigh"&&!([\\w$]+)\\(\\5\\)\\)return!1;return!0\\}\\))',
+      'g',
+    ),
+    1,
+  );
+  const markedConsumerCounts = indexCounts(
+    new RegExp(
+      'supportedEffortLevels:\\(' + escapeRegex(effortMetadataMarker)
+      + 'Object\\.assign\\(Object\\.create\\(null\\),\\{[^{}]*\\}\\)'
+      + '\\[String\\(([\\w$]+)\\|\\|""\\)\\.trim\\(\\)\\.toLowerCase\\(\\)\\]'
+      + '\\?\\?(' + identifier + ')\\)'
+      + '(\\.filter\\(\\(([\\w$]+)\\)=>\\{if\\(\\4==="max"&&!([\\w$]+)\\(\\1\\)\\)'
+      + 'return!1;if\\(\\4==="xhigh"&&!([\\w$]+)\\(\\1\\)\\)return!1;return!0\\}\\))',
+      'g',
+    ),
+    2,
+  );
+
+  let occurrenceCount = 0;
+  let binding: string | undefined;
+  for (const match of source.matchAll(ladder)) {
+    const prefixStart = Math.max(0, match.index - EFFORT_BINDING_PREFIX_LENGTH);
+    const prefix = source.slice(prefixStart === 0 ? 0 : prefixStart - 1, match.index);
+    const boundary = prefixStart === 0 ? '(?:^|[^\\w$])' : '[^\\w$]';
+    const direct = new RegExp(
+      boundary + '(?:var|let|const)\\s+(' + identifier + ')\\s*=\\s*$',
+    ).exec(prefix);
+    let derived: string | undefined;
+    if (direct) {
+      derived = direct[1]!;
+    } else {
+      const bare = new RegExp(boundary + '(' + identifier + ')\\s*=\\s*$').exec(prefix);
+      if (!bare || (declarationCounts.get(bare[1]!) ?? 0) !== 1) continue;
+      derived = bare[1]!;
+    }
+    const helpers = (freshHelperCounts.get(derived) ?? 0)
+      + (markedHelperCounts.get(derived) ?? 0);
+    const consumers = (freshConsumerCounts.get(derived) ?? 0)
+      + (markedConsumerCounts.get(derived) ?? 0);
+    if (helpers !== 1 || consumers !== 2) continue;
+    occurrenceCount += 1;
+    binding = derived;
+  }
+  return { binding: occurrenceCount === 1 ? binding : undefined, occurrenceCount };
+}
 
 export function projectNativeEffort(
   effort: PatchScriptEffort | undefined,
@@ -322,6 +429,31 @@ export function applyClodexPatches(source: string, config: PatchScriptModelConfi
       if (noopIsSkip) { log('SKIP', name, 'already patched'); return; }
       log('FAIL', name, 'replacement made no change');
       if (required) fail(name);
+      return;
+    }
+    log('OK', name);
+  }
+
+  /** Apply one replacement to an exact number of identical-shape sites. */
+  function applyExactCount(
+    name: string,
+    regex: RegExp,
+    expected: number,
+    fn: (match: string, ...groups: string[]) => string,
+    required: boolean,
+  ): void {
+    const flags = regex.flags.includes('g') ? regex.flags : regex.flags + 'g';
+    const global = new RegExp(regex.source, flags);
+    const matches = [...js.matchAll(global)];
+    if (matches.length !== expected) {
+      log('FAIL', name, `anchor matched ${matches.length} times (expected ${expected})`);
+      if (required) fail(`clodex patch: required patch failed: ${name}`);
+      return;
+    }
+    const before = js;
+    js = js.replace(global, fn as (substring: string, ...args: unknown[]) => string);
+    if (js === before) {
+      log('SKIP', name, 'already patched');
       return;
     }
     log('OK', name);
@@ -626,6 +758,108 @@ export function applyClodexPatches(source: string, config: PatchScriptModelConfi
     'PATCH 8c: max effort capability',
     /(function [\w$]+\(([\w$]+)\)\{if\([\w$]+\(\2\)\)return!1;)(let [\w$]+=[\w$]+\(\2,"max_effort"\);)/,
   );
+
+  // ---------------------------------------------------------------------------
+  // PATCH 8d/8e — exact effort ladders.
+  //
+  // Claude Code materializes supported effort levels in one helper and two
+  // metadata consumers. Claude 2.1.228+ splits the retained native ladder's
+  // declaration from its later assignment and carries an unrelated lookalike.
+  // Discover the one binding whose topology has exactly one helper and two
+  // consumers, then preserve each configured identity's exact ordered ladder.
+  // ---------------------------------------------------------------------------
+  const effortLevels: Record<string, string[]> = Object.create(null);
+  for (const key of EFFORT_KEYS) effortLevels[key] = EFFORT_BY_KEY[key]!.levels;
+  const hasEffortModels = EFFORT_KEYS.length > 0;
+  const hasNativeEffortLadder = /\[\s*"low"\s*,\s*"medium"\s*,\s*"high"\s*,\s*"xhigh"\s*,\s*"max"\s*\]/.test(js);
+  const needsEffortHelper = (hasEffortModels && hasNativeEffortLadder)
+    || js.includes(effortHelperMarker);
+  const needsEffortMetadata = (hasEffortModels && hasNativeEffortLadder)
+    || js.includes(effortMetadataMarker);
+  const discoveredLadder = needsEffortHelper || needsEffortMetadata
+    ? findEffortLadderBinding(js)
+    : { binding: undefined, occurrenceCount: 0 };
+  const effortListBinding = discoveredLadder.binding;
+  if (!effortListBinding && (needsEffortHelper || needsEffortMetadata)) {
+    const extra = `effort ladder topology matched ${discoveredLadder.occurrenceCount} times (expected 1)`;
+    if (needsEffortHelper) log('FAIL', 'PATCH 8d: exact effort level helper', extra);
+    if (needsEffortMetadata) log('FAIL', 'PATCH 8e: exact effort metadata lists', extra);
+  }
+
+  if (effortListBinding && needsEffortHelper) {
+    const table = orderedRecordLiteral(EFFORT_KEYS, effortLevels);
+    const binding = reEsc(effortListBinding);
+    const snippet = (arg: string, predicate: string) =>
+      effortHelperMarker + 'var _ccl=Object.assign(Object.create(null),'
+      + table + ')[String(' + arg + '||"").trim().toLowerCase()];'
+      + 'if(_ccl!==void 0)return _ccl.filter(function(_cclv){return '
+      + predicate + '(_cclv,' + arg + ')});';
+    if (js.includes(effortHelperMarker)) {
+      applyOnce(
+        'PATCH 8d: exact effort level helper (refresh)',
+        new RegExp(
+          '(function [\\w$]+\\(([\\w$]+)\\)\\{)'
+          + reEsc(effortHelperMarker)
+          + 'var _ccl=Object\\.assign\\(Object\\.create\\(null\\),\\{[^{}]*\\}\\)'
+          + '\\[String\\(\\2\\|\\|""\\)\\.trim\\(\\)\\.toLowerCase\\(\\)\\];'
+          + 'if\\(_ccl!==void 0\\)return _ccl\\.filter\\(function\\(_cclv\\)\\{return '
+          + '([\\w$]+)\\(_cclv,\\2\\)\\}\\);'
+          + '(?=return ' + binding + '\\.filter\\(\\(([\\w$]+)\\)=>\\3\\(\\4,\\2\\)\\)\\})',
+        ),
+        (_m, head, arg, predicate) => head! + snippet(arg!, predicate!),
+        { required: false, noopIsSkip: true },
+      );
+    } else {
+      applyOnce(
+        'PATCH 8d: exact effort level helper',
+        new RegExp(
+          '(function [\\w$]+\\(([\\w$]+)\\)\\{)'
+          + '(return ' + binding
+          + '\\.filter\\(\\(([\\w$]+)\\)=>([\\w$]+)\\(\\4,\\2\\)\\)\\})',
+        ),
+        (_m, head, arg, body, _level, predicate) =>
+          head! + snippet(arg!, predicate!) + body!,
+        { required: false },
+      );
+    }
+  }
+
+  if (effortListBinding && needsEffortMetadata) {
+    const table = orderedRecordLiteral(EFFORT_KEYS, effortLevels);
+    const binding = reEsc(effortListBinding);
+    const expression = (model: string, tail: string) =>
+      'supportedEffortLevels:(' + effortMetadataMarker + 'Object.assign('
+      + 'Object.create(null),' + table + ')[String(' + model
+      + '||"").trim().toLowerCase()]??' + effortListBinding + ')' + tail;
+    if (js.includes(effortMetadataMarker)) {
+      applyExactCount(
+        'PATCH 8e: exact effort metadata lists (refresh)',
+        new RegExp(
+          'supportedEffortLevels:\\(' + reEsc(effortMetadataMarker)
+          + 'Object\\.assign\\(Object\\.create\\(null\\),\\{[^{}]*\\}\\)'
+          + '\\[String\\(([\\w$]+)\\|\\|""\\)\\.trim\\(\\)\\.toLowerCase\\(\\)\\]'
+          + '\\?\\?' + binding + '\\)'
+          + '(\\.filter\\(\\(([\\w$]+)\\)=>\\{if\\(\\3==="max"&&!([\\w$]+)\\(\\1\\)\\)'
+          + 'return!1;if\\(\\3==="xhigh"&&!([\\w$]+)\\(\\1\\)\\)return!1;return!0\\}\\))',
+        ),
+        2,
+        (_m, model, tail) => expression(model!, tail!),
+        false,
+      );
+    } else {
+      applyExactCount(
+        'PATCH 8e: exact effort metadata lists',
+        new RegExp(
+          'supportedEffortLevels:' + binding
+          + '(\\.filter\\(\\(([\\w$]+)\\)=>\\{if\\(\\2==="max"&&!([\\w$]+)\\(([\\w$]+)\\)\\)'
+          + 'return!1;if\\(\\2==="xhigh"&&!([\\w$]+)\\(\\4\\)\\)return!1;return!0\\}\\))',
+        ),
+        2,
+        (_m, tail, _level, _maxGate, model) => expression(model!, tail!),
+        false,
+      );
+    }
+  }
 
   // ---------------------------------------------------------------------------
   // PATCH 9 — per-model default effort.

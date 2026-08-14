@@ -57,6 +57,24 @@ function capturePattern(
   return captureNeedle(source, name, uniqueMatch(source, name, pattern));
 }
 
+function capturePatternOccurrences(
+  source: string,
+  name: string,
+  pattern: RegExp,
+  expected: number,
+): BuiltInPatchProof[] {
+  const flags = pattern.flags.includes('g') ? pattern.flags : `${pattern.flags}g`;
+  const matches = [...source.matchAll(new RegExp(pattern.source, flags))].map(match => match[0]);
+  if (matches.length !== expected) {
+    throw new Error(`clodex patch: could not capture built-in postcondition: ${name}`);
+  }
+  return matches.map((match, index) => ({
+    name: `${name} (${index + 1}/${expected})`,
+    protectedText: match,
+    occurrences: 1,
+  }));
+}
+
 function normalizedPatchName(name: string): string {
   return name.replace(/ \(refresh\)$/, '');
 }
@@ -159,6 +177,62 @@ export function captureBuiltInPatchProofs(
     'PATCH 8c: max effort capability',
     effortProofPattern('/*ccpatch:max-effort*/'),
   );
+  const protectsEffortHelper = protectsResult(results, 'PATCH 8d: exact effort level helper');
+  const protectsEffortMetadata = protectsResult(results, 'PATCH 8e: exact effort metadata lists');
+  if (protectsEffortHelper || protectsEffortMetadata) {
+    // Derive the retained ladder binding from the unique marked helper's full
+    // postcondition so proof capture preserves the same correlation as discovery.
+    const helper = new RegExp(
+      escapeRegex('/*ccpatch:effort-level-list*/')
+      + 'var _ccl=Object\\.assign\\(Object\\.create\\(null\\),\\{[^{}]*\\}\\)'
+      + '\\[String\\([\\w$]+\\|\\|""\\)\\.trim\\(\\)\\.toLowerCase\\(\\)\\];'
+      + 'if\\(_ccl!==void 0\\)return _ccl\\.filter\\(function\\(_cclv\\)\\{return '
+      + '[\\w$]+\\(_cclv,[\\w$]+\\)\\}\\);return ([A-Za-z_$][\\w$]*)\\.filter'
+      + '\\(\\([\\w$]+\\)=>[\\w$]+\\([\\w$]+,[\\w$]+\\)\\)\\}',
+    );
+    const flags = helper.flags.includes('g') ? helper.flags : `${helper.flags}g`;
+    const matcher = new RegExp(helper.source, flags);
+    const match = matcher.exec(source);
+    if (!match || matcher.exec(source)) {
+      throw new Error('clodex patch: could not capture built-in postcondition: PATCH 8d: exact effort level helper');
+    }
+    const effortListBinding = escapeRegex(match[1]!);
+    if (protectsEffortHelper) {
+      proofs.push({
+        name: 'PATCH 8d: exact effort level helper',
+        protectedText: match[0],
+        occurrences: 1,
+      });
+      proofs.push(capturePattern(
+        source,
+        'PATCH 8d: effort ladder declaration',
+        new RegExp('(?:var|let|const)\\s+' + effortListBinding + '[,;=]'),
+      ));
+      proofs.push(capturePattern(
+        source,
+        'PATCH 8d: effort ladder assignment',
+        new RegExp(
+          effortListBinding
+          + '\\s*=\\s*\\[\\s*"low"\\s*,\\s*"medium"\\s*,\\s*"high"\\s*,\\s*"xhigh"\\s*,\\s*"max"\\s*\\]',
+        ),
+      ));
+    }
+    if (protectsEffortMetadata) {
+      proofs.push(...capturePatternOccurrences(
+        source,
+        'PATCH 8e: exact effort metadata lists',
+        new RegExp(
+          'supportedEffortLevels:\\(/\\*ccpatch:effort-level-consumer\\*/Object\\.assign'
+          + '\\(Object\\.create\\(null\\),\\{[^{}]*\\}\\)'
+          + '\\[String\\([\\w$]+\\|\\|""\\)\\.trim\\(\\)\\.toLowerCase\\(\\)\\]'
+          + '\\?\\?' + effortListBinding + '\\)\\.filter\\(\\([\\w$]+\\)=>\\{'
+          + 'if\\([\\w$]+==="max"&&![\\w$]+\\([\\w$]+\\)\\)return!1;'
+          + 'if\\([\\w$]+==="xhigh"&&![\\w$]+\\([\\w$]+\\)\\)return!1;return!0\\}\\)',
+        ),
+        2,
+      ));
+    }
+  }
   addPattern(
     'PATCH 9: default effort',
     /\/\*ccpatch:default-effort\*\/var _cce=Object\.assign\(Object\.create\(null\),\{[^{}]*\}\)\[String\([\w$]+\|\|""\)\.trim\(\)\.toLowerCase\(\)\];if\(_cce!==void 0\)return _cce;/,

@@ -31,7 +31,7 @@ layout with exact pins. Keep it even after node-lief fixes the packaging.
 
 The built-ins bake favorites + aliases into the binary: model validation, `/model` listing, alias
 resolution, context windows via a `/*ccpatch:ctx*/`-marked map, per-model effort
-capabilities/defaults, and child-command network isolation.
+capabilities/defaults and exact sparse effort lists, and child-command network isolation.
 
 ## The entry-module shim (`bun-entry-module.ts`)
 
@@ -126,6 +126,12 @@ tweakcc's own repack reads back as an ordinary module name.
   claude version, config hash, patched size/sha256, backup path, pristine sha256 — the last absent
   in pre-content-addressed manifests) drives `evaluatePatchState` →
   `unpatched | current | stale-config | stale-binary`.
+- **PATCH 8d/8e preserve exact sparse effort lists.** Claude Code 2.1.228/229 split the retained
+  five-level ladder declaration from its assignment and retain another lookalike ladder. Discovery
+  selects only one binding carrying exactly one helper and two metadata consumers, with a 4096-byte
+  bounded assignment-prefix scan; missing, duplicate, or mismatched topology fails both optional
+  sites closed. The injected tables use the same saved alias/key order as PATCH 8a/8b/8c/9, and
+  built-in postcondition proofs retain the declaration, assignment, helper, and both consumers.
 - **PATCH 10 isolates proxy-mode bridge settings from standard child commands.**
   `computeWrapperEnv()` and `buildHttpProxyChildEnv()` write `CLAUDE_CODE_CLODEX_NETWORK_ENV`, a
   versioned compare-before-revert contract holding the external and injected values for the proxy

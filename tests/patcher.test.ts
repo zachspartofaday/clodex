@@ -823,8 +823,8 @@ describe('PATCH_TRANSFORMS_VERSION', () => {
       .join('\n');
     const digest = createHash('sha256').update(source).digest('hex');
     expect({ version: PATCH_TRANSFORMS_VERSION, digest }).toEqual({
-      version: 10,
-      digest: '658787435634d24e9324ad89b7adf7b0ba6b4681f823b78b11e4b428d996548c',
+      version: 11,
+      digest: 'e572b42eca3605196438c33d7ce2419d82a6cc8688c2a47cafcb44f890dca8c3',
     });
   });
 });
@@ -1614,6 +1614,27 @@ const CLAUDE_PROXY_EFFORT_FIXTURE = [
   'function ait(e){return ww(lo(e))?.default_effort??"high"}',
 ].join('\n');
 
+const SPLIT_EM1 = 'var EM1={...o&&{supportsEffort:!0,supportedEffortLevels:FL.filter((l)=>{if(l==="max"&&!eqe(n))return!1;if(l==="xhigh"&&!I_e(n))return!1;return!0})}};';
+const SPLIT_EM2 = 'var EM2={...To&&{supportsEffort:!0,supportedEffortLevels:FL.filter((Fo)=>{if(Fo==="max"&&!eqe(Et))return!1;if(Fo==="xhigh"&&!I_e(Et))return!1;return!0})}};';
+
+// Claude 2.1.228/229 split the real ladder declaration from its assignment and
+// retain another canonical ladder that has no helper or metadata consumers.
+const CLAUDE_SPLIT_EFFORT_FIXTURE = [
+  CLAUDE_CORE_FIXTURE,
+  'function a3e(e){return FL.filter((t)=>iJe(t,e))}',
+  'var FL,Tn;',
+  'var R2=function(){Tn=1;FL=["low","medium","high","xhigh","max"];Tn=2};',
+  SPLIT_EM1,
+  SPLIT_EM2,
+  'var d6b;',
+  'd6b=["low","medium","high","xhigh","max"];',
+  'function iJe(e,t){return!0}',
+  'function OI(e){if(SNr(e))return!1;let t=Ede(e,"effort");if(t!==void 0)return t;return!1}',
+  'function I_e(e){if(SNr(e))return!1;let t=Ede(e,"xhigh_effort");if(t!==void 0)return t;return!1}',
+  'function eqe(e){if(SNr(e))return!1;let t=Ede(e,"max_effort");if(t!==void 0)return t;return!1}',
+  'function ait(e){return ww(lo(e))?.default_effort??"high"}',
+].join('\n');
+
 function runPatchScript(config: Parameters<typeof applyClodexPatches>[1], source = CLAUDE_FIXTURE): string {
   return applyClodexPatches(source, config).content;
 }
@@ -1689,6 +1710,24 @@ function executeDefaultEffort(
     () => ({ default_effort: nativeDefault }),
   ) as (id: string) => string;
   return defaultEffort(modelId);
+}
+
+function executeExactEffortLevels(
+  source: string,
+  modelId: string,
+  binding = 'FL',
+): string[] {
+  const declaration = source.split('\n').find(line => line.startsWith('function a3e('));
+  expect(declaration).toBeDefined();
+  const levels = Function(
+    binding,
+    'iJe',
+    `${declaration};return a3e;`,
+  )(
+    ['low', 'medium', 'high', 'xhigh', 'max'],
+    () => true,
+  ) as (id: string) => string[];
+  return levels(modelId);
 }
 
 const CAPABILITY_GATES: Array<{
@@ -2180,16 +2219,154 @@ describe('patch script identity naming', () => {
     expect(executeDefaultEffort(runPatchScript(config), 'unconfigured', 'medium')).toBe('medium');
   });
 
+  describe('split effort ladder topology', () => {
+    const splitConfig: PatchScriptModelConfig = {
+      'clodex:openai:sparse': {
+        aliases: ['10', '2'],
+        effort: {
+          levels: ['low', 'medium', 'high', 'max'],
+          defaultLevel: 'high',
+        },
+      },
+    };
+    const topologyFailure = (source: string) => {
+      const patched = applyClodexPatches(source, splitConfig);
+      expect(patched.results).toEqual(expect.arrayContaining([
+        {
+          status: 'FAIL',
+          name: 'PATCH 8d: exact effort level helper',
+          extra: expect.stringMatching(/^effort ladder topology matched [02] times \(expected 1\)$/),
+        },
+        {
+          status: 'FAIL',
+          name: 'PATCH 8e: exact effort metadata lists',
+          extra: expect.stringMatching(/^effort ladder topology matched [02] times \(expected 1\)$/),
+        },
+      ]));
+      expect(patched.content).not.toContain('/*ccpatch:effort-level-list*/');
+      expect(patched.content).not.toContain('/*ccpatch:effort-level-consumer*/');
+    };
+
+    it('patches one helper and both consumers with the ordered sparse ladder', () => {
+      const patched = applyClodexPatches(CLAUDE_SPLIT_EFFORT_FIXTURE, splitConfig);
+      expect(patched.results).toEqual(expect.arrayContaining([
+        { status: 'OK', name: 'PATCH 8d: exact effort level helper' },
+        { status: 'OK', name: 'PATCH 8e: exact effort metadata lists' },
+      ]));
+      expect(patched.content.match(/\/\*ccpatch:effort-level-list\*\//g)).toHaveLength(1);
+      expect(patched.content.match(/\/\*ccpatch:effort-level-consumer\*\//g)).toHaveLength(2);
+      expect(patched.content).toContain(
+        '{"10":["low","medium","high","max"],'
+        + '"10[1m]":["low","medium","high","max"],'
+        + '"2":["low","medium","high","max"],'
+        + '"2[1m]":["low","medium","high","max"],'
+        + '"clodex:openai:sparse":["low","medium","high","max"],'
+        + '"clodex:openai:sparse[1m]":["low","medium","high","max"]}',
+      );
+      expect(patched.content).toContain('??FL)');
+      expect(patched.content).not.toContain('??d6b)');
+      expect(executeExactEffortLevels(patched.content, '10')).toEqual([
+        'low', 'medium', 'high', 'max',
+      ]);
+      expect(executeExactEffortLevels(patched.content, 'unconfigured')).toEqual([
+        'low', 'medium', 'high', 'xhigh', 'max',
+      ]);
+      expect(patched.content).not.toContain('/*ccpatch:requested-effort*/');
+    });
+
+    it('is byte-idempotent and captures the correlated topology proof', () => {
+      const once = applyClodexPatches(CLAUDE_SPLIT_EFFORT_FIXTURE, splitConfig);
+      const proofs = captureBuiltInPatchProofs(once.content, splitConfig, once.results);
+      expect(builtInPatchProofsChanged(once.content, proofs)).toBe(false);
+      expect(proofs.map(proof => proof.name)).toEqual(expect.arrayContaining([
+        'PATCH 8d: exact effort level helper',
+        'PATCH 8d: effort ladder declaration',
+        'PATCH 8d: effort ladder assignment',
+        'PATCH 8e: exact effort metadata lists (1/2)',
+        'PATCH 8e: exact effort metadata lists (2/2)',
+      ]));
+      expect(builtInPatchProofsChanged(
+        once.content.replace(']??FL).filter((l)=>', ']??d6b).filter((l)=>'),
+        proofs,
+      )).toBe(true);
+      expect(applyClodexPatches(once.content, splitConfig).content).toBe(once.content);
+    });
+
+    it.each([
+      [
+        'missing assignment',
+        CLAUDE_SPLIT_EFFORT_FIXTURE.replace(
+          'Tn=1;FL=["low","medium","high","xhigh","max"];Tn=2',
+          'Tn=1;Tn=2',
+        ),
+      ],
+      [
+        'duplicate assignment',
+        CLAUDE_SPLIT_EFFORT_FIXTURE.replace(
+          'Tn=2};',
+          'Tn=2};\nvar R3=function(){FL=["low","medium","high","xhigh","max"]};',
+        ),
+      ],
+      [
+        'wrong helper binding',
+        CLAUDE_SPLIT_EFFORT_FIXTURE.replace(
+          'function a3e(e){return FL.filter((t)=>iJe(t,e))}',
+          'function a3e(e){return d6b.filter((t)=>iJe(t,e))}',
+        ),
+      ],
+      [
+        'missing consumer',
+        CLAUDE_SPLIT_EFFORT_FIXTURE.replace(`\n${SPLIT_EM2}`, ''),
+      ],
+    ])('fails closed for %s', (_label, source) => topologyFailure(source));
+
+    it('bounds assignment-prefix scans to 4097 characters', () => {
+      const hostile = 'H' + 'x'.repeat(8191);
+      const source = CLAUDE_SPLIT_EFFORT_FIXTURE.replace(
+        'var FL,Tn;',
+        `var ${hostile}:["low","medium","high","xhigh","max"],\nvar FL,Tn;`,
+      );
+      const originalExec = RegExp.prototype.exec;
+      let longestBindingScan = 0;
+      RegExp.prototype.exec = function (this: RegExp, input: string) {
+        if (this.source.includes('[^\\w$]')) {
+          longestBindingScan = Math.max(longestBindingScan, input.length);
+        }
+        return originalExec.call(this, input);
+      };
+      try {
+        const patched = applyClodexPatches(source, splitConfig);
+        expect(patched.results.filter(result => result.status === 'FAIL')).toEqual([]);
+        expect(patched.content).toContain('??FL)');
+      } finally {
+        RegExp.prototype.exec = originalExec;
+      }
+      expect(longestBindingScan).toBeLessThanOrEqual(4097);
+    });
+  });
+
   if (process.env.REVIEW_BUNDLE_DIR) {
     for (const version of ['2.1.228', '2.1.229'] as const) {
       it(`replays the ordered numeric patch against pristine Claude Code ${version}`, () => {
         const bundlePath = join(process.env.REVIEW_BUNDLE_DIR!, `claude-${version}.js`);
         expect(existsSync(bundlePath), `missing replay bundle ${bundlePath}`).toBe(true);
         const pristine = readFileSync(bundlePath, 'utf8');
+        const canonicalLadder = /\[\s*"low"\s*,\s*"medium"\s*,\s*"high"\s*,\s*"xhigh"\s*,\s*"max"\s*\]/g;
+        expect(pristine.match(canonicalLadder)).toHaveLength(8);
+        expect(pristine.match(
+          /[A-Za-z_$][\w$]*\s*=\s*\[\s*"low"\s*,\s*"medium"\s*,\s*"high"\s*,\s*"xhigh"\s*,\s*"max"\s*\]/g,
+        )).toHaveLength(2);
+
         const patched = applyClodexPatches(pristine, numericOrderConfig);
         const out = patched.content;
 
         expect(patched.results.every(result => result.status === 'OK')).toBe(true);
+        expect(patched.results.map(result => result.name)).toEqual(expect.arrayContaining([
+          'PATCH 8d: exact effort level helper',
+          'PATCH 8e: exact effort metadata lists',
+        ]));
+        expect(out.match(/\/\*ccpatch:effort-level-list\*\//g)).toHaveLength(1);
+        expect(out.match(/\/\*ccpatch:effort-level-consumer\*\//g)).toHaveLength(2);
         expect(out).toContain('"10","2","luna","clodex:openai:100"');
         expect(out).toContain(
           '{value:"10",label:"10",description:"Same Target"},'
@@ -2203,6 +2380,12 @@ describe('patch script identity naming', () => {
           '/*ccpatch:ctx*/var _ccw=({"10":111111,"2":111111,'
           + '"clodex:openai:same-target":111111,"luna":222222,'
           + '"clodex:openai:luna-target":222222,"clodex:openai:100":333333})',
+        );
+        expect(out).toContain(
+          '{"10":["low","medium","high","xhigh","max"],'
+          + '"10[1m]":["low","medium","high","xhigh","max"],'
+          + '"2":["low","medium","high","xhigh","max"],'
+          + '"2[1m]":["low","medium","high","xhigh","max"]',
         );
 
         const proofNames = captureBuiltInPatchProofs(
@@ -2218,6 +2401,13 @@ describe('patch script identity naming', () => {
           'PATCH 5: model picker options (2)',
           'PATCH 5: model picker options (luna)',
         ]);
+        expect(proofNames).toEqual(expect.arrayContaining([
+          'PATCH 8d: exact effort level helper',
+          'PATCH 8d: effort ladder declaration',
+          'PATCH 8d: effort ladder assignment',
+          'PATCH 8e: exact effort metadata lists (1/2)',
+          'PATCH 8e: exact effort metadata lists (2/2)',
+        ]));
         expect(builtInPatchProofsChanged(
           out,
           captureBuiltInPatchProofs(out, numericOrderConfig, patched.results),
