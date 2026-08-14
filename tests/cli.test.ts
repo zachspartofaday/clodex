@@ -1,7 +1,8 @@
 // tests/cli.test.ts
 import { describe, it, expect, vi, afterEach } from 'vitest';
 import * as p from '@clack/prompts';
-import { parseArgs, rootHelpText, claudeHelpText, serverHelpText, modelsHelpText, patchHelpText, main, runClaudeCommand } from '../src/cli.js';
+import { parseArgs, requiresAnthropicProxy, rootHelpText, claudeHelpText, serverHelpText, modelsHelpText, patchHelpText, main, runClaudeCommand } from '../src/cli.js';
+import type { EffortProfile } from '../src/effort-policy.js';
 import { VERSION } from '../src/constants.js';
 import { fetchProviderCatalog, resolveLocalProviderApiKey } from '../src/provider-catalog.js';
 import { startProxy } from '../src/proxy.js';
@@ -637,5 +638,100 @@ describe('main dispatch', () => {
     const code = await main(['patch', '--help']);
     expect(code).toBe(0);
     expect(log.mock.calls.some(call => String(call[0]).includes('clodex patch'))).toBe(true);
+  });
+});
+
+/**
+ * Which Anthropic launches must stay behind clodex's own boundary.
+ *
+ * Every arm here names a semantic clodex applies at that boundary and nowhere
+ * else, so a direct child launch would quietly deliver a different request than
+ * the one the configuration describes.
+ */
+describe('requiresAnthropicProxy', () => {
+  const apiProvider = { authType: 'api' as const, headers: undefined };
+  const anthropicModel = { modelFormat: 'anthropic' as const };
+  const thinkingProfile: EffortProfile = {
+    modelId: 'qwen3.8-max',
+    transport: 'anthropic-messages',
+    defaultLevel: null,
+    levels: [
+      { level: 'high', native: { kind: 'anthropic-thinking', thinking: { budget_tokens: 16_000, type: 'enabled' } } },
+    ],
+  };
+  const effortOnlyProfile: EffortProfile = {
+    modelId: 'kimi-k3',
+    transport: 'openai-completions',
+    defaultLevel: null,
+    levels: [{ level: 'max', native: { kind: 'reasoning-effort', value: 'max' } }],
+  };
+
+  it('never proxies a non-Anthropic model on this decision', () => {
+    expect(requiresAnthropicProxy(
+      { modelFormat: 'openai', effortProfile: thinkingProfile },
+      apiProvider,
+    )).toBe(false);
+  });
+
+  it('proxies an OAuth Anthropic route, which needs boundary-owned token refresh', () => {
+    expect(requiresAnthropicProxy(anthropicModel, { authType: 'oauth', headers: undefined })).toBe(true);
+  });
+
+  it('proxies an anonymous Anthropic route, whose credential must be stripped', () => {
+    expect(requiresAnthropicProxy(anthropicModel, { authType: 'none', headers: undefined })).toBe(true);
+  });
+
+  it('proxies an API-key route that needs the local count_tokens estimate', () => {
+    expect(requiresAnthropicProxy(
+      { ...anthropicModel, compatibility: { supportsCountTokens: false } },
+      apiProvider,
+    )).toBe(true);
+  });
+
+  it('proxies an API-key route with configured provider headers', () => {
+    expect(requiresAnthropicProxy(
+      anthropicModel,
+      { authType: 'api', headers: { 'Anthropic-Beta': 'context-1m-2025-08-07' } },
+    )).toBe(true);
+  });
+
+  it('proxies an API-key route whose reviewed thinking ladder clodex applies', () => {
+    // The named bypass: no OAuth, no anonymous key, no configured headers, and
+    // count_tokens forwards fine — yet clodex still rewrites the body, so a
+    // direct child would send an ungraded request for a graded model.
+    expect(requiresAnthropicProxy(
+      { ...anthropicModel, effortProfile: thinkingProfile },
+      apiProvider,
+    )).toBe(true);
+  });
+
+  it('launches direct for a plain API-key route with nothing to apply', () => {
+    expect(requiresAnthropicProxy(anthropicModel, apiProvider)).toBe(false);
+    expect(requiresAnthropicProxy(
+      { ...anthropicModel, compatibility: { supportsCountTokens: true } },
+      { authType: 'api', headers: {} },
+    )).toBe(false);
+  });
+
+  it('launches direct for a profile whose ladder this transport cannot carry', () => {
+    // A reasoning_effort ladder is applied by the SDK path, never by the
+    // Messages passthrough, so it is not a reason to interpose here.
+    expect(requiresAnthropicProxy(
+      { ...anthropicModel, effortProfile: effortOnlyProfile },
+      apiProvider,
+    )).toBe(false);
+    expect(requiresAnthropicProxy(
+      { ...anthropicModel, effortProfile: { ...thinkingProfile, levels: [] } },
+      apiProvider,
+    )).toBe(false);
+  });
+
+  it('proxies a graded route even when count_tokens forwards upstream', () => {
+    // The arms must not depend on today's coincidence that every graded
+    // Messages model also suppresses count_tokens.
+    expect(requiresAnthropicProxy(
+      { ...anthropicModel, compatibility: { supportsCountTokens: true }, effortProfile: thinkingProfile },
+      apiProvider,
+    )).toBe(true);
   });
 });

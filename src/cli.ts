@@ -20,6 +20,7 @@ import { runServerCommand } from './server/index.js';
 import { loadPreferences, savePreferences, recordLaunchSelection, resolveBridgeMode } from './config.js';
 import { pickLocalModel } from './prompts.js';
 import { fetchProviderCatalog, providersForPicker, resolveLocalProviderApiKey } from './provider-catalog.js';
+import { hasAnthropicThinkingLadder } from './model-runtime-compatibility.js';
 import { VERSION } from './constants.js';
 import type { BuiltinAliasName, ModelAlias, ParsedArgs, FavoriteModel, LocalProvider, LocalProviderModel } from './types.js';
 import { routableBuiltinOverrides } from './builtin-alias-env.js';
@@ -75,6 +76,40 @@ import {
   type UnsupportedEffortPolicy,
 } from './effort-policy.js';
 const STARTER_CLAUDE_FLAGS = new Set(['--dry-run', '--trace', '--fast', '--endpoint', '--proxy', '--save-mode', '--help', '-h', '--version', '-v']);
+
+/**
+ * Whether an Anthropic-format launch must go through clodex's local boundary.
+ *
+ * Launching direct points Claude Code straight at the provider base URL, so
+ * every semantic clodex applies at its own boundary simply never happens. Each
+ * arm below names one such semantic, and the list is conditional rather than a
+ * blanket "always proxy Anthropic" so a plain API-key route with nothing for
+ * clodex to do still gets the direct path's lower latency.
+ *
+ * The arms are stated INDEPENDENTLY on purpose. Every OpenCode Go Messages
+ * model happens to satisfy both the count-tokens arm and the effort arm today,
+ * and relying on that coincidence would silently drop the effort transform the
+ * first time a graded route answers count_tokens upstream.
+ */
+export function requiresAnthropicProxy(
+  model: Pick<LocalProviderModel, 'modelFormat' | 'compatibility' | 'effortProfile'>,
+  provider: Pick<LocalProvider, 'authType' | 'headers'>,
+): boolean {
+  if (model.modelFormat !== 'anthropic') return false;
+  // OAuth: the boundary owns token refresh, and an anonymous endpoint needs its
+  // credential stripped — neither can happen in a child pointed upstream.
+  if (provider.authType === 'oauth' || provider.authType === 'none') return true;
+  // count_tokens is answered from clodex's local estimate for a route that
+  // implements no such endpoint; direct, the client 404s into its accounting.
+  if (model.compatibility?.supportsCountTokens === false) return true;
+  // Configured provider headers — including a configured Anthropic-Beta — are
+  // applied only at clodex's own routed boundary.
+  if (Object.keys(provider.headers ?? {}).length > 0) return true;
+  // A reviewed thinking ladder is a request transform clodex performs on the
+  // forwarded body, so a direct child would send an ungraded request while the
+  // model advertises graded effort.
+  return hasAnthropicThinkingLadder(model.effortProfile);
+}
 const CLODEX_LAUNCH_FLAGS = new Set(['--provider', '--model']);
 
 function parseClodexLaunchFlag(
@@ -1718,15 +1753,7 @@ export async function runClaudeCommand(parsed: ParsedArgs): Promise<number> {
 
   const anonymousProvider = activeProvider.authType === 'none';
   const isOAuthAnthropic = selectedModel.modelFormat === 'anthropic' && activeProvider.authType === 'oauth';
-  const requiresLocalCountEstimate = selectedModel.modelFormat === 'anthropic'
-    && selectedModel.compatibility?.supportsCountTokens === false;
-  // Configured provider headers — including a configured Anthropic-Beta — are
-  // only applied at clodex's own routed boundary. Launching direct points the
-  // child straight at the provider base URL, where clodex never sees the
-  // request and the configured contract would silently never be honoured.
-  const hasConfiguredHeaders = Object.keys(activeProvider.headers ?? {}).length > 0;
-  const usesAnthropicProxy = selectedModel.modelFormat === 'anthropic' &&
-    (isOAuthAnthropic || anonymousProvider || requiresLocalCountEstimate || hasConfiguredHeaders);
+  const usesAnthropicProxy = requiresAnthropicProxy(selectedModel, activeProvider);
 
   if (dryRun) {
     const formatDesc = usesAnthropicProxy
