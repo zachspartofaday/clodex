@@ -21,6 +21,21 @@ import type {
   LocalProviderModel,
 } from './types.js';
 
+export function localProviderRefreshToken(
+  lp: Pick<LocalProvider, 'id' | 'authType' | 'authRef'>,
+): ProxyRoute['refreshToken'] {
+  return lp.authType === 'oauth' && lp.authRef
+    ? rejectedAccessToken => rejectedAccessToken === undefined
+      ? resolveProviderCredential(lp.id, lp.authRef!)
+      : resolveProviderCredential(
+          lp.id,
+          lp.authRef!,
+          undefined,
+          { rejectedAccessToken },
+        )
+    : undefined;
+}
+
 export function localModelToRoute(lp: LocalProvider, model: LocalProviderModel): ProxyRoute | null {
   if (model.modelFormat === 'anthropic' && !model.baseUrl) return null;
   if (model.modelFormat === 'openai' && !isSdkMigratedNpm(model.npm) && !model.completionsUrl) return null;
@@ -37,16 +52,7 @@ export function localModelToRoute(lp: LocalProvider, model: LocalProviderModel):
     baseURL: model.apiBaseUrl,
     providerId: lp.id,
     authType: lp.authType,
-    refreshToken: lp.authType === 'oauth' && lp.authRef
-      ? rejectedAccessToken => rejectedAccessToken === undefined
-        ? resolveProviderCredential(lp.id, lp.authRef!)
-        : resolveProviderCredential(
-            lp.id,
-            lp.authRef!,
-            undefined,
-            { rejectedAccessToken },
-          )
-      : undefined,
+    refreshToken: localProviderRefreshToken(lp),
     oauthAccountId: lp.oauthAccountId,
     providerData: lp.providerData,
     headers: lp.headers,

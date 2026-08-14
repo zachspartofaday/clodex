@@ -998,6 +998,7 @@ export function startProxy(
     oauthAccountId?: string;
     providerData?: Record<string, unknown>;
     modelFormat?: 'anthropic' | 'openai';
+    refreshToken?: ProxyRoute['refreshToken'];
     supportedParameters?: string[];
     reasoning?: boolean;
     interleavedReasoningField?: string;
@@ -1027,6 +1028,7 @@ export function startProxy(
     authType: sdk?.authType,
     oauthAccountId: sdk?.oauthAccountId,
     providerData: sdk?.providerData,
+    refreshToken: sdk?.refreshToken,
     supportedParameters: sdk?.supportedParameters,
     reasoning: sdk?.reasoning,
     interleavedReasoningField: sdk?.interleavedReasoningField,

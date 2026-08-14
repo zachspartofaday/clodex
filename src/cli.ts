@@ -13,6 +13,7 @@ import { startProxy, startProxyCatalog } from './proxy.js';
 import type { ProxyHandle, ProxyModelAlias, ProxyRoute } from './proxy.js';
 import {
   buildCatalogRoutes,
+  localProviderRefreshToken,
   makeRouteResolver,
   resolveCatalogModelAliases,
 } from './catalog.js';
@@ -1782,6 +1783,7 @@ export async function runClaudeCommand(parsed: ParsedArgs): Promise<number> {
         {
           providerId: activeProvider.id,
           authType: activeProvider.authType,
+          refreshToken: isOAuthAnthropic ? localProviderRefreshToken(activeProvider) : undefined,
           oauthAccountId: activeProvider.oauthAccountId,
           providerData: activeProvider.providerData,
           modelFormat: 'anthropic',

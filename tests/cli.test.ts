@@ -640,6 +640,48 @@ describe('main dispatch', () => {
     );
   });
 
+  it('propagates OAuth Anthropic refreshToken through a single-model launch', async () => {
+    vi.clearAllMocks();
+    const model = {
+      id: 'oauth-anthropic-model',
+      name: 'OAuth Anthropic Model',
+      family: 'claude',
+      brand: 'Anthropic',
+      modelFormat: 'anthropic' as const,
+      upstreamModelId: 'oauth-anthropic-model',
+      baseUrl: 'https://api.anthropic.com',
+    };
+    const provider = {
+      id: 'anthropic-oauth',
+      name: 'Anthropic OAuth',
+      apiKey: 'provider-token',
+      authType: 'oauth' as const,
+      authRef: 'env:CLODEX_TEST_OAUTH',
+      models: [model],
+    };
+    const catalog = Object.assign([provider], { blockedProviders: new Map() });
+    const close = vi.fn();
+    vi.mocked(fetchProviderCatalog).mockResolvedValue(catalog);
+    vi.mocked(resolveLocalProviderApiKey).mockResolvedValue('provider-token');
+    vi.mocked(startProxy).mockResolvedValue({ port: 43123, token: 'proxy-token', close });
+    vi.mocked(launchClaude).mockResolvedValue(0);
+
+    const code = await runClaudeCommand(parseArgs([
+      'claude',
+      '--endpoint',
+      '--provider', 'anthropic-oauth',
+      '--model', 'oauth-anthropic-model',
+    ]));
+
+    expect(code).toBe(0);
+    const sdkOptions = vi.mocked(startProxy).mock.calls[0]?.[4];
+    expect(sdkOptions).toEqual(expect.objectContaining({
+      authType: 'oauth',
+      modelFormat: 'anthropic',
+      refreshToken: expect.any(Function),
+    }));
+  });
+
   it.each(['oauth', 'none'] as const)(
     'keeps %s Anthropic providers on the proxy path without child suppression',
     async authType => {

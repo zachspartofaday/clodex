@@ -2222,6 +2222,80 @@ describe('OAuth route credential resolution', () => {
     }
   });
 
+  it('projects refreshToken through single-model OAuth Anthropic routes and retries once after a 401', async () => {
+    const refreshToken = vi.fn(async (rejectedAccessToken?: string) =>
+      rejectedAccessToken === undefined
+        ? 'rejected-anthropic-token'
+        : 'fresh-anthropic-token',
+    );
+    const fetchMock = vi.fn(async (_input: string | URL | Request, init?: RequestInit) => {
+      const authorization = new Headers(init?.headers).get('authorization');
+      if (authorization !== 'Bearer fresh-anthropic-token') {
+        return new Response(
+          JSON.stringify({ error: { message: 'expired token' } }),
+          {
+            status: 401,
+            headers: { 'Content-Type': 'application/json' },
+          },
+        );
+      }
+      return new Response(
+        JSON.stringify({
+          type: 'message',
+          id: 'msg-retry',
+          role: 'assistant',
+          model: 'claude-oauth-single',
+          content: [],
+          stop_reason: 'end_turn',
+          stop_sequence: null,
+          usage: { input_tokens: 1, output_tokens: 1 },
+        }),
+        {
+          status: 200,
+          headers: { 'Content-Type': 'application/json' },
+        },
+      );
+    });
+    vi.stubGlobal('fetch', fetchMock);
+
+    const handle = await startProxy(
+      'https://api.example.test',
+      'claude-oauth-single',
+      false,
+      undefined,
+      {
+        providerId: 'oauth-anthropic',
+        authType: 'oauth',
+        modelFormat: 'anthropic',
+        refreshToken,
+      },
+      'launch-token',
+    );
+    try {
+      const response = await postToProxy(handle.port, handle.token, {
+        model: 'claude-oauth-single',
+        max_tokens: 100,
+        messages: [{ role: 'user', content: 'hi' }],
+        stream: false,
+      });
+
+      expect(response.status).toBe(200);
+      expect(response.body).toContain('msg-retry');
+      expect(fetchMock).toHaveBeenCalledTimes(2);
+      expect(refreshToken).toHaveBeenCalledTimes(2);
+      expect(refreshToken.mock.calls.filter(([token]) => token !== undefined)).toEqual([
+        ['rejected-anthropic-token'],
+      ]);
+      expect(
+        fetchMock.mock.calls.map(([, init]) =>
+          new Headers(init?.headers).get('authorization'),
+        ),
+      ).toEqual(['Bearer rejected-anthropic-token', 'Bearer fresh-anthropic-token']);
+    } finally {
+      handle.close();
+    }
+  });
+
   it('surfaces a second translated OAuth 401 without another retry', async () => {
     const refreshToken = vi.fn(async (rejectedAccessToken?: string) =>
       rejectedAccessToken === undefined
