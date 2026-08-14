@@ -112,7 +112,7 @@ export function computeWrapperEnv(
   // state: an inherited injection is ours, never the user's, and leaving it
   // sends an alias straight to Anthropic as an unknown model id.
   if (!state) {
-    const untouched: NodeJS.ProcessEnv = { ...baseEnv };
+    const untouched = networkEnvBaseline(baseEnv);
     clearSessionProxyRouting(untouched, baseEnv);
     clearInheritedBuiltinOverrides(untouched, baseEnv);
     return untouched;

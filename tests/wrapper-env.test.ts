@@ -7,6 +7,7 @@ import {
   LOCAL_GATEWAY_API_KEY,
   wrapperRequiresServer,
 } from '../src/wrapper-env.js';
+import { buildHttpProxyChildEnv } from '../src/env.js';
 import {
   readLiveServerRuntimeState,
   registerServerRuntimeState,
@@ -125,6 +126,68 @@ describe('computeWrapperEnv', () => {
       CLODEX_SESSION_PROXY: '17645:12345',
     }, null, undefined, { isAlive: () => false });
     expect(foreignProxy['HTTPS_PROXY']).toBe('http://corp-proxy:8080');
+  });
+
+  it('restores a private-session child to its complete external network baseline', () => {
+    const corporateEnv: NodeJS.ProcessEnv = {
+      ...baseEnv,
+      HTTPS_PROXY: 'http://corp-https.example:8443',
+      HTTP_PROXY: 'http://corp-http.example:8080',
+      https_proxy: 'http://corp-https.example:8443',
+      http_proxy: 'http://corp-http.example:8080',
+      NO_PROXY: 'localhost,api.anthropic.com,.corp.example',
+      no_proxy: '127.0.0.1,.internal.example',
+      NODE_EXTRA_CA_CERTS: '/corp/ca.pem',
+    };
+    const privateSession = buildHttpProxyChildEnv(
+      17645,
+      '/clodex/session-ca.pem',
+      corporateEnv,
+    );
+
+    const restored = computeWrapperEnv(
+      privateSession,
+      null,
+      undefined,
+      { sessionProxyActive: false },
+    );
+
+    expect(restored).toMatchObject({
+      HTTPS_PROXY: 'http://corp-https.example:8443',
+      HTTP_PROXY: 'http://corp-http.example:8080',
+      https_proxy: 'http://corp-https.example:8443',
+      http_proxy: 'http://corp-http.example:8080',
+      NO_PROXY: 'localhost,api.anthropic.com,.corp.example',
+      no_proxy: '127.0.0.1,.internal.example',
+      NODE_EXTRA_CA_CERTS: '/corp/ca.pem',
+    });
+    expect(restored[NETWORK_ENV_CONTRACT_VAR]).toBeUndefined();
+    expect(restored['CLODEX_SESSION_PROXY']).toBeUndefined();
+  });
+
+  it('restores a standalone proxy child to its original network baseline', () => {
+    const state: ServerRuntimeState = {
+      mode: 'proxy',
+      port: 17645,
+      pid: process.pid,
+      caPath: '/home/u/.clodex/http-proxy/clodex-ca.pem',
+      startedAt: '2026-07-20T00:00:00.000Z',
+    };
+    const standalone = computeWrapperEnv(baseEnv, state);
+
+    const restored = computeWrapperEnv(standalone, null);
+
+    expect(restored).toMatchObject({
+      HTTPS_PROXY: 'http://corp-proxy:8080',
+      https_proxy: 'http://corp-proxy:8080',
+    });
+    for (const name of ['HTTP_PROXY', 'http_proxy', 'NO_PROXY', 'no_proxy', 'NODE_EXTRA_CA_CERTS']) {
+      expect(restored[name]).toBeUndefined();
+    }
+    for (const name of ['HTTPS_PROXY', 'HTTP_PROXY', 'https_proxy', 'http_proxy']) {
+      expect(restored[name]).not.toBe('http://127.0.0.1:17645');
+    }
+    expect(restored[NETWORK_ENV_CONTRACT_VAR]).toBeUndefined();
   });
 
   it('clears inherited injections on the no-server and endpoint paths', () => {
