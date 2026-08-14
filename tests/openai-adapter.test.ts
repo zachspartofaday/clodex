@@ -126,6 +126,29 @@ describe('streamOpenAiResponse', () => {
     expect(output).not.toContain('[DONE]');
   });
 
+  it('settles the watchdog when streaming creation throws synchronously', async () => {
+    vi.useFakeTimers();
+    const originalError = new Error('stream creation failed');
+    vi.mocked(streamText).mockImplementation(() => {
+      throw originalError;
+    });
+    let output = '';
+
+    try {
+      await expect(streamOpenAiResponse(
+        {} as never,
+        { messages: [] },
+        'gpt-test',
+        chunk => { output += chunk; },
+      )).rejects.toBe(originalError);
+      expect(output).not.toContain('[DONE]');
+      expect(vi.getTimerCount()).toBe(0);
+    } finally {
+      vi.useRealTimers();
+      vi.mocked(streamText).mockReset();
+    }
+  });
+
   it('accepts a provider-defined other finish reason', async () => {
     async function* stream() {
       yield { type: 'text-delta', text: 'complete' };
@@ -307,6 +330,27 @@ describe('generateOpenAiResponse with forceStream', () => {
       'gpt-test',
       { forceStream: true },
     )).rejects.toThrow('Upstream OpenAI stream ended without a terminal event');
+  });
+
+  it('settles the watchdog when force-stream creation throws synchronously', async () => {
+    vi.useFakeTimers();
+    const originalError = new Error('stream creation failed');
+    vi.mocked(streamText).mockImplementation(() => {
+      throw originalError;
+    });
+
+    try {
+      await expect(generateOpenAiResponse(
+        {} as never,
+        { messages: [] },
+        'gpt-test',
+        { forceStream: true },
+      )).rejects.toBe(originalError);
+      expect(vi.getTimerCount()).toBe(0);
+    } finally {
+      vi.useRealTimers();
+      vi.mocked(streamText).mockReset();
+    }
   });
 
   it('uses a non-streaming upstream request when forceStream is not set', async () => {

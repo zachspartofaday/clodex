@@ -272,28 +272,28 @@ export async function generateOpenAiResponse(
     // stream. Request a real stream from the SDK and collect it into one
     // response instead of issuing a non-streaming request upstream.
     const watchdog = openAiIdleWatchdog();
-    const { stream } = streamText({
-      model,
-      ...(params as any),
-      maxRetries: upstreamMaxRetries(),
-      abortSignal: watchdog.signal,
-      onError: () => {},
-      onStepFinish: step => reportUnsupportedServiceTier(params, step.warnings),
-    });
-    // forceStream is still a stream, so it keeps the idle deadline and no total
-    // ceiling. Watching here rather than inside collectOpenAiStream leaves that
-    // reducer's contract — and its callers — unchanged.
-    const watched = (async function* () {
-      for await (const part of stream as AsyncIterable<unknown>) {
-        watchdog.beat();
-        const p = part as any;
-        if (p?.type === 'tool-call' || (p?.type === 'text-delta' && (p.textDelta ?? p.text ?? ''))) {
-          watchdog.markOutput();
-        }
-        yield part;
-      }
-    })();
     try {
+      const { stream } = streamText({
+        model,
+        ...(params as any),
+        maxRetries: upstreamMaxRetries(),
+        abortSignal: watchdog.signal,
+        onError: () => {},
+        onStepFinish: step => reportUnsupportedServiceTier(params, step.warnings),
+      });
+      // forceStream is still a stream, so it keeps the idle deadline and no total
+      // ceiling. Watching here rather than inside collectOpenAiStream leaves that
+      // reducer's contract — and its callers — unchanged.
+      const watched = (async function* () {
+        for await (const part of stream as AsyncIterable<unknown>) {
+          watchdog.beat();
+          const p = part as any;
+          if (p?.type === 'tool-call' || (p?.type === 'text-delta' && (p.textDelta ?? p.text ?? ''))) {
+            watchdog.markOutput();
+          }
+          yield part;
+        }
+      })();
       result = await collectOpenAiStream(watched);
       // An aborted request never returns a response, even if the reducer
       // happened to see a terminal event as the deadline fired.
@@ -371,27 +371,27 @@ export async function streamOpenAiResponse(
   onChunk: (chunk: string) => void,
 ): Promise<void> {
   const watchdog = openAiIdleWatchdog();
-  const { stream } = streamText({
-    model,
-    ...(params as any),
-    maxRetries: upstreamMaxRetries(),
-    abortSignal: watchdog.signal,
-    onStepFinish: step => reportUnsupportedServiceTier(params, step.warnings),
-  });
-  const baseData = {
-    id: `chatcmpl-${Date.now()}`,
-    object: 'chat.completion.chunk',
-    created: Math.floor(Date.now() / 1000),
-    model: responseModelId,
-  };
-
-  const send = (delta: Record<string, any>, finish_reason: string | null = null) => {
-    watchdog.markOutput();
-    onChunk(`data: ${JSON.stringify({ ...baseData, choices: [{ index: 0, delta, finish_reason }] })}\n\n`);
-  };
-  let finishPart: { finishReason?: unknown; rawFinishReason?: unknown } | undefined;
-
   try {
+    const { stream } = streamText({
+      model,
+      ...(params as any),
+      maxRetries: upstreamMaxRetries(),
+      abortSignal: watchdog.signal,
+      onStepFinish: step => reportUnsupportedServiceTier(params, step.warnings),
+    });
+    const baseData = {
+      id: `chatcmpl-${Date.now()}`,
+      object: 'chat.completion.chunk',
+      created: Math.floor(Date.now() / 1000),
+      model: responseModelId,
+    };
+
+    const send = (delta: Record<string, any>, finish_reason: string | null = null) => {
+      watchdog.markOutput();
+      onChunk(`data: ${JSON.stringify({ ...baseData, choices: [{ index: 0, delta, finish_reason }] })}\n\n`);
+    };
+    let finishPart: { finishReason?: unknown; rawFinishReason?: unknown } | undefined;
+
     for await (const part of stream) {
       watchdog.beat();
       const p = part as any;

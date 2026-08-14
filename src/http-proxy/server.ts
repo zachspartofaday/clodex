@@ -4,6 +4,7 @@ import * as net from 'node:net';
 import type { AddressInfo, Socket } from 'node:net';
 import { randomUUID } from 'node:crypto';
 import { URL } from 'node:url';
+import { StringDecoder } from 'node:string_decoder';
 import { createBrotliDecompress, createGunzip, createInflate } from 'node:zlib';
 import type { ProxyHandle, ProxyRoute } from '../proxy.js';
 import { startProxyCatalog } from '../proxy.js';
@@ -122,9 +123,23 @@ function createResponseSseCapture(
   onTerminal?: (terminal: ResponseTerminal) => void,
 ): (chunk: Buffer) => void {
   let buffered = '';
+  const decoder = new StringDecoder('utf8');
+  let previousWasCr = false;
 
   return chunk => {
-    buffered = (buffered + chunk.toString('utf8')).replace(/\r\n/g, '\n');
+    let normalized = '';
+    for (const character of decoder.write(chunk)) {
+      if (character === '\r') {
+        normalized += '\n';
+        previousWasCr = true;
+      } else if (character === '\n' && previousWasCr) {
+        previousWasCr = false;
+      } else {
+        normalized += character;
+        previousWasCr = false;
+      }
+    }
+    buffered += normalized;
 
     let boundary: number;
     while ((boundary = buffered.indexOf('\n\n')) >= 0) {

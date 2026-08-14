@@ -43,6 +43,16 @@ const SUCCESS_SSE = [
   '',
   '',
 ].join('\n');
+const ERROR_SSE_BARE_CR = [
+  'event: message_start',
+  'data: {"type":"message_start","message":{"usage":{"input_tokens":0,"output_tokens":0}}}',
+  '',
+  'event: error',
+  'data: {"type":"error","error":{"type":"api_error","message":"synthetic failure"}}',
+  '',
+  '',
+].join('\r');
+const ERROR_SSE_CRLF = ERROR_SSE.replace(/\n/g, '\r\n');
 const compressedSseLifecycleCases = [
   { encodingName: 'gzip', contentEncoding: 'gzip', encode: gzipSync },
   { encodingName: 'deflate', contentEncoding: 'deflate', encode: deflateSync },
@@ -1756,6 +1766,120 @@ describe('selective HTTP proxy', () => {
     }
   }, 20_000);
 
+  it('records a bare-CR passthrough error SSE when a block delimiter spans chunks', async () => {
+    const certificates = ensureHttpProxyCertificates();
+    const inferenceLogPath = join(testHome, 'passthrough-bare-cr-error-sse-inference.jsonl');
+    const splitAt = ERROR_SSE_BARE_CR.indexOf('\r\r') + 1;
+    const origin = https.createServer({
+      key: certificates.serverKey,
+      cert: certificates.serverCert,
+    }, async (req, res) => {
+      req.resume();
+      await once(req, 'end');
+      res.writeHead(200, {
+        'Content-Type': 'text/event-stream',
+        'Content-Length': Buffer.byteLength(ERROR_SSE_BARE_CR),
+        'Connection': 'close',
+      });
+      res.write(ERROR_SSE_BARE_CR.slice(0, splitAt));
+      res.end(ERROR_SSE_BARE_CR.slice(splitAt));
+    });
+    const originPort = await listen(origin);
+    const proxy = await startHttpProxy({
+      routes: [],
+      inferenceLogPath,
+      anthropicOrigin: `https://127.0.0.1:${originPort}`,
+      anthropicRejectUnauthorized: false,
+    });
+
+    try {
+      const response = await requestMitm(
+        proxy.port,
+        certificates.caCert,
+        '/v1/messages',
+        JSON.stringify({
+          model: 'claude-sonnet-4-6',
+          messages: [{ role: 'user', content: 'synthetic bare CR passthrough error' }],
+          stream: true,
+        }),
+      );
+
+      expect(response).toContain(ERROR_SSE_BARE_CR);
+      await vi.waitFor(() => {
+        const current = readFileSync(inferenceLogPath, 'utf8').trim().split('\n').map(line => JSON.parse(line));
+        expect(current.some(entry => entry.event === 'response_failed')).toBe(true);
+      });
+      const entries = readFileSync(inferenceLogPath, 'utf8').trim().split('\n').map(line => JSON.parse(line));
+      expect(entries).toContainEqual(expect.objectContaining({
+        event: 'response_failed',
+        route: 'passthrough',
+        statusCode: 200,
+        terminalOutcome: 'error',
+        terminalCategory: 'error_sse',
+      }));
+      expect(entries.some(entry => entry.event === 'response_completed')).toBe(false);
+    } finally {
+      await proxy.close();
+      await new Promise<void>(resolve => origin.close(() => resolve()));
+    }
+  }, 20_000);
+
+  it('preserves a CRLF delimiter split across chunks while observing the terminal', async () => {
+    const certificates = ensureHttpProxyCertificates();
+    const inferenceLogPath = join(testHome, 'passthrough-split-crlf-inference.jsonl');
+    const splitAt = ERROR_SSE_CRLF.indexOf('\r\n') + 1;
+    const origin = https.createServer({
+      key: certificates.serverKey,
+      cert: certificates.serverCert,
+    }, async (req, res) => {
+      req.resume();
+      await once(req, 'end');
+      res.writeHead(200, {
+        'Content-Type': 'text/event-stream',
+        'Content-Length': Buffer.byteLength(ERROR_SSE_CRLF),
+        'Connection': 'close',
+      });
+      res.write(ERROR_SSE_CRLF.slice(0, splitAt));
+      res.end(ERROR_SSE_CRLF.slice(splitAt));
+    });
+    const originPort = await listen(origin);
+    const proxy = await startHttpProxy({
+      routes: [],
+      inferenceLogPath,
+      anthropicOrigin: `https://127.0.0.1:${originPort}`,
+      anthropicRejectUnauthorized: false,
+    });
+
+    try {
+      const response = await requestMitm(
+        proxy.port,
+        certificates.caCert,
+        '/v1/messages',
+        JSON.stringify({
+          model: 'claude-sonnet-4-6',
+          messages: [{ role: 'user', content: 'synthetic split CRLF error' }],
+          stream: true,
+        }),
+      );
+
+      expect(response).toContain(ERROR_SSE_CRLF);
+      await vi.waitFor(() => {
+        const current = readFileSync(inferenceLogPath, 'utf8').trim().split('\n').map(line => JSON.parse(line));
+        expect(current.some(entry => entry.event === 'response_failed')).toBe(true);
+      });
+      const entries = readFileSync(inferenceLogPath, 'utf8').trim().split('\n').map(line => JSON.parse(line));
+      expect(entries).toContainEqual(expect.objectContaining({
+        event: 'response_failed',
+        route: 'passthrough',
+        terminalOutcome: 'error',
+        terminalCategory: 'error_sse',
+      }));
+    } finally {
+      await proxy.close();
+      await new Promise<void>(resolve => origin.close(() => resolve()));
+    }
+  }, 20_000);
+
   it('records a normally closed error SSE as a failed terminal without changing client bytes', async () => {
     const certificates = ensureHttpProxyCertificates();
     const inferenceLogPath = join(testHome, 'adapter-error-sse-inference.jsonl');
@@ -1808,6 +1932,68 @@ describe('selective HTTP proxy', () => {
         terminalOutcome: 'error',
         terminalCategory: 'error_sse',
         terminationSource: 'upstream_failure',
+      }));
+      expect(entries.some(entry => entry.event === 'response_completed')).toBe(false);
+    } finally {
+      await proxy.close();
+    }
+  }, 20_000);
+
+  it('records a bare-CR translated error SSE when a block delimiter spans chunks', async () => {
+    const certificates = ensureHttpProxyCertificates();
+    const inferenceLogPath = join(testHome, 'adapter-bare-cr-error-sse-inference.jsonl');
+    const splitAt = ERROR_SSE_BARE_CR.indexOf('\r\r') + 1;
+    const adapterServer = http.createServer(async (req, res) => {
+      const ended = once(req, 'end');
+      req.resume();
+      await ended;
+      res.writeHead(200, {
+        'Content-Type': 'text/event-stream',
+        'Content-Length': Buffer.byteLength(ERROR_SSE_BARE_CR),
+        'Connection': 'close',
+      });
+      res.write(ERROR_SSE_BARE_CR.slice(0, splitAt));
+      res.end(ERROR_SSE_BARE_CR.slice(splitAt));
+    });
+    const adapterPort = await listen(adapterServer);
+    const proxy = await startHttpProxy({
+      routes: [TRANSLATED_ROUTE],
+      adapterHandle: {
+        port: adapterPort,
+        token: 'adapter-local-token',
+        close: () => {
+          adapterServer.closeAllConnections();
+          adapterServer.close();
+        },
+      },
+      inferenceLogPath,
+    });
+
+    try {
+      const response = await requestMitm(
+        proxy.port,
+        certificates.caCert,
+        '/v1/messages',
+        JSON.stringify({
+          model: TRANSLATED_ROUTE.aliasId,
+          messages: [{ role: 'user', content: 'synthetic bare CR translated error' }],
+          stream: true,
+        }),
+      );
+
+      expect(response).toContain(ERROR_SSE_BARE_CR);
+      await vi.waitFor(() => {
+        const current = readFileSync(inferenceLogPath, 'utf8').trim().split('\n').map(line => JSON.parse(line));
+        expect(current.some(entry => entry.event === 'response_failed')).toBe(true);
+      });
+      const entries = readFileSync(inferenceLogPath, 'utf8').trim().split('\n').map(line => JSON.parse(line));
+      const requestEntry = entries.find(entry => !entry.event);
+      expect(entries).toContainEqual(expect.objectContaining({
+        event: 'response_failed',
+        requestId: requestEntry.requestId,
+        statusCode: 200,
+        terminalOutcome: 'error',
+        terminalCategory: 'error_sse',
       }));
       expect(entries.some(entry => entry.event === 'response_completed')).toBe(false);
     } finally {
