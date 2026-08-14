@@ -42,7 +42,7 @@ No model declares a default effort, so `defaultLevel` is `null` throughout and a
 
 Profiles are runtime-only. They are attached by retained provider identity after model projection, never stored in a model cache, so a stale cache cannot state what a model's effort control is. What a request does with an unsupported level is the user's global `clodex models --effort-policy` setting; see the README.
 
-The historical native interactive selector uses a dense low/medium/high picker, so only `gpt-5.6-luna` and `qwen3.6-plus` reach it. Under the settled `PATCH_TRANSFORMS_VERSION = 6` conservation decision, sparse-picker work is explicitly deferred: the other reviewed ladders correctly appear with no native picker rather than changing protected patch transforms in this slice. The CLI `clodex models --effort-policy` setting remains supported for every routed request regardless of whether that model has a native interactive picker.
+The historical native interactive selector uses a dense low/medium/high picker, so only `gpt-5.6-luna` and `qwen3.6-plus` reach it. The current `PATCH_TRANSFORMS_VERSION` is 11, and PATCH 8d/8e ship each configured model's exact ordered sparse ladder. The current native-picker restriction comes from `projectNativeEffort`, which requires all three base levels `low`, `medium`, and `high`; only those two profiles declare all three, so the other reviewed sparse ladders remain supported through the CLI effort-policy path rather than the native picker. The CLI `clodex models --effort-policy` setting remains supported for every routed request regardless of whether that model has a native interactive picker.
 
 ## Updating the catalog
 
