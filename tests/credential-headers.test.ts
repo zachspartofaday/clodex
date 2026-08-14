@@ -12,6 +12,10 @@ describe('isCredentialBearingHeader', () => {
     'X-Client-Secret',
     'X-Credential-Id',
     ' X-API-Key ',
+    'X-Auth',
+    'Authentication',
+    'X-Auth-Key',
+    'XApiKey',
   ])('identifies %s as credential-bearing', (name) => {
     expect(isCredentialBearingHeader(name)).toBe(true);
   });
@@ -22,6 +26,8 @@ describe('isCredentialBearingHeader', () => {
     'User-Agent',
     'X-Plan',
     'X-Request-Id',
+    'X-Auth-Tracking',
+    'Authentication-Info',
   ])('preserves non-credential header %s', (name) => {
     expect(isCredentialBearingHeader(name)).toBe(false);
   });
