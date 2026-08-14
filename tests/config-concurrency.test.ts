@@ -26,12 +26,12 @@ function temporaryRoot(): string {
   return root;
 }
 
-async function buildWorker(root: string): Promise<string> {
+async function buildWorker(root: string, fixture = 'config-write-worker.ts'): Promise<string> {
   const outDir = join(root, 'worker-build');
   await build({
     entry: [
       fileURLToPath(
-        new URL('./fixtures/config-write-worker.ts', import.meta.url),
+        new URL(`./fixtures/${fixture}`, import.meta.url),
       ),
     ],
     outDir,
@@ -46,18 +46,20 @@ async function buildWorker(root: string): Promise<string> {
     silent: true,
     config: false,
   });
-  return join(outDir, 'config-write-worker.mjs');
+  return join(outDir, fixture.replace(/\.ts$/, '.mjs'));
 }
 
 function workerEnvironment(
   configHome: string,
   workerId: string,
   writeCount: number,
+  operation?: 'profiles' | 'aliases',
 ): NodeJS.ProcessEnv {
   const environment: NodeJS.ProcessEnv = {
     CLODEX_HOME: configHome,
     CONFIG_WRITE_WORKER_ID: workerId,
     CONFIG_WRITE_COUNT: String(writeCount),
+    ...(operation ? { CONFIG_COLLECTION_WORKER_OPERATION: operation } : {}),
   };
   for (const key of [
     'HOME',
@@ -79,10 +81,11 @@ function spawnWorker(
   configHome: string,
   workerId: string,
   writeCount: number,
+  operation?: 'profiles' | 'aliases',
 ): WorkerProcess {
   const child = spawn(process.execPath, [workerPath], {
     cwd: process.cwd(),
-    env: workerEnvironment(configHome, workerId, writeCount),
+    env: workerEnvironment(configHome, workerId, writeCount, operation),
     stdio: ['pipe', 'pipe', 'pipe'],
   });
   let stdout = '';
@@ -193,5 +196,79 @@ describe('preference write concurrency', () => {
       ).flat(),
     );
     expect(config.appPathOverrides).toEqual(expected);
+  }, 30_000);
+});
+
+describe('collection write concurrency', () => {
+  it('preserves every concurrent model profile update', async () => {
+    const root = temporaryRoot();
+    const configHome = join(root, 'clodex-home');
+    const configPath = join(configHome, 'config.json');
+    const workerPath = await buildWorker(root, 'config-collection-worker.ts');
+    const workerCount = 8;
+    const writesPerWorker = 4;
+    const spawned = Array.from({ length: workerCount }, (_, index) =>
+      spawnWorker(workerPath, configHome, `worker-${index}`, writesPerWorker, 'profiles'),
+    );
+
+    await Promise.all(spawned.map(worker => worker.ready));
+    const exits = Promise.all(spawned.map(worker => worker.exit));
+    const malformed = observeJsonUntil(configPath, exits);
+    for (const worker of spawned) worker.child.stdin?.end('START\n');
+
+    const results = await exits;
+    expect(results).toEqual(
+      Array.from({ length: workerCount }, () => ({ code: 0, stderr: '' })),
+    );
+    expect(await malformed).toEqual([]);
+
+    const config = JSON.parse(readFileSync(configPath, 'utf8')) as {
+      modelProfiles?: Record<string, unknown>;
+    };
+    const expectedNames = Array.from(
+      { length: workerCount * writesPerWorker },
+      (_, index) => `profile-worker-${Math.floor(index / writesPerWorker)}-${index % writesPerWorker}`,
+    ).sort();
+    expect(Object.keys(config.modelProfiles ?? {}).sort()).toEqual(expectedNames);
+  }, 30_000);
+
+  it('preserves every concurrent model alias update', async () => {
+    const root = temporaryRoot();
+    const configHome = join(root, 'clodex-home');
+    const configPath = join(configHome, 'config.json');
+    const workerPath = await buildWorker(root, 'config-collection-worker.ts');
+    const workerCount = 8;
+    const writesPerWorker = 4;
+    const spawned = Array.from({ length: workerCount }, (_, index) =>
+      spawnWorker(workerPath, configHome, `worker-${index}`, writesPerWorker, 'aliases'),
+    );
+
+    await Promise.all(spawned.map(worker => worker.ready));
+    const exits = Promise.all(spawned.map(worker => worker.exit));
+    const malformed = observeJsonUntil(configPath, exits);
+    for (const worker of spawned) worker.child.stdin?.end('START\n');
+
+    const results = await exits;
+    expect(results).toEqual(
+      Array.from({ length: workerCount }, () => ({ code: 0, stderr: '' })),
+    );
+    expect(await malformed).toEqual([]);
+
+    const config = JSON.parse(readFileSync(configPath, 'utf8')) as {
+      modelAliases?: Array<{ name: string; providerId: string; modelId: string }>;
+    };
+    const expected = Array.from(
+      { length: workerCount * writesPerWorker },
+      (_, index) => {
+        const workerIndex = Math.floor(index / writesPerWorker);
+        const writeIndex = index % writesPerWorker;
+        return {
+          name: `alias-worker-${workerIndex}-${writeIndex}`,
+          providerId: `worker-${workerIndex}`,
+          modelId: `model-${writeIndex}`,
+        };
+      },
+    ).sort((a, b) => a.name.localeCompare(b.name));
+    expect([...(config.modelAliases ?? [])].sort((a, b) => a.name.localeCompare(b.name))).toEqual(expected);
   }, 30_000);
 });

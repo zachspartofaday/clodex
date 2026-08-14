@@ -16,6 +16,28 @@ vi.mock('../src/config.js', () => ({
       }
     }
   }),
+  setModelProfile: vi.fn((name: string, profile: NonNullable<UserPreferences['modelProfiles']>[string]) => {
+    const profiles = configState.current.modelProfiles
+      && typeof configState.current.modelProfiles === 'object'
+      && !Array.isArray(configState.current.modelProfiles)
+      ? { ...configState.current.modelProfiles }
+      : {};
+    profiles[name] = structuredClone(profile);
+    configState.current.modelProfiles = profiles;
+    configState.current.activeModelProfile = name;
+  }),
+  deleteModelProfile: vi.fn((name: string) => {
+    const profiles = configState.current.modelProfiles
+      && typeof configState.current.modelProfiles === 'object'
+      && !Array.isArray(configState.current.modelProfiles)
+      ? { ...configState.current.modelProfiles }
+      : {};
+    delete profiles[name];
+    configState.current.modelProfiles = profiles;
+    if (configState.current.activeModelProfile === name) {
+      delete configState.current.activeModelProfile;
+    }
+  }),
 }));
 
 vi.mock('@clack/prompts', () => ({

@@ -9,7 +9,12 @@
 
 import pc from 'picocolors';
 import * as p from '@clack/prompts';
-import { loadPreferences, savePreferences } from './config.js';
+import {
+  deleteModelProfile,
+  loadPreferences,
+  savePreferences,
+  setModelProfile,
+} from './config.js';
 import type {
   BuiltinAliasName,
   FavoriteModel,
@@ -133,14 +138,6 @@ function ownProfiles(prefs: UserPreferences): Record<string, ModelProfile> {
   return profiles;
 }
 
-/** Preserve unknown/malformed own entries during unrelated save/delete operations. */
-function storedProfileEntries(prefs: UserPreferences): Record<string, unknown> {
-  const stored: Record<string, unknown> = Object.create(null);
-  if (!isRecord(prefs.modelProfiles)) return stored;
-  for (const [name, value] of Object.entries(prefs.modelProfiles)) stored[name] = value;
-  return stored;
-}
-
 function sameSnapshot(a: Omit<ModelProfile, 'savedAt'>, b: Omit<ModelProfile, 'savedAt'>): boolean {
   const canonical = (value: unknown): string => JSON.stringify(value ?? []);
   return canonical(a.favoriteModels) === canonical(b.favoriteModels)
@@ -191,7 +188,6 @@ export async function runProfilesCommand(args: string[]): Promise<number> {
 
   const prefs = loadPreferences();
   const profiles = ownProfiles(prefs);
-  const storedProfiles = storedProfileEntries(prefs);
 
   if (!sub || sub === 'list') {
     const names = Object.keys(profiles).sort();
@@ -226,10 +222,7 @@ export async function runProfilesCommand(args: string[]): Promise<number> {
 
     if (sub === 'save') {
       const profile: ModelProfile = { savedAt: new Date().toISOString(), ...snapshotOf(prefs) };
-      savePreferences({
-        modelProfiles: { ...storedProfiles, [name]: profile } as Record<string, ModelProfile>,
-        activeModelProfile: name,
-      });
+      setModelProfile(name, profile);
       p.log.success(`Saved profile "${name}" (${profile.modelAliases.length} alias${profile.modelAliases.length === 1 ? '' : 'es'}, ${profile.favoriteModels.length} favorite${profile.favoriteModels.length === 1 ? '' : 's'}).`);
       return 0;
     }
@@ -269,12 +262,7 @@ export async function runProfilesCommand(args: string[]): Promise<number> {
     }
 
     // delete
-    const remaining = { ...storedProfiles };
-    delete remaining[name];
-    savePreferences({
-      modelProfiles: remaining as Record<string, ModelProfile>,
-      ...(prefs.activeModelProfile === name ? { activeModelProfile: '' } : {}),
-    });
+    deleteModelProfile(name);
     p.log.success(`Deleted profile "${name}".`);
     return 0;
   }

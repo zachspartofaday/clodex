@@ -1,4 +1,10 @@
-import type { UserPreferences } from './types.js';
+import type {
+  BuiltinAliasName,
+  FavoriteModel,
+  ModelAlias,
+  ModelProfile,
+  UserPreferences,
+} from './types.js';
 import { randomUUID } from 'node:crypto';
 import { readFileSync, renameSync, unlinkSync } from 'node:fs';
 import {
@@ -6,6 +12,9 @@ import {
   isUnsupportedEffortPolicy,
 } from './effort-policy.js';
 import { getConfigPath } from './paths.js';
+import { addFavorite, removeFavorite, type AddFavoriteResult } from './favorites.js';
+import { modelAliasMatchesName, modelAliasMatchesStoredName } from './model-aliases.js';
+import { BUILTIN_ALIAS_ENV } from './builtin-alias-env.js';
 import { syncParentDirectory, writeSecureFile } from './registry/io.js';
 import {
   assertRegistryWriteOwnership,
@@ -24,6 +33,10 @@ function readJsonFile(path: string): UserPreferences | null {
 
 function readConfig(): UserPreferences {
   return readJsonFile(getConfigPath()) ?? {};
+}
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return Boolean(value) && typeof value === 'object' && !Array.isArray(value);
 }
 
 function writeConfig(config: UserPreferences): void {
@@ -127,6 +140,129 @@ export function savePreferences(prefs: Partial<Pick<UserPreferences, 'lastModel'
   });
 }
 
+export function setModelProfile(name: string, profile: ModelProfile): void {
+  updateConfig(config => {
+    const profiles: Record<string, ModelProfile> = isRecord(config.modelProfiles)
+      ? { ...config.modelProfiles } as Record<string, ModelProfile>
+      : {};
+    profiles[name] = profile;
+    config.modelProfiles = profiles;
+    config.activeModelProfile = name;
+  });
+}
+
+export function deleteModelProfile(name: string): void {
+  updateConfig(config => {
+    const profiles: Record<string, ModelProfile> = isRecord(config.modelProfiles)
+      ? { ...config.modelProfiles } as Record<string, ModelProfile>
+      : {};
+    delete profiles[name];
+    config.modelProfiles = profiles;
+    if (config.activeModelProfile === name) delete config.activeModelProfile;
+  });
+}
+
+export function setBuiltinModelOverride(
+  builtin: BuiltinAliasName,
+  target: string | null,
+): Partial<Record<BuiltinAliasName, string>> {
+  return updateConfig(config => {
+    const next: Partial<Record<BuiltinAliasName, string>> = isRecord(config.builtinModelOverrides)
+      ? { ...config.builtinModelOverrides } as Partial<Record<BuiltinAliasName, string>>
+      : {};
+    if (target === null) delete next[builtin];
+    else next[builtin] = target;
+    if (Object.keys(next).length === 0) delete config.builtinModelOverrides;
+    else config.builtinModelOverrides = next;
+    return next;
+  });
+}
+
+export function clearBuiltinOverridesTargeting(
+  aliasName: string,
+): Array<[BuiltinAliasName, string]> {
+  return updateConfig(config => {
+    const overrides = isRecord(config.builtinModelOverrides)
+      ? config.builtinModelOverrides
+      : {};
+    const targetName = aliasName.trim().toLowerCase();
+    const cleared = (Object.entries(overrides) as Array<[string, unknown]>)
+      .filter(([builtin, target]) => (
+        builtin in BUILTIN_ALIAS_ENV
+        && typeof target === 'string'
+        && target.trim().toLowerCase() === targetName
+      ))
+      .map(([builtin, target]) => [builtin as BuiltinAliasName, target as string] as [BuiltinAliasName, string]);
+    if (cleared.length === 0) return cleared;
+    const next = { ...overrides } as Partial<Record<BuiltinAliasName, string>>;
+    for (const [builtin] of cleared) delete next[builtin];
+    if (Object.keys(next).length === 0) delete config.builtinModelOverrides;
+    else config.builtinModelOverrides = next;
+    return cleared;
+  });
+}
+
+export function upsertModelAlias(alias: ModelAlias): ModelAlias[] {
+  return updateConfig(config => {
+    const aliases = Array.isArray(config.modelAliases) ? config.modelAliases : [];
+    const next = aliases.filter(entry => !modelAliasMatchesName(entry, alias.name));
+    next.push(alias);
+    config.modelAliases = next;
+    return next;
+  });
+}
+
+export function removeModelAliasesByName(
+  name: string,
+): { aliases: ModelAlias[]; removedCount: number } {
+  return updateConfig(config => {
+    const aliases = Array.isArray(config.modelAliases) ? config.modelAliases : [];
+    const aliasesAfterRemoval = aliases.filter(entry => !modelAliasMatchesName(entry, name));
+    const removedCount = aliases.length - aliasesAfterRemoval.length;
+    if (removedCount > 0) config.modelAliases = aliasesAfterRemoval;
+    return {
+      aliases: aliasesAfterRemoval,
+      removedCount,
+    };
+  });
+}
+
+export function removeModelAliasesByStoredName(
+  requestedName: string,
+): { aliases: ModelAlias[]; removedCount: number } {
+  return updateConfig(config => {
+    const aliases = Array.isArray(config.modelAliases) ? config.modelAliases : [];
+    const aliasesAfterRemoval = aliases.filter(entry => !modelAliasMatchesStoredName(entry, requestedName));
+    const removedCount = aliases.length - aliasesAfterRemoval.length;
+    if (removedCount > 0) config.modelAliases = aliasesAfterRemoval;
+    return {
+      aliases: aliasesAfterRemoval,
+      removedCount,
+    };
+  });
+}
+
+export function addFavoriteModel(
+  fav: FavoriteModel,
+  max?: number,
+): AddFavoriteResult {
+  return updateConfig(config => {
+    const favorites = Array.isArray(config.favoriteModels) ? config.favoriteModels : [];
+    const result = addFavorite(favorites, fav, max);
+    if (result.ok) config.favoriteModels = result.list;
+    return result;
+  });
+}
+
+export function removeFavoriteModel(fav: FavoriteModel): FavoriteModel[] {
+  return updateConfig(config => {
+    const favorites = Array.isArray(config.favoriteModels) ? config.favoriteModels : [];
+    const next = removeFavorite(favorites, fav);
+    config.favoriteModels = next;
+    return next;
+  });
+}
+
 export function getAppPathOverride(appId: string): string | undefined {
   const value = loadPreferences().appPathOverrides?.[appId];
   return typeof value === 'string' && value.trim() ? value : undefined;
@@ -180,14 +316,19 @@ export function recordLaunchSelection(
   _agent: 'claude',
   providerId: string,
   modelId: string,
-  prefs: UserPreferences,
 ): void {
-  const prevRecent = prefs.recentModelsByProvider?.[providerId] ?? [];
-  const updatedRecent = [modelId, ...prevRecent.filter(id => id !== modelId)].slice(0, MAX_RECENT_MODELS);
-  savePreferences({
-    lastProvider: providerId,
-    lastModel: modelId,
-    recentModelsByProvider: { ...prefs.recentModelsByProvider, [providerId]: updatedRecent },
+  updateConfig(config => {
+    const recentModelsByProvider = isRecord(config.recentModelsByProvider)
+      ? { ...config.recentModelsByProvider } as Record<string, string[]>
+      : {};
+    const prevRecent = Array.isArray(recentModelsByProvider[providerId])
+      ? recentModelsByProvider[providerId]
+      : [];
+    const updatedRecent = [modelId, ...prevRecent.filter(id => id !== modelId)].slice(0, MAX_RECENT_MODELS);
+    recentModelsByProvider[providerId] = updatedRecent;
+    config.lastProvider = providerId;
+    config.lastModel = modelId;
+    config.recentModelsByProvider = recentModelsByProvider;
   });
 }
 

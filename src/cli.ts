@@ -17,23 +17,33 @@ import {
   resolveCatalogModelAliases,
 } from './catalog.js';
 import { runServerCommand } from './server/index.js';
-import { loadPreferences, savePreferences, recordLaunchSelection, resolveBridgeMode } from './config.js';
+import {
+  addFavoriteModel,
+  clearBuiltinOverridesTargeting,
+  loadPreferences,
+  recordLaunchSelection,
+  removeFavoriteModel,
+  removeModelAliasesByName,
+  removeModelAliasesByStoredName,
+  resolveBridgeMode,
+  savePreferences,
+  setBuiltinModelOverride,
+  upsertModelAlias,
+} from './config.js';
 import { pickLocalModel } from './prompts.js';
 import { fetchProviderCatalog, providersForPicker, resolveLocalProviderApiKey } from './provider-catalog.js';
 import { hasAnthropicThinkingLadder } from './model-runtime-compatibility.js';
 import { VERSION } from './constants.js';
-import type { BuiltinAliasName, ModelAlias, ParsedArgs, FavoriteModel, LocalProvider, LocalProviderModel } from './types.js';
+import type { BuiltinAliasName, ParsedArgs, FavoriteModel, LocalProvider, LocalProviderModel } from './types.js';
 import { routableBuiltinOverrides } from './builtin-alias-env.js';
 import { normalizeRouteLookupId } from './context-model-id.js';
-import { addFavorite, isFavorite, projectFavoriteExposure, removeFavorite } from './favorites.js';
+import { isFavorite, projectFavoriteExposure } from './favorites.js';
 import { httpProxyModelId } from './http-proxy/routes.js';
 import {
   canonicalModelAliasName,
   describeModelAliasRejection,
   isReservedModelAlias,
   isModelAliasNameSyntax,
-  modelAliasMatchesName,
-  modelAliasMatchesStoredName,
   modelAliasTarget,
   parseModelAliasAssignment,
 } from './model-aliases.js';
@@ -879,7 +889,6 @@ async function runAliasConfigurator(
 
     if (choice.startsWith('builtin-')) {
       const builtin = choice.slice('builtin-'.length) as BuiltinAliasName;
-      const current = prefs.builtinModelOverrides ?? {};
       // Offer only what the proxy will actually route. A saved alias that
       // normalizeModelAliases rejects (conflicting duplicates) or whose
       // favorite/provider is unavailable would inject a model name through
@@ -912,10 +921,8 @@ async function runAliasConfigurator(
         options: routable,
       });
       if (p.isCancel(picked)) continue;
-      const next = { ...current };
-      if (picked === '__native__') delete next[builtin];
-      else next[builtin] = picked.slice('use:'.length);
-      savePreferences({ builtinModelOverrides: next });
+      if (picked === '__native__') setBuiltinModelOverride(builtin, null);
+      else setBuiltinModelOverride(builtin, picked.slice('use:'.length));
       p.log.success(picked === '__native__'
         ? `Restored built-in ${builtin} to its native default.`
         : `Built-in ${builtin} now launches as ${picked.slice('use:'.length)} (proxy mode; explicit env vars still win).`);
@@ -937,9 +944,7 @@ async function runAliasConfigurator(
       const name = canonicalModelAliasName(String(rawName));
       const target = await pickTarget(favorites, `Route "${name}" to which favorite?`);
       if (!target) continue;
-      const next: ModelAlias[] = aliases.filter(alias => !modelAliasMatchesName(alias, name));
-      next.push({ name, providerId: target.providerId, modelId: target.modelId });
-      savePreferences({ modelAliases: next });
+      upsertModelAlias({ name, providerId: target.providerId, modelId: target.modelId });
       p.log.success(`Saved alias ${name} → clodex:${target.providerId}:${target.modelId}.`);
       continue;
     }
@@ -964,9 +969,7 @@ async function runAliasConfigurator(
     // equivalent duplicate remains routable (remove).
     const canonicalName = canonicalModelAliasName(alias.name) || alias.name;
     if (action === 'remove') {
-      const remaining = aliases.filter(entry => !modelAliasMatchesName(entry, canonicalName));
-      const removedCount = aliases.length - remaining.length;
-      savePreferences({ modelAliases: remaining });
+      const { removedCount } = removeModelAliasesByName(canonicalName);
       p.log.success(removedCount > 1
         ? `Removed ${removedCount} records for alias ${alias.name}.`
         : `Removed alias ${alias.name}.`);
@@ -975,9 +978,7 @@ async function runAliasConfigurator(
     }
     const target = await pickTarget(favorites, `Route "${alias.name}" to which favorite?`);
     if (!target) continue;
-    const next = aliases.filter(entry => !modelAliasMatchesName(entry, canonicalName));
-    next.push({ name: canonicalName, providerId: target.providerId, modelId: target.modelId });
-    savePreferences({ modelAliases: next });
+    upsertModelAlias({ name: canonicalName, providerId: target.providerId, modelId: target.modelId });
     p.log.success(`Saved alias ${alias.name} → clodex:${target.providerId}:${target.modelId}.`);
   }
 }
@@ -989,14 +990,7 @@ async function runAliasConfigurator(
  * native default. Clear matching remaps whenever an alias is deleted.
  */
 function clearBuiltinOverridesForRemovedAlias(removedName: string): void {
-  const prefs = loadPreferences();
-  const overrides = prefs.builtinModelOverrides ?? {};
-  const cleared = (Object.entries(overrides) as Array<[BuiltinAliasName, string]>)
-    .filter(([, target]) => target.trim().toLowerCase() === removedName.trim().toLowerCase());
-  if (cleared.length === 0) return;
-  const next = { ...overrides };
-  for (const [builtin] of cleared) delete next[builtin];
-  savePreferences({ builtinModelOverrides: next });
+  const cleared = clearBuiltinOverridesTargeting(removedName);
   for (const [builtin, target] of cleared) {
     p.log.warn(`Cleared built-in remap ${builtin} → ${target}: its alias was removed, so ${builtin} reverts to the native default.`);
   }
@@ -1037,10 +1031,7 @@ export async function runModelsCommand(opts: FavoritesCommandOptions = {}): Prom
       p.log.error('Saved model aliases are malformed: "modelAliases" must be an array.');
       return 1;
     }
-    const aliases = prefs.modelAliases ?? [];
-    const modelAliases = aliases.filter(alias => !modelAliasMatchesName(alias, parsed.name));
-    modelAliases.push(parsed);
-    savePreferences({ modelAliases });
+    upsertModelAlias(parsed);
     p.log.success(`Saved model alias ${parsed.name} → ${modelAliasTarget(parsed)}.`);
     const exposure = projectFavoriteExposure(prefs.favoriteModels ?? []);
     const targetExposed = exposure.exposedFavorites.some(
@@ -1062,14 +1053,11 @@ export async function runModelsCommand(opts: FavoritesCommandOptions = {}): Prom
       p.log.error('Saved model aliases are malformed: "modelAliases" must be an array.');
       return 1;
     }
-    const aliases = prefs.modelAliases ?? [];
-    const modelAliases = aliases.filter(alias => !modelAliasMatchesStoredName(alias, requestedName));
-    const removedCount = aliases.length - modelAliases.length;
+    const { removedCount } = removeModelAliasesByStoredName(requestedName);
     if (removedCount === 0) {
       p.log.error(`No model alias named ${JSON.stringify(requestedName)} is saved.`);
       return 1;
     }
-    savePreferences({ modelAliases });
     p.log.success(
       removedCount === 1
         ? `Removed model alias ${name || JSON.stringify(requestedName)}.`
@@ -1134,7 +1122,6 @@ export async function runModelsCommand(opts: FavoritesCommandOptions = {}): Prom
 
   const prefs = loadPreferences();
   let favorites = prefs.favoriteModels ?? [];
-  let favoritesDirty = false;
 
   // eslint-disable-next-line no-constant-condition
   while (true) {
@@ -1191,10 +1178,6 @@ export async function runModelsCommand(opts: FavoritesCommandOptions = {}): Prom
     }
 
     if (choice === '__aliases__') {
-      if (favoritesDirty) {
-        savePreferences({ favoriteModels: favorites });
-        favoritesDirty = false;
-      }
       await runAliasConfigurator(modelLookup);
       continue;
     }
@@ -1286,7 +1269,7 @@ export async function runModelsCommand(opts: FavoritesCommandOptions = {}): Prom
 
       for (const model of browsedMultiple) {
         const fav: FavoriteModel = { providerId: provider!.id, modelId: model.id };
-        const result = addFavorite(favorites, fav, maxFavorites);
+        const result = addFavoriteModel(fav, maxFavorites);
         if (!result.ok) {
           if (result.reason === 'duplicate') {
             duplicateCount++;
@@ -1296,7 +1279,6 @@ export async function runModelsCommand(opts: FavoritesCommandOptions = {}): Prom
           }
         } else {
           favorites = result.list;
-          favoritesDirty = true;
           addedModels.push(model);
         }
       }
@@ -1322,14 +1304,9 @@ export async function runModelsCommand(opts: FavoritesCommandOptions = {}): Prom
       const label = entry ? `${entry.modelName} (${entry.providerName})` : fav.modelId;
       const confirmed = await p.confirm({ message: `Remove ${label} from favorites?` });
       if (p.isCancel(confirmed) || !confirmed) continue;
-      favorites = removeFavorite(favorites, fav);
-      favoritesDirty = true;
+      favorites = removeFavoriteModel(fav);
       p.log.success(`Removed ${label} from favorites.`);
     }
-  }
-
-  if (favoritesDirty) {
-    savePreferences({ favoriteModels: favorites });
   }
 
   relayOutro(
@@ -1613,7 +1590,7 @@ export async function runClaudeCommand(parsed: ParsedArgs): Promise<number> {
     if (!agentStdout) {
       p.log.step(`Using ${selectedModel.name || selectedModel.id} (${activeProvider.name})`);
     }
-    if (!dryRun) recordLaunchSelection('claude', activeProvider.id, selectedModel.id, prefs);
+    if (!dryRun) recordLaunchSelection('claude', activeProvider.id, selectedModel.id);
   } else {
     let currentInitialProvider = initialProvider;
     while (true) {
@@ -1655,7 +1632,7 @@ export async function runClaudeCommand(parsed: ParsedArgs): Promise<number> {
         const sel = available[Number(pickedIdx)]!;
         activeProvider = sel.provider;
         selectedModel = sel.model;
-        if (!dryRun) recordLaunchSelection('claude', activeProvider.id, selectedModel.id, prefs);
+        if (!dryRun) recordLaunchSelection('claude', activeProvider.id, selectedModel.id);
         break;
       } else {
         activeProvider = allProviders.find(lp => lp.id === providerChoice)!;
@@ -1667,7 +1644,7 @@ export async function runClaudeCommand(parsed: ParsedArgs): Promise<number> {
         if (!pickedModelResult) return 0;
         selectedModel = pickedModelResult;
 
-        if (!dryRun) recordLaunchSelection('claude', activeProvider.id, selectedModel.id, prefs);
+        if (!dryRun) recordLaunchSelection('claude', activeProvider.id, selectedModel.id);
         break;
       }
     }
