@@ -157,9 +157,15 @@ tweakcc's own repack reads back as an ordinary module name.
   (`.clodex-patch-*`, removed in a `finally`) and `renameSync`s it over the binary only after every
   *required* site applied and the repack succeeded (PATCH 4 and 5 are `required:false` and may FAIL
   without blocking) — which is what makes the "required effort patches failed" throw (PATCH
-  8a/8b/8c/9) safe: the install is still whole. The candidate is seeded from the *established
-  pristine bytes*, not the live binary, whenever the live binary is not itself provably pristine —
-  regardless of what the manifest says.
+  8a/8b/8c/9) safe: the install is still whole. Before that rename, publication keeps an
+  independently named hardlink rescue of the live binary until manifest publication succeeds or
+  rollback definitely succeeds. If both publication and rollback fail, the rescue remains and the
+  error reports its path and instructs the operator to rename it over the live binary before
+  rerunning `clodex patch`. Individual live-binary publication is atomic, but there is no durable
+  transaction marker: process or power loss between binary and manifest operations can leave stale
+  manifest state or orphaned stage/rescue files. There is no cross-path crash atomicity or automatic
+  recovery. The candidate is seeded from the *established pristine bytes*, not the live binary,
+  whenever the live binary is not itself provably pristine — regardless of what the manifest says.
 - **Whatever the seed, the bytes about to be patched must carry no clodex patch marker.** The live
   binary is checked on the bootstrap path, and a backup is checked after it is seeded, because
   `verifyPristineSource` only proves the *version* — and a patched claude reports its version
@@ -200,9 +206,10 @@ tweakcc's own repack reads back as an ordinary module name.
   `claude-<ver>.orig` (no hash in the name, possibly mislabeled by an older clodex) must
   additionally report that version when executed (`verifyPristineSource`). Conflicting or
   unverifiable backups produce a loud error, never a copy. This gate covers both consumers —
-  `applyPatch` seeds its candidate from those bytes, and **`clodex patch --restore` copies straight
-  over the live binary** (nothing to publish atomically), so an unverified backup would be a silent
-  downgrade either way. An already-patched binary is never snapshotted as pristine. Legacy backups
+  `applyPatch` seeds its candidate from those bytes, and **`clodex patch --restore` stages a verified
+  sibling beside the live binary, validates its size and SHA-256 against the selected pristine backup,
+  then atomically renames it over the live path**, so an unverified backup would be a silent downgrade
+  either way. An already-patched binary is never snapshotted as pristine. Legacy backups
   are adopted (copied to their content address) rather than orphaned — and whether the canonical
   name already holds the right bytes is decided from the scan's **content hash, not `existsSync`**,
   so a truncated or foreign file parked there is replaced instead of adopted and published. Every
@@ -214,9 +221,11 @@ tweakcc's own repack reads back as an ordinary module name.
 - **`clodex patch --restore` must work on a binary that no longer runs** — that is what a pristine
   backup is *for*. It resolves the version from `claude --version` when it can, and otherwise falls
   back to the manifest's `claudeVersion` when `manifest.binaryPath` matches the resolved install,
-  establishing provenance without executing anything. The patch path keeps the hard `version-unknown`
-  failure (patching is elective; restoring is the way out), and its error message names `--restore`
-  as the recovery.
+  establishing provenance without executing anything. The restore removes the manifest after the
+  binary rename; ENOENT is normal, but any other cleanup failure is reported as a partial/divergent
+  completion. Manually remove the stale `~/.clodex/patch-state.json` manifest before rerunning
+  `clodex patch`. The patch path keeps the hard `version-unknown` failure (patching is elective;
+  restoring is the way out), and its error message names `--restore` as the recovery.
 - **Binary resolution bypasses PATH shims** (cmux installs a shim copy):
   `TWEAKCC_CC_INSTALLATION_PATH` → `~/.local/bin/claude` → `findClaudeBinary()`. **The version is
   probed from that resolved binary** (`getClaudeVersionForBinary`), never from
