@@ -33,7 +33,8 @@ The reviewed per-model wire maps in the updater are the authority for every exec
 
 - `deepseek-v4-flash` advertises a `low` variant that the reviewed map sends nothing for, so `low` is not exposed.
 - `qwen3.6-plus` advertises Anthropic thinking budgets, but clodex routes it over Chat Completions, so that representation is denied and the reviewed effort map governs the route.
-- `minimax-m3`, `qwen3.7-max`, `qwen3.7-plus`, and `qwen3.8-max` advertise thinking variants on the Messages passthrough, which carries no clodex-controlled effort control at all — their profiles are empty on purpose.
+- `minimax-m3` advertises thinking variants on the Messages passthrough, but its reviewed map carries no clodex-controlled effort levels, so its profile is empty on purpose.
+- `qwen3.7-max`, `qwen3.7-plus`, and `qwen3.8-max` route over Anthropic Messages, and their reviewed maps expose `high` as 16,000 and `max` as 31,999 Anthropic thinking budget tokens.
 
 Widening or narrowing any of these needs live validation and is a review decision, not a regeneration.
 
