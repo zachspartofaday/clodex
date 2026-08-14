@@ -206,13 +206,15 @@ describe('applyAnthropicMessagesEffort', () => {
   });
 
   it('sends no thinking when the policy defers to the provider', () => {
+    const body = { ...request('low'), thinking: { budget_tokens: 1, type: 'enabled' } };
     const out = applyAnthropicMessagesEffort(
-      request('low'),
+      body,
       budgetProfile,
       resolveRequestEffort('low', budgetProfile, 'provider-default'),
     );
     expect(out.thinking).toBeUndefined();
     expect(out.output_config).toBeUndefined();
+    expect(body).toEqual({ ...request('low'), thinking: { budget_tokens: 1, type: 'enabled' } });
   });
 
   it('overrides a thinking object the client wrote itself', () => {
@@ -258,5 +260,17 @@ describe('applyAnthropicMessagesEffort', () => {
     );
     expect(out.thinking).toBeUndefined();
     expect(out).toEqual(request());
+  });
+
+  it('preserves caller thinking when a null default leaves effort unresolved', () => {
+    const body = { ...request(), thinking: { budget_tokens: 1, type: 'enabled' } };
+    const resolution = resolveRequestEffort(undefined, budgetProfile);
+    expect(resolution).toBeUndefined();
+
+    const out = applyAnthropicMessagesEffort(body, budgetProfile, resolution);
+
+    expect(out.thinking).toEqual({ budget_tokens: 1, type: 'enabled' });
+    expect(out.output_config).toBeUndefined();
+    expect(body).toEqual({ ...request(), thinking: { budget_tokens: 1, type: 'enabled' } });
   });
 });

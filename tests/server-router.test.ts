@@ -577,6 +577,20 @@ describe('server router', () => {
         .toEqual({ budget_tokens: 16_000, type: 'enabled' });
     });
 
+    it('removes caller thinking when the default policy defers an unsupported level', async () => {
+      const upstream = await startUpstream({ id: 'msg-graded', type: 'message', role: 'assistant', content: [] });
+      handles.push(upstream);
+      const server = await passthroughServer(upstream.baseUrl);
+
+      expect((await post(server, {
+        thinking: { budget_tokens: 1, type: 'enabled' },
+        output_config: { effort: 'low' },
+      })).status).toBe(200);
+      const forwarded = upstream.requests[0]!.body as Record<string, unknown>;
+      expect(forwarded).not.toHaveProperty('thinking');
+      expect(forwarded).not.toHaveProperty('output_config');
+    });
+
     it('refuses an unsupported level under the exact policy without calling upstream', async () => {
       const upstream = await startUpstream({ id: 'msg-graded', type: 'message', role: 'assistant', content: [] });
       handles.push(upstream);

@@ -91,6 +91,8 @@ export function applyAnthropicMessagesEffort(
     else delete transformed.output_config;
   }
 
+  if (resolution !== undefined) delete transformed.thinking;
+
   const native = resolution?.resolved === undefined
     ? undefined
     : profile.levels.find(entry => entry.level === resolution.resolved)?.native;

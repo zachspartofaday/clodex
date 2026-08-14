@@ -2609,6 +2609,25 @@ describe('anthropic passthrough applies the reviewed thinking ladder', () => {
     expect(forwardedBody(fetchMock).thinking).toEqual({ budget_tokens: 16_000, type: 'enabled' });
   });
 
+  it('removes caller thinking when the default policy defers an unsupported level', async () => {
+    const fetchMock = stubUpstream();
+    const route = gradedRoute();
+    const handle = await startProxyCatalog([route], route.aliasId, false);
+    const res = await postToProxy(handle.port, handle.token, {
+      model: route.aliasId,
+      max_tokens: 100,
+      messages: [{ role: 'user', content: 'hi' }],
+      thinking: { budget_tokens: 1, type: 'enabled' },
+      output_config: { effort: 'low' },
+    });
+    handle.close();
+
+    expect(res.status).toBe(200);
+    const body = forwardedBody(fetchMock);
+    expect(body).not.toHaveProperty('thinking');
+    expect(body).not.toHaveProperty('output_config');
+  });
+
   it('refuses an unsupported level under the exact policy without calling upstream', async () => {
     const fetchMock = stubUpstream();
     const route = gradedRoute();
