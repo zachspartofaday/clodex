@@ -10,9 +10,9 @@
 import pc from 'picocolors';
 import * as p from '@clack/prompts';
 import {
+  applyModelProfile,
   deleteModelProfile,
   loadPreferences,
-  savePreferences,
   setModelProfile,
 } from './config.js';
 import type {
@@ -227,24 +227,22 @@ export async function runProfilesCommand(args: string[]): Promise<number> {
       return 0;
     }
 
-    const profile = profiles[name];
-    if (!profile) {
+    const reportMissingProfile = (): number => {
       const available = Object.keys(profiles).sort().join(', ');
       p.log.error(`No profile named "${name}"${available ? ` (saved: ${available})` : ''}.`);
       return 1;
-    }
+    };
 
     if (sub === 'use') {
-      savePreferences({
-        favoriteModels: structuredClone(profile.favoriteModels),
-        modelAliases: structuredClone(profile.modelAliases),
-        builtinModelOverrides: structuredClone(profile.builtinModelOverrides ?? {}),
-        activeModelProfile: name,
-      });
-      p.log.success(`Applied profile "${name}": ${aliasSummary(profile)}`);
+      const result = await applyModelProfile(name);
+      if (result.status === 'missing') return reportMissingProfile();
+      p.log.success(`Applied profile "${name}": ${aliasSummary(result.profile)}`);
       p.log.info('New clodex claude launches use this routing. The launcher will offer to re-patch for the changed model config — accept it, or run `clodex patch` now. Running sessions keep their old routing until relaunched, and a standalone `clodex server` keeps its old routing until you RESTART it — clients launched through it (clodex-claude) follow the server, not this profile.');
       return 0;
     }
+
+    const profile = profiles[name];
+    if (!profile) return reportMissingProfile();
 
     if (sub === 'show') {
       console.log(`\n${pc.bold(name)} ${pc.dim(`(saved ${profile.savedAt})`)}`);
@@ -262,7 +260,7 @@ export async function runProfilesCommand(args: string[]): Promise<number> {
     }
 
     // delete
-    deleteModelProfile(name);
+    if (!deleteModelProfile(name)) return reportMissingProfile();
     p.log.success(`Deleted profile "${name}".`);
     return 0;
   }

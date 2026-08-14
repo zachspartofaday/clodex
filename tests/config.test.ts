@@ -3,7 +3,9 @@ import { existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'no
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import {
+  applyModelProfile,
   clearSavedServerPassword,
+  deleteModelProfile,
   getAppPathOverride,
   getSavedServerPassword,
   getServerListenMode,
@@ -12,10 +14,25 @@ import {
   resolveBridgeMode,
   savePreferences,
   setAppPathOverride,
+  setModelProfile,
   setSavedServerPassword,
   setServerListenMode,
 } from '../src/config.js';
 import { getAppHome, getConfigPath } from '../src/paths.js';
+import type { ModelProfile } from '../src/types.js';
+
+const profileP: ModelProfile = {
+  savedAt: '2026-01-01T00:00:00.000Z',
+  favoriteModels: [{ providerId: 'provider-p', modelId: 'model-p' }],
+  modelAliases: [{ name: 'route', providerId: 'provider-p', modelId: 'model-p' }],
+  builtinModelOverrides: { sonnet: 'route' },
+};
+const profileQ: ModelProfile = {
+  savedAt: '2026-01-02T00:00:00.000Z',
+  favoriteModels: [{ providerId: 'provider-q', modelId: 'model-q' }],
+  modelAliases: [{ name: 'route', providerId: 'provider-q', modelId: 'model-q' }],
+  builtinModelOverrides: { opus: 'route' },
+};
 
 let tempHome: string;
 let previousHome: string | undefined;
@@ -79,6 +96,69 @@ describe('dotfolder config', () => {
     expect(JSON.parse(readFileSync(getConfigPath(), 'utf8')).modelAliases).toEqual([
       { name: 'Sol', providerId: 'openai-oauth', modelId: 'gpt-5.6-sol' },
     ]);
+  });
+
+  it('returns missing without writing when a profile is deleted before apply', async () => {
+    setModelProfile('profile', profileP);
+    expect(deleteModelProfile('profile')).toBe(true);
+    const before = readFileSync(getConfigPath(), 'utf8');
+
+    expect(await applyModelProfile('profile')).toEqual({ status: 'missing' });
+    expect(readFileSync(getConfigPath(), 'utf8')).toBe(before);
+  });
+
+  it('applies the profile currently saved at the time of the update', async () => {
+    setModelProfile('profile', profileP);
+    setModelProfile('profile', profileQ);
+
+    expect(await applyModelProfile('profile')).toEqual({ status: 'applied', profile: profileQ });
+    expect(loadPreferences()).toMatchObject({
+      favoriteModels: profileQ.favoriteModels,
+      modelAliases: profileQ.modelAliases,
+      builtinModelOverrides: profileQ.builtinModelOverrides,
+      activeModelProfile: 'profile',
+    });
+  });
+
+  it('returns missing without writing for a malformed profile', async () => {
+    savePreferences({ lastModel: 'keep-me' });
+    writeFileSync(getConfigPath(), JSON.stringify({
+      lastModel: 'keep-me',
+      modelProfiles: {
+        broken: {
+          savedAt: '2026-01-01T00:00:00.000Z',
+          favoriteModels: [{ providerId: 'provider-p' }],
+          modelAliases: [],
+        },
+      },
+    }));
+    const before = readFileSync(getConfigPath(), 'utf8');
+
+    expect(await applyModelProfile('broken')).toEqual({ status: 'missing' });
+    expect(readFileSync(getConfigPath(), 'utf8')).toBe(before);
+  });
+
+  it('preserves unrelated fields and the profile map when applying a profile', async () => {
+    setModelProfile('profile', profileQ);
+    const before = JSON.parse(readFileSync(getConfigPath(), 'utf8')) as Record<string, unknown>;
+    before.lastModel = 'untouched';
+    before.server = { listenMode: 'network' };
+    writeFileSync(getConfigPath(), JSON.stringify(before));
+    const profilesBefore = (before.modelProfiles as Record<string, unknown>);
+
+    expect(await applyModelProfile('profile')).toEqual({ status: 'applied', profile: profileQ });
+    const after = JSON.parse(readFileSync(getConfigPath(), 'utf8')) as Record<string, unknown>;
+    expect(after.lastModel).toBe('untouched');
+    expect(after.server).toEqual({ listenMode: 'network' });
+    expect(after.modelProfiles).toEqual(profilesBefore);
+    expect(after.activeModelProfile).toBe('profile');
+  });
+
+  it('deletes a profile once and reports false when it is already absent', () => {
+    setModelProfile('profile', profileP);
+
+    expect(deleteModelProfile('profile')).toBe(true);
+    expect(deleteModelProfile('profile')).toBe(false);
   });
 
   it('persists explicit local-patch opt-in and opt-out', () => {

@@ -39,6 +39,70 @@ function isRecord(value: unknown): value is Record<string, unknown> {
   return Boolean(value) && typeof value === 'object' && !Array.isArray(value);
 }
 
+const PROFILE_NAME_RE = /^[a-z0-9][a-z0-9_-]{0,31}$/;
+const RESERVED_PROFILE_NAMES = new Set(Object.getOwnPropertyNames(Object.prototype));
+const BUILTIN_ALIAS_NAMES = new Set<BuiltinAliasName>(['sonnet', 'opus', 'haiku', 'fable']);
+
+function isFavoriteModel(value: unknown): value is FavoriteModel {
+  if (!isRecord(value)) return false;
+  return typeof value['providerId'] === 'string'
+    && value['providerId'].trim().length > 0
+    && typeof value['modelId'] === 'string'
+    && value['modelId'].trim().length > 0;
+}
+
+function isModelAlias(value: unknown): value is ModelAlias {
+  if (!isRecord(value)) return false;
+  const name = value['name'];
+  return typeof name === 'string'
+    && name.trim().length > 0
+    && isFavoriteModel(value);
+}
+
+function normalizeBuiltinOverrides(
+  value: unknown,
+): Partial<Record<BuiltinAliasName, string>> | null {
+  if (value === undefined) return {};
+  if (!isRecord(value)) return null;
+  const overrides: Partial<Record<BuiltinAliasName, string>> = {};
+  for (const [alias, target] of Object.entries(value)) {
+    if (!BUILTIN_ALIAS_NAMES.has(alias as BuiltinAliasName)) return null;
+    if (typeof target !== 'string' || !target.trim()) return null;
+    overrides[alias as BuiltinAliasName] = target.trim();
+  }
+  return overrides;
+}
+
+function parseStoredProfile(value: unknown): ModelProfile | null {
+  if (!isRecord(value)) return null;
+  if (typeof value['savedAt'] !== 'string' || !value['savedAt'].trim()) return null;
+  if (!Array.isArray(value['favoriteModels']) || !value['favoriteModels'].every(isFavoriteModel)) {
+    return null;
+  }
+  if (!Array.isArray(value['modelAliases']) || !value['modelAliases'].every(isModelAlias)) {
+    return null;
+  }
+  const builtinModelOverrides = normalizeBuiltinOverrides(value['builtinModelOverrides']);
+  if (builtinModelOverrides === null) return null;
+  return {
+    savedAt: value['savedAt'],
+    favoriteModels: structuredClone(value['favoriteModels']),
+    modelAliases: structuredClone(value['modelAliases']),
+    ...(Object.keys(builtinModelOverrides).length > 0
+      ? { builtinModelOverrides: structuredClone(builtinModelOverrides) }
+      : {}),
+  };
+}
+
+function currentOwnProfile(config: UserPreferences, name: string): ModelProfile | null {
+  if (!PROFILE_NAME_RE.test(name) || RESERVED_PROFILE_NAMES.has(name)) return null;
+  if (!isRecord(config.modelProfiles)
+    || !Object.prototype.hasOwnProperty.call(config.modelProfiles, name)) {
+    return null;
+  }
+  return parseStoredProfile(config.modelProfiles[name]);
+}
+
 function writeConfig(config: UserPreferences): void {
   const configPath = getConfigPath();
   assertRegistryWriteOwnership(configPath);
@@ -58,12 +122,15 @@ function writeConfig(config: UserPreferences): void {
   }
 }
 
-function updateConfig<T>(mutate: (config: UserPreferences) => T): T {
+function updateConfig<T>(
+  mutate: (config: UserPreferences) => T,
+  shouldWrite: (result: T) => boolean = () => true,
+): T {
   const configPath = getConfigPath();
   return withRegistryWriteLockSync(() => {
     const config = readJsonFile(configPath) ?? {};
     const result = mutate(config);
-    writeConfig(config);
+    if (shouldWrite(result)) writeConfig(config);
     return result;
   }, { lockPath: `${configPath}.lock` });
 }
@@ -115,21 +182,16 @@ export function loadPreferences(): UserPreferences {
   };
 }
 
-export function savePreferences(prefs: Partial<Pick<UserPreferences, 'lastModel' | 'lastProvider' | 'recentModelsByProvider' | 'favoriteModels' | 'modelAliases' | 'modelProfiles' | 'activeModelProfile' | 'builtinModelOverrides' | 'claudeBridgeMode' | 'serverBridgeMode' | 'appPathOverrides' | 'localPatchesEnabled' | 'effortPolicy' | 'recentLaunchFolders'>>): void {
+export function savePreferences(prefs: Partial<Pick<UserPreferences, 'lastModel' | 'lastProvider' | 'recentModelsByProvider' | 'favoriteModels' | 'modelAliases' | 'builtinModelOverrides' | 'claudeBridgeMode' | 'serverBridgeMode' | 'appPathOverrides' | 'localPatchesEnabled' | 'effortPolicy' | 'recentLaunchFolders'>>): void {
   updateConfig(config => {
     if (prefs.lastModel !== undefined) config.lastModel = prefs.lastModel;
     if (prefs.lastProvider !== undefined) config.lastProvider = prefs.lastProvider;
     if (prefs.recentModelsByProvider !== undefined) config.recentModelsByProvider = prefs.recentModelsByProvider;
     if (prefs.favoriteModels !== undefined) config.favoriteModels = prefs.favoriteModels;
     if (prefs.modelAliases !== undefined) config.modelAliases = prefs.modelAliases;
-    if (prefs.modelProfiles !== undefined) config.modelProfiles = prefs.modelProfiles;
     if (prefs.builtinModelOverrides !== undefined) {
       if (Object.keys(prefs.builtinModelOverrides).length === 0) delete config.builtinModelOverrides;
       else config.builtinModelOverrides = prefs.builtinModelOverrides;
-    }
-    if (prefs.activeModelProfile !== undefined) {
-      if (prefs.activeModelProfile === '') delete config.activeModelProfile;
-      else config.activeModelProfile = prefs.activeModelProfile;
     }
     if (prefs.claudeBridgeMode !== undefined) config.claudeBridgeMode = prefs.claudeBridgeMode;
     if (prefs.serverBridgeMode !== undefined) config.serverBridgeMode = prefs.serverBridgeMode;
@@ -151,15 +213,38 @@ export function setModelProfile(name: string, profile: ModelProfile): void {
   });
 }
 
-export function deleteModelProfile(name: string): void {
-  updateConfig(config => {
-    const profiles: Record<string, ModelProfile> = isRecord(config.modelProfiles)
-      ? { ...config.modelProfiles } as Record<string, ModelProfile>
-      : {};
-    delete profiles[name];
-    config.modelProfiles = profiles;
-    if (config.activeModelProfile === name) delete config.activeModelProfile;
+export type ApplyModelProfileResult =
+  | { status: 'applied'; profile: ModelProfile }
+  | { status: 'missing' };
+
+export async function applyModelProfile(name: string): Promise<ApplyModelProfileResult> {
+  return updateConfigAsync<ApplyModelProfileResult>(config => {
+    const profile = currentOwnProfile(config, name);
+    if (!profile) return { result: { status: 'missing' }, write: false };
+
+    config.favoriteModels = structuredClone(profile.favoriteModels);
+    config.modelAliases = structuredClone(profile.modelAliases);
+    if (profile.builtinModelOverrides && Object.keys(profile.builtinModelOverrides).length > 0) {
+      config.builtinModelOverrides = structuredClone(profile.builtinModelOverrides);
+    } else {
+      delete config.builtinModelOverrides;
+    }
+    config.activeModelProfile = name;
+    return { result: { status: 'applied', profile }, write: true };
   });
+}
+
+export function deleteModelProfile(name: string): boolean {
+  return updateConfig(config => {
+    const profile = currentOwnProfile(config, name);
+    if (!profile || !isRecord(config.modelProfiles)) return false;
+
+    const profiles = { ...config.modelProfiles };
+    delete profiles[name];
+    config.modelProfiles = profiles as UserPreferences['modelProfiles'];
+    if (config.activeModelProfile === name) delete config.activeModelProfile;
+    return true;
+  }, result => result);
 }
 
 export function setBuiltinModelOverride(

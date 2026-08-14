@@ -9,11 +9,7 @@ vi.mock('../src/config.js', () => ({
   loadPreferences: vi.fn(() => structuredClone(configState.current)),
   savePreferences: vi.fn((prefs: Partial<UserPreferences>) => {
     for (const [key, value] of Object.entries(prefs)) {
-      if (key === 'activeModelProfile' && value === '') {
-        delete (configState.current as Record<string, unknown>).activeModelProfile;
-      } else {
-        (configState.current as Record<string, unknown>)[key] = structuredClone(value);
-      }
+      (configState.current as Record<string, unknown>)[key] = structuredClone(value);
     }
   }),
   setModelProfile: vi.fn((name: string, profile: NonNullable<UserPreferences['modelProfiles']>[string]) => {
@@ -26,18 +22,8 @@ vi.mock('../src/config.js', () => ({
     configState.current.modelProfiles = profiles;
     configState.current.activeModelProfile = name;
   }),
-  deleteModelProfile: vi.fn((name: string) => {
-    const profiles = configState.current.modelProfiles
-      && typeof configState.current.modelProfiles === 'object'
-      && !Array.isArray(configState.current.modelProfiles)
-      ? { ...configState.current.modelProfiles }
-      : {};
-    delete profiles[name];
-    configState.current.modelProfiles = profiles;
-    if (configState.current.activeModelProfile === name) {
-      delete configState.current.activeModelProfile;
-    }
-  }),
+  applyModelProfile: vi.fn(() => ({ status: 'missing' as const })),
+  deleteModelProfile: vi.fn(() => false),
 }));
 
 vi.mock('@clack/prompts', () => ({
