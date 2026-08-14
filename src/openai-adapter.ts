@@ -2,7 +2,14 @@ import { tool, jsonSchema, streamText, generateText } from 'ai';
 import type { LanguageModel, ModelMessage } from 'ai';
 import { parseToolArguments } from './proxy-shared.js';
 import type { SdkCallParams } from './sdk-adapter.js';
-import { oauthServiceTier, reportUnsupportedServiceTier } from './sdk-adapter.js';
+import {
+  SDK_NON_STREAMING_TIMEOUT_MS,
+  SDK_STREAM_IDLE_TIMEOUT_MS,
+  SdkTimeoutError,
+  oauthServiceTier,
+  reportUnsupportedServiceTier,
+  streamAbortError,
+} from './sdk-adapter.js';
 import { upstreamMaxRetries } from './upstream-retry.js';
 
 // ── OpenAI request shapes ───────────────────────────────────────────────────
@@ -170,6 +177,62 @@ function requireOpenAiTerminalFinish(
   return part.finishReason;
 }
 
+/**
+ * The Anthropic adapter's stream liveness policy, applied to the OpenAI routes.
+ *
+ * A no-event idle deadline that resets on every provider part, and NO fixed
+ * total deadline: a long generation that is still producing output is healthy,
+ * and cutting it at a wall-clock ceiling discards work the user already waited
+ * for. The deadline aborts upstream work through a Relay-owned controller
+ * rather than only abandoning the local read, and it surfaces as the shared
+ * `SdkTimeoutError` so a timeout stays distinguishable from an upstream fault.
+ *
+ * Do not compose streamText's own timeout signals here — see the note in
+ * `streamAnthropicResponse`; Relay owns these timers and settles its controller
+ * after consumption.
+ */
+function openAiIdleWatchdog() {
+  const controller = new AbortController();
+  let lastPartAt = Date.now();
+  let outputBegan = false;
+  const timeoutError = () => new SdkTimeoutError(
+    'idle_timeout',
+    `no data received from provider for ${Math.round(SDK_STREAM_IDLE_TIMEOUT_MS / 1000)}s`,
+    Math.max(0, Date.now() - lastPartAt),
+    SDK_STREAM_IDLE_TIMEOUT_MS,
+    outputBegan,
+  );
+  const arm = () => setTimeout(() => controller.abort(timeoutError()), SDK_STREAM_IDLE_TIMEOUT_MS);
+  let timer = arm();
+  return {
+    signal: controller.signal,
+    /** Record that this request has already produced content for the client. */
+    markOutput() { outputBegan = true; },
+    /** Every provider event is liveness: restart the deadline. */
+    beat() {
+      clearTimeout(timer);
+      lastPartAt = Date.now();
+      timer = arm();
+    },
+    /**
+     * Prefer the local deadline as the cause. An aborted stream ends without a
+     * terminal event, so without this the caller would report the generic
+     * missing-terminal failure and hide why the request died.
+     */
+    throwIfAborted() {
+      if (controller.signal.aborted) throw streamAbortError(controller.signal);
+    },
+    /**
+     * Stop the timer and settle the Relay-owned signal only after consumption,
+     * so Node can release the AI SDK's listener graph.
+     */
+    settle() {
+      clearTimeout(timer);
+      if (!controller.signal.aborted) controller.abort();
+    },
+  };
+}
+
 export interface CollectedOpenAiStream {
   text: string;
   toolCalls: Array<{ toolCallId: string; toolName: string; input: unknown }>;
@@ -219,20 +282,65 @@ export async function generateOpenAiResponse(
     // Some upstreams (e.g. ChatGPT's Codex OAuth backend) only ever answer as a
     // stream. Request a real stream from the SDK and collect it into one
     // response instead of issuing a non-streaming request upstream.
+    const watchdog = openAiIdleWatchdog();
     const { stream } = streamText({
       model,
       ...(params as any),
       maxRetries: upstreamMaxRetries(),
+      abortSignal: watchdog.signal,
       onError: () => {},
       onStepFinish: step => reportUnsupportedServiceTier(params, step.warnings),
     });
-    result = await collectOpenAiStream(stream);
+    // forceStream is still a stream, so it keeps the idle deadline and no total
+    // ceiling. Watching here rather than inside collectOpenAiStream leaves that
+    // reducer's contract — and its callers — unchanged.
+    const watched = (async function* () {
+      for await (const part of stream as AsyncIterable<unknown>) {
+        watchdog.beat();
+        const p = part as any;
+        if (p?.type === 'tool-call' || (p?.type === 'text-delta' && (p.textDelta ?? p.text ?? ''))) {
+          watchdog.markOutput();
+        }
+        yield part;
+      }
+    })();
+    try {
+      result = await collectOpenAiStream(watched);
+      // An aborted request never returns a response, even if the reducer
+      // happened to see a terminal event as the deadline fired.
+      watchdog.throwIfAborted();
+    } catch (err) {
+      watchdog.throwIfAborted();
+      throw err;
+    } finally {
+      watchdog.settle();
+    }
   } else {
-    result = (await generateText({
-      model,
-      ...(params as any),
-      maxRetries: upstreamMaxRetries(),
-    })) as any;
+    // No output flows on this path, so a stalled call is indistinguishable from
+    // a slow one: it carries the absolute ceiling instead of idle detection.
+    const totalAbort = new AbortController();
+    const startedAt = Date.now();
+    const totalTimer = setTimeout(
+      () => totalAbort.abort(new SdkTimeoutError(
+        'total_timeout',
+        `provider request exceeded ${Math.round(SDK_NON_STREAMING_TIMEOUT_MS / 1000)}s`,
+        Math.max(0, Date.now() - startedAt),
+        SDK_NON_STREAMING_TIMEOUT_MS,
+        false,
+      )),
+      SDK_NON_STREAMING_TIMEOUT_MS,
+    );
+    try {
+      result = (await generateText({
+        model,
+        ...(params as any),
+        maxRetries: upstreamMaxRetries(),
+        abortSignal: totalAbort.signal,
+      })) as any;
+    } finally {
+      clearTimeout(totalTimer);
+      if (!totalAbort.signal.aborted) totalAbort.abort();
+    }
   }
   reportUnsupportedServiceTier(params, result.warnings);
   const message: Record<string, any> = { role: 'assistant', content: result.text || null };
@@ -265,10 +373,12 @@ export async function streamOpenAiResponse(
   responseModelId: string,
   onChunk: (chunk: string) => void,
 ): Promise<void> {
+  const watchdog = openAiIdleWatchdog();
   const { stream } = streamText({
     model,
     ...(params as any),
     maxRetries: upstreamMaxRetries(),
+    abortSignal: watchdog.signal,
     onStepFinish: step => reportUnsupportedServiceTier(params, step.warnings),
   });
   const baseData = {
@@ -278,32 +388,46 @@ export async function streamOpenAiResponse(
     model: responseModelId,
   };
 
-  const send = (delta: Record<string, any>, finish_reason: string | null = null) =>
+  const send = (delta: Record<string, any>, finish_reason: string | null = null) => {
+    watchdog.markOutput();
     onChunk(`data: ${JSON.stringify({ ...baseData, choices: [{ index: 0, delta, finish_reason }] })}\n\n`);
+  };
   let finishPart: { finishReason?: unknown; rawFinishReason?: unknown } | undefined;
 
-  for await (const part of stream) {
-    const p = part as any;
-    switch (p.type) {
-      case 'text-delta':
-        send({ role: 'assistant', content: p.textDelta ?? p.text ?? '' });
-        break;
-      case 'tool-input-start':
-        send({ role: 'assistant', tool_calls: [{ index: 0, id: p.id ?? p.toolCallId, type: 'function', function: { name: p.toolName, arguments: '' } }] });
-        break;
-      case 'tool-input-delta':
-        send({ tool_calls: [{ index: 0, function: { arguments: p.delta ?? p.text ?? p.argsTextDelta ?? '' } }] });
-        break;
-      case 'finish':
-        finishPart = p;
-        break;
-      case 'error':
-        throw p.error instanceof Error || (p.error && typeof p.error === 'object')
-          ? p.error
-          : new Error(typeof p.error === 'string' ? p.error : 'Upstream stream failed');
+  try {
+    for await (const part of stream) {
+      watchdog.beat();
+      const p = part as any;
+      switch (p.type) {
+        case 'text-delta':
+          send({ role: 'assistant', content: p.textDelta ?? p.text ?? '' });
+          break;
+        case 'tool-input-start':
+          send({ role: 'assistant', tool_calls: [{ index: 0, id: p.id ?? p.toolCallId, type: 'function', function: { name: p.toolName, arguments: '' } }] });
+          break;
+        case 'tool-input-delta':
+          send({ tool_calls: [{ index: 0, function: { arguments: p.delta ?? p.text ?? p.argsTextDelta ?? '' } }] });
+          break;
+        case 'finish':
+          finishPart = p;
+          break;
+        case 'error':
+          throw p.error instanceof Error || (p.error && typeof p.error === 'object')
+            ? p.error
+            : new Error(typeof p.error === 'string' ? p.error : 'Upstream stream failed');
+      }
     }
-  }
 
-  send({}, requireOpenAiTerminalFinish(finishPart));
-  onChunk('data: [DONE]\n\n');
+    // Before the terminal check: an idle abort ends the stream without a finish
+    // part, and reporting that as a missing terminal event would hide the real
+    // cause. Either way no completion frame and no [DONE] is emitted.
+    watchdog.throwIfAborted();
+    send({}, requireOpenAiTerminalFinish(finishPart));
+    onChunk('data: [DONE]\n\n');
+  } catch (err) {
+    watchdog.throwIfAborted();
+    throw err;
+  } finally {
+    watchdog.settle();
+  }
 }

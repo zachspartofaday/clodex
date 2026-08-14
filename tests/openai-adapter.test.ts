@@ -1,7 +1,7 @@
 import { describe, expect, it, vi } from 'vitest';
 import { generateText, streamText } from 'ai';
 import { collectOpenAiStream, generateOpenAiResponse, streamOpenAiResponse, translateOpenAiRequest } from '../src/openai-adapter.js';
-import { resetServiceTierWarningForTests } from '../src/sdk-adapter.js';
+import { resetServiceTierWarningForTests, sdkTimeoutDetails } from '../src/sdk-adapter.js';
 import { installParentNoticeSink } from '../src/parent-notice.js';
 
 /** Observes the parent-notice channel, which is where request-time warnings go
@@ -424,6 +424,182 @@ describe('OpenAI-format service tier omission warning', () => {
       resetServiceTierWarningForTests();
       notices.release();
       vi.mocked(streamText).mockReset();
+    }
+  });
+});
+
+describe('OpenAI provider liveness deadlines', () => {
+  /** A stream that produces nothing and dies only when the caller aborts it. */
+  function mockHangingStream(): void {
+    vi.mocked(streamText).mockImplementation(((options: { abortSignal?: AbortSignal }) => ({
+      stream: (async function* (): AsyncGenerator<never> {
+        await new Promise<never>((_resolve, reject) => {
+          options.abortSignal?.addEventListener(
+            'abort',
+            () => reject(options.abortSignal?.reason ?? new Error('aborted')),
+          );
+        });
+      })(),
+    })) as never);
+  }
+
+  it('aborts a stream that never produces its first event, without completing it', async () => {
+    vi.useFakeTimers();
+    mockHangingStream();
+    let output = '';
+
+    try {
+      const settled = streamOpenAiResponse(
+        {} as never,
+        { messages: [] },
+        'gpt-test',
+        chunk => { output += chunk; },
+      ).then(() => undefined, reason => reason);
+
+      await vi.advanceTimersByTimeAsync(120_000);
+      const error = await settled;
+
+      expect(sdkTimeoutDetails(error)).toEqual({
+        category: 'idle_timeout',
+        elapsedMs: 120_000,
+        limitMs: 120_000,
+        outputBegan: false,
+      });
+      // The deadline stops upstream work rather than only abandoning the read.
+      expect(vi.mocked(streamText).mock.calls[0]![0].abortSignal?.aborted).toBe(true);
+      expect(output).toBe('');
+    } finally {
+      vi.useRealTimers();
+      vi.mocked(streamText).mockReset();
+    }
+  });
+
+  it('restarts the idle deadline on every event, so a productive stream is never cut off', async () => {
+    vi.useFakeTimers();
+    let releaseFirst!: () => void;
+    let releaseSecond!: () => void;
+    const firstGap = new Promise<void>(resolve => { releaseFirst = resolve; });
+    const secondGap = new Promise<void>(resolve => { releaseSecond = resolve; });
+    async function* stream() {
+      yield { type: 'text-delta', text: 'one' };
+      await firstGap;
+      yield { type: 'text-delta', text: 'two' };
+      await secondGap;
+      yield { type: 'finish', finishReason: 'stop' };
+    }
+    vi.mocked(streamText).mockReturnValue({ stream: stream() } as never);
+    let output = '';
+
+    try {
+      const settled = streamOpenAiResponse(
+        {} as never,
+        { messages: [] },
+        'gpt-test',
+        chunk => { output += chunk; },
+      ).then(() => undefined, reason => reason);
+
+      // Three gaps just under the deadline: 357s total, no single silent gap.
+      await vi.advanceTimersByTimeAsync(119_000);
+      releaseFirst();
+      await vi.advanceTimersByTimeAsync(119_000);
+      releaseSecond();
+      await vi.advanceTimersByTimeAsync(119_000);
+
+      expect(await settled).toBeUndefined();
+      expect(output).toContain('one');
+      expect(output).toContain('two');
+      expect(output).toContain('[DONE]');
+    } finally {
+      vi.useRealTimers();
+      vi.mocked(streamText).mockReset();
+    }
+  });
+
+  it('applies the same idle deadline to a force-stream collection', async () => {
+    vi.useFakeTimers();
+    mockHangingStream();
+
+    try {
+      const settled = generateOpenAiResponse(
+        {} as never,
+        { messages: [] },
+        'gpt-test',
+        { forceStream: true },
+      ).then(() => undefined, reason => reason);
+
+      await vi.advanceTimersByTimeAsync(120_000);
+      const error = await settled;
+
+      expect(sdkTimeoutDetails(error)).toMatchObject({
+        category: 'idle_timeout',
+        limitMs: 120_000,
+        outputBegan: false,
+      });
+      // Not the generic missing-terminal failure: the local deadline is the cause.
+      expect((error as Error).message).not.toContain('without a terminal event');
+      expect(vi.mocked(streamText).mock.calls[0]![0].abortSignal?.aborted).toBe(true);
+    } finally {
+      vi.useRealTimers();
+      vi.mocked(streamText).mockReset();
+    }
+  });
+
+  it('applies the absolute ceiling to an ordinary non-streaming generation', async () => {
+    vi.useFakeTimers();
+    vi.mocked(generateText).mockImplementation(((options: { abortSignal?: AbortSignal }) =>
+      new Promise((_resolve, reject) => {
+        options.abortSignal?.addEventListener(
+          'abort',
+          () => reject(options.abortSignal?.reason ?? new Error('aborted')),
+        );
+      })) as never);
+
+    try {
+      const settled = generateOpenAiResponse({} as never, { messages: [] }, 'gpt-test')
+        .then(() => undefined, reason => reason);
+
+      await vi.advanceTimersByTimeAsync(10 * 60_000);
+      const error = await settled;
+
+      expect((error as Error).message).toContain('provider request exceeded 600s');
+      expect(sdkTimeoutDetails(error)).toEqual({
+        category: 'total_timeout',
+        elapsedMs: 10 * 60_000,
+        limitMs: 10 * 60_000,
+        outputBegan: false,
+      });
+    } finally {
+      vi.useRealTimers();
+      vi.mocked(generateText).mockReset();
+    }
+  });
+
+  it('leaves no deadline armed after a stream or a generation completes', async () => {
+    vi.useFakeTimers();
+    async function* stream() {
+      yield { type: 'text-delta', text: 'hi' };
+      yield { type: 'finish', finishReason: 'stop' };
+    }
+    vi.mocked(streamText).mockReturnValue({ stream: stream() } as never);
+    vi.mocked(generateText).mockResolvedValue({
+      text: 'done',
+      toolCalls: [],
+      finishReason: 'stop',
+      usage: { inputTokens: 1, outputTokens: 1, totalTokens: 2 },
+    } as never);
+    let output = '';
+
+    try {
+      await streamOpenAiResponse({} as never, { messages: [] }, 'gpt-test', chunk => { output += chunk; });
+      expect(output).toContain('[DONE]');
+      expect(vi.getTimerCount()).toBe(0);
+
+      await generateOpenAiResponse({} as never, { messages: [] }, 'gpt-test');
+      expect(vi.getTimerCount()).toBe(0);
+    } finally {
+      vi.useRealTimers();
+      vi.mocked(streamText).mockReset();
+      vi.mocked(generateText).mockReset();
     }
   });
 });

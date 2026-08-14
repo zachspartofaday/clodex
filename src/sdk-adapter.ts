@@ -60,7 +60,12 @@ export interface SdkTimeoutDetails {
   outputBegan: boolean;
 }
 
-class SdkTimeoutError extends Error implements SdkTimeoutDetails {
+/**
+ * Exported so the OpenAI adapter raises the SAME error type on the SAME
+ * deadlines. A second timeout error class there would make `sdkTimeoutDetails`
+ * blind to every OpenAI-route timeout.
+ */
+export class SdkTimeoutError extends Error implements SdkTimeoutDetails {
   override readonly name = 'SdkTimeoutError';
 
   constructor(
@@ -751,13 +756,13 @@ export interface AnthropicStreamObserver {
   idleTimeoutMs?: number;
 }
 
-const SDK_STREAM_IDLE_TIMEOUT_MS = 120_000;
+export const SDK_STREAM_IDLE_TIMEOUT_MS = 120_000;
 // Absolute ceiling for a NON-STREAMING provider request, where no output
 // flows and a stalled call is indistinguishable from a slow one. Streaming
 // paths deliberately have no fixed total deadline (see streamAnthropicResponse).
-const SDK_NON_STREAMING_TIMEOUT_MS = 10 * 60_000;
+export const SDK_NON_STREAMING_TIMEOUT_MS = 10 * 60_000;
 
-function streamAbortError(signal?: AbortSignal): Error {
+export function streamAbortError(signal?: AbortSignal): Error {
   if (signal?.reason instanceof Error) return signal.reason;
   const error = new Error(
     typeof signal?.reason === 'string' ? signal.reason : 'SDK stream aborted',
