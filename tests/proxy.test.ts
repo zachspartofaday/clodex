@@ -253,6 +253,54 @@ describe('SDK anonymous route handling', () => {
     }
   });
 
+  it('forwards x-api-key-only Anthropic routes without an Authorization header', async () => {
+    const fetchMock = vi.fn(async () => new Response(
+      JSON.stringify({
+        id: 'msg_custom_anthropic',
+        type: 'message',
+        role: 'assistant',
+        model: 'custom-anthropic-model',
+        content: [],
+        usage: { input_tokens: 1, output_tokens: 1 },
+      }),
+      { status: 200, headers: { 'Content-Type': 'application/json' } },
+    ));
+    vi.stubGlobal('fetch', fetchMock);
+
+    const handle = await startProxy(
+      'https://custom-anthropic.example',
+      'custom-anthropic-model',
+      false,
+      undefined,
+      {
+        providerId: 'custom-anthropic',
+        authType: 'api',
+        modelFormat: 'anthropic',
+        anthropicAuthMode: 'x-api-key-only',
+      },
+      'custom-anthropic-key',
+    );
+
+    try {
+      const response = await postToProxy(handle.port, handle.token, {
+        model: 'custom-anthropic-model',
+        max_tokens: 100,
+        messages: [{ role: 'user', content: 'hi' }],
+        stream: false,
+      });
+
+      expect(response.status).toBe(200);
+      expect(fetchMock).toHaveBeenCalledOnce();
+      const [, init] = fetchMock.mock.calls[0] as unknown as [string, RequestInit];
+      const headers = new Headers(init.headers);
+      expect(headers.get('x-api-key')).toBe('custom-anthropic-key');
+      expect(headers.has('authorization')).toBe(false);
+    } finally {
+      handle.close();
+      vi.unstubAllGlobals();
+    }
+  });
+
   it('rejects an invalid Anthropic destination before proxy messages or token-count dispatch', async () => {
     const fetchMock = vi.fn(async () => new Response(
       JSON.stringify({

@@ -1786,6 +1786,7 @@ export async function runClaudeCommand(parsed: ParsedArgs): Promise<number> {
           providerData: activeProvider.providerData,
           modelFormat: 'anthropic',
           compatibility: selectedModel.compatibility,
+          anthropicAuthMode: selectedModel.anthropicAuthMode,
           effortProfile: selectedModel.effortProfile,
           headers: activeProvider.headers,
         },

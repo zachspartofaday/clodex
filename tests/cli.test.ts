@@ -591,6 +591,55 @@ describe('main dispatch', () => {
     expect(childEnv).not.toHaveProperty('CLAUDE_CODE_DISABLE_EXPERIMENTAL_BETAS');
   });
 
+  it('propagates the selected Anthropic auth mode into the proxy route', async () => {
+    vi.clearAllMocks();
+    const model = {
+      id: 'custom-anthropic-model',
+      name: 'Custom Anthropic Model',
+      family: 'claude',
+      brand: 'Custom Anthropic',
+      modelFormat: 'anthropic' as const,
+      upstreamModelId: 'custom-anthropic-model',
+      baseUrl: 'https://custom-anthropic.example',
+      anthropicAuthMode: 'x-api-key-only' as const,
+    };
+    const provider = {
+      id: 'custom-anthropic',
+      name: 'Custom Anthropic',
+      apiKey: 'custom-anthropic-key',
+      authType: 'api' as const,
+      headers: { 'X-Plan': 'coding' },
+      models: [model],
+    };
+    const catalog = Object.assign([provider], { blockedProviders: new Map() });
+    const close = vi.fn();
+    vi.mocked(fetchProviderCatalog).mockResolvedValue(catalog);
+    vi.mocked(resolveLocalProviderApiKey).mockResolvedValue('custom-anthropic-key');
+    vi.mocked(startProxy).mockResolvedValue({ port: 43123, token: 'proxy-token', close });
+    vi.mocked(launchClaude).mockResolvedValue(0);
+
+    const code = await runClaudeCommand(parseArgs([
+      'claude',
+      '--endpoint',
+      '--provider', 'custom-anthropic',
+      '--model', 'custom-anthropic-model',
+    ]));
+
+    expect(code).toBe(0);
+    expect(startProxy).toHaveBeenCalledWith(
+      'https://custom-anthropic.example',
+      'custom-anthropic-model',
+      false,
+      undefined,
+      expect.objectContaining({
+        modelFormat: 'anthropic',
+        anthropicAuthMode: 'x-api-key-only',
+      }),
+      'custom-anthropic-key',
+      'provider-default',
+    );
+  });
+
   it.each(['oauth', 'none'] as const)(
     'keeps %s Anthropic providers on the proxy path without child suppression',
     async authType => {

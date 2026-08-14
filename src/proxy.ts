@@ -1004,6 +1004,7 @@ export function startProxy(
     useResponsesLite?: boolean;
     preferWebSockets?: boolean;
     compatibility?: ModelRuntimeCompatibility;
+    anthropicAuthMode?: AnthropicAuthMode;
     effortProfile?: EffortProfile;
     headers?: Record<string, string>;
   },
@@ -1032,6 +1033,7 @@ export function startProxy(
     useResponsesLite: sdk?.useResponsesLite,
     preferWebSockets: sdk?.preferWebSockets,
     compatibility: sdk?.compatibility,
+    anthropicAuthMode: sdk?.anthropicAuthMode,
     effortProfile: sdk?.effortProfile,
     headers: sdk?.headers,
   }], clientModelId, debug, undefined, undefined, undefined, undefined, effortPolicy);
