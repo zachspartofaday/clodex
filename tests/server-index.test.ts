@@ -20,7 +20,11 @@ const state = vi.hoisted(() => ({
   startMode: 'quick' as 'configure' | 'quick' | null,
   favoriteModels: [] as Array<{ providerId: string; modelId: string }>,
   modelAliases: [] as Array<{ name: string; providerId: string; modelId: string }>,
+  builtinModelOverrides: {} as Record<string, string>,
   startServerOptions: null as any,
+  childEnvOverrides: null as Record<string, string> | null,
+  proxySnapshotRace: false,
+  proxyHandleClose: vi.fn<() => Promise<void>>(async () => undefined),
   close: vi.fn<() => Promise<void>>(async () => undefined),
   askServerStartMode: vi.fn(async () => 'quick' as 'configure' | 'quick' | null),
   askFavoritesOnly: vi.fn(async () => false as boolean | null),
@@ -54,7 +58,9 @@ vi.mock('../src/config.js', () => ({
   loadPreferences: () => ({
     favoriteModels: state.favoriteModels,
     modelAliases: state.modelAliases,
+    builtinModelOverrides: state.builtinModelOverrides,
   }),
+  resolveBridgeMode: () => 'proxy',
   setSavedServerPassword: (password: string) => {
     state.savedPassword = password;
   },
@@ -156,7 +162,11 @@ describe('runServerCommand', () => {
     state.startMode = 'configure';
     state.favoriteModels = [];
     state.modelAliases = [];
+    state.builtinModelOverrides = {};
     state.startServerOptions = null;
+    state.childEnvOverrides = null;
+    state.proxySnapshotRace = false;
+    state.proxyHandleClose.mockClear();
     state.close.mockClear();
     state.askServerStartMode.mockClear();
     state.askServerStartMode.mockImplementation(async () => state.startMode);
@@ -449,6 +459,180 @@ describe('runServerCommand', () => {
     expect(state.askListenMode).not.toHaveBeenCalled();
     expect(state.askServerPassword).not.toHaveBeenCalled();
     expect(state.startServerOptions).toBeNull();
+  });
+});
+
+describe('proxy preference snapshot races', () => {
+  const route = {
+    aliasId: 'clodex:test:route-snapshot',
+    realModelId: 'route-snapshot',
+    displayName: 'Route Snapshot',
+    providerId: 'test-provider',
+    modelId: 'route-snapshot',
+    apiKey: 'route-key',
+    upstreamUrl: 'https://provider.example/v1',
+    modelFormat: 'openai' as const,
+    npm: '@ai-sdk/openai-compatible',
+    baseURL: 'https://provider.example/v1',
+  };
+  const routeResult = {
+    routes: [route],
+    unavailable: [],
+    unsupported: [],
+    capacitySkippedFavorites: [],
+    aliases: [],
+    unavailableAliasRejections: [],
+  };
+
+  it('keeps standalone discovery registration on the route-load snapshot', async () => {
+    vi.resetModules();
+    state.favoriteModels = [{ providerId: 'test-provider', modelId: 'route-snapshot' }];
+    state.builtinModelOverrides = { fable: route.aliasId };
+    state.proxySnapshotRace = true;
+
+    vi.doMock('../src/provider-catalog.js', () => ({
+      fetchProviderCatalog: vi.fn(async () => {
+        if (state.proxySnapshotRace) {
+          state.proxySnapshotRace = false;
+          state.builtinModelOverrides = { fable: 'changed-after-route-load' };
+        }
+        return [];
+      }),
+      resolveLocalProviderApiKey: vi.fn(async () => 'route-key'),
+      localProvidersToServerModels: vi.fn(() => []),
+    }));
+    vi.doMock('../src/http-proxy/routes.js', async importOriginal => ({
+      ...await importOriginal<typeof import('../src/http-proxy/routes.js')>(),
+      buildHttpProxyRoutes: vi.fn(() => routeResult),
+    }));
+    vi.doMock('../src/http-proxy/server.js', () => ({
+      startHttpProxy: vi.fn(async (options: any) => ({
+        host: '127.0.0.1',
+        port: 17646,
+        caCertPath: '/dev/null',
+        modelIds: options.routes.map((candidate: { aliasId: string }) => candidate.aliasId),
+        inferenceLogPath: options.inferenceLogPath,
+        close: state.proxyHandleClose,
+      })),
+    }));
+    vi.doMock('../src/http-proxy/ca.js', () => ({
+      ensureHttpProxyCaBundle: vi.fn((caPath: string) => caPath),
+    }));
+    vi.doMock('../src/trace-log.js', () => ({
+      getInferenceRequestLogPath: vi.fn(() => 'ignored-inference-log'),
+      getSessionLogPath: vi.fn(() => 'ignored-session-log'),
+      writeProxyLifecycleLog: vi.fn(),
+    }));
+
+    try {
+      const { runServerCommand } = await import('../src/server/index.js');
+      const result = runServerCommand({ httpProxy: true });
+      await vi.waitFor(() => expect(discovery.register).toHaveBeenCalled());
+      process.emit('SIGINT');
+
+      await expect(result).resolves.toBe(0);
+      expect(discovery.register).toHaveBeenCalledWith(expect.objectContaining({
+        builtinModelOverrides: { fable: route.aliasId },
+      }));
+    } finally {
+      vi.doUnmock('../src/provider-catalog.js');
+      vi.doUnmock('../src/http-proxy/routes.js');
+      vi.doUnmock('../src/http-proxy/server.js');
+      vi.doUnmock('../src/http-proxy/ca.js');
+      vi.doUnmock('../src/trace-log.js');
+      vi.resetModules();
+    }
+  });
+
+  it('keeps the Claude child environment on the route-load snapshot', async () => {
+    vi.resetModules();
+    state.builtinModelOverrides = { fable: route.aliasId };
+
+    vi.doMock('../src/http-proxy/index.js', () => ({
+      loadHttpProxyRoutes: vi.fn(),
+      printHttpProxyModels: vi.fn(),
+      reportSkippedHttpProxyFavorites: vi.fn(),
+      startConfiguredHttpProxy: vi.fn(async () => {
+        state.builtinModelOverrides = { fable: 'changed-after-route-load' };
+        return {
+          handle: {
+            host: '127.0.0.1',
+            port: 17647,
+            caCertPath: '/dev/null',
+            modelIds: [route.aliasId],
+            close: state.proxyHandleClose,
+          },
+          loaded: {
+            ...routeResult,
+            effortPolicy: 'provider-default',
+            builtinModelOverrides: { fable: route.aliasId },
+          },
+        };
+      }),
+    }));
+    vi.doMock('../src/env.js', () => ({
+      resolveApiKey: vi.fn(() => 'real-key'),
+      buildHttpProxyChildEnv: vi.fn((_port: number, _caPath: string, _baseEnv: NodeJS.ProcessEnv, overrides: Record<string, string>) => {
+        state.childEnvOverrides = overrides;
+        return {};
+      }),
+      buildChildEnv: vi.fn(() => ({})),
+      detectConflicts: vi.fn(() => []),
+    }));
+    vi.doMock('../src/launch.js', () => ({
+      findClaudeBinary: vi.fn(() => '/fake/claude'),
+      launchClaude: vi.fn(async () => 0),
+    }));
+    vi.doMock('../src/patcher.js', () => ({
+      runLaunchPatchCheck: vi.fn(async () => undefined),
+      runPatchCommand: vi.fn(async () => 0),
+    }));
+    vi.doMock('../src/launch-target.js', () => ({
+      normalizeClaudeAgentArgs: vi.fn((args: string[]) => args),
+      wantsCleanAgentStdout: vi.fn(() => false),
+      findProviderAndModel: vi.fn(),
+      planLaunchWizard: vi.fn(),
+    }));
+    vi.doMock('../src/agent-io.js', () => ({
+      setAgentStdoutMode: vi.fn(),
+      isAgentStdoutMode: vi.fn(() => false),
+    }));
+    vi.doMock('../src/http-proxy/routes.js', () => ({
+      httpProxyModelId: vi.fn((providerId: string, modelId: string) => `${providerId}:${modelId}`),
+    }));
+    vi.doMock('../src/trace-log.js', () => ({
+      getInferenceSessionLogPath: vi.fn(() => 'ignored-inference-log'),
+      getSessionLogPath: vi.fn(() => 'ignored-session-log'),
+      prepareClaudeTraceLog: vi.fn(() => 'ignored-trace-log'),
+      printTraceLog: vi.fn(),
+      writeProxyLifecycleLog: vi.fn(),
+    }));
+
+    try {
+      const { runClaudeCommand } = await import('../src/cli.js');
+      const result = await runClaudeCommand({
+        command: 'claude',
+        showHelp: false,
+        showVersion: false,
+        dryRun: false,
+        trace: false,
+        claudeArgs: [],
+        bridgeMode: 'proxy',
+      });
+
+      expect(result).toBe(0);
+      expect(state.childEnvOverrides).toEqual({ fable: route.aliasId });
+    } finally {
+      vi.doUnmock('../src/http-proxy/index.js');
+      vi.doUnmock('../src/env.js');
+      vi.doUnmock('../src/launch.js');
+      vi.doUnmock('../src/patcher.js');
+      vi.doUnmock('../src/launch-target.js');
+      vi.doUnmock('../src/agent-io.js');
+      vi.doUnmock('../src/http-proxy/routes.js');
+      vi.doUnmock('../src/trace-log.js');
+      vi.resetModules();
+    }
   });
 });
 

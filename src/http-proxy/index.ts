@@ -21,6 +21,7 @@ import {
   writeProxyLifecycleLog,
 } from '../trace-log.js';
 import { removeAnthropicProxyBypass } from '../wrapper-env.js';
+import type { BuiltinAliasName } from '../types.js';
 import {
   DEFAULT_UNSUPPORTED_EFFORT_POLICY,
   type UnsupportedEffortPolicy,
@@ -34,6 +35,8 @@ export interface LoadedHttpProxyRoutes extends HttpProxyRouteResult {
   favoriteCount: number;
   /** Startup snapshot of the global unsupported-effort policy. */
   effortPolicy: UnsupportedEffortPolicy;
+  /** Startup snapshot of built-in model remaps, filtered against these routes at injection time. */
+  builtinModelOverrides: Partial<Record<BuiltinAliasName, string>>;
 }
 
 export async function loadHttpProxyRoutes(): Promise<LoadedHttpProxyRoutes> {
@@ -55,6 +58,7 @@ export async function loadHttpProxyRoutes(): Promise<LoadedHttpProxyRoutes> {
       ],
       favoriteCount: 0,
       effortPolicy: prefs.effortPolicy ?? DEFAULT_UNSUPPORTED_EFFORT_POLICY,
+      builtinModelOverrides: prefs.builtinModelOverrides ?? {},
     };
   }
   const rawCatalog = providersForTarget(await fetchProviderCatalog({ agent: 'claude' }), 'claude');
@@ -66,6 +70,7 @@ export async function loadHttpProxyRoutes(): Promise<LoadedHttpProxyRoutes> {
     ...buildHttpProxyRoutes(catalog, favorites, prefs.modelAliases),
     favoriteCount: favorites.length,
     effortPolicy: prefs.effortPolicy ?? DEFAULT_UNSUPPORTED_EFFORT_POLICY,
+    builtinModelOverrides: prefs.builtinModelOverrides ?? {},
   };
 }
 
@@ -281,7 +286,7 @@ export async function runHttpProxyServerCommand(
       // Validated against THIS server's route table; wrappers apply these
       // instead of re-reading preferences that may postdate the server.
       builtinModelOverrides: routableBuiltinOverrides(
-        loadPreferences().builtinModelOverrides,
+        loaded.builtinModelOverrides,
         [...loaded.aliases.map(alias => alias.name), ...loaded.routes.map(route => route.aliasId)],
         message => console.log(pc.yellow(`  ${message}`)),
         normalizeRouteLookupId,

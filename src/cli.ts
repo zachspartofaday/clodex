@@ -1436,7 +1436,7 @@ async function runClaudeHttpProxyCommand(
     handle.caCertPath,
     process.env,
     routableBuiltinOverrides(
-      loadPreferences().builtinModelOverrides,
+      loaded.builtinModelOverrides,
       [...loaded.aliases.map(alias => alias.name), ...loaded.routes.map(route => route.aliasId)],
       message => { if (!agentStdout) p.log.warn(message); },
       normalizeRouteLookupId,
