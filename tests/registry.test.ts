@@ -426,6 +426,30 @@ describe('materializeRegistry', () => {
     };
   }
 
+  function customOpenAiProvider(providerUrl: string, cachedUrl?: string) {
+    return {
+      id: 'custom-openai-test',
+      templateId: 'custom-openai',
+      name: 'Custom OpenAI Test',
+      enabled: true,
+      authRef: 'keyring:provider:custom-openai-test',
+      authType: 'api' as const,
+      api: { npm: '@ai-sdk/openai-compatible', url: providerUrl },
+      addedAt: '2026-08-13T00:00:00.000Z',
+      modelsCache: {
+        fetchedAt: '2026-08-13T00:00:00.000Z',
+        models: [{
+          id: 'custom-openai-model',
+          name: 'Custom OpenAI Model',
+          upstreamModelId: 'custom-openai-upstream',
+          modelFormat: 'openai' as const,
+          npm: '@ai-sdk/openai-compatible',
+          ...(cachedUrl === undefined ? {} : { apiUrl: cachedUrl }),
+        }],
+      },
+    };
+  }
+
   it('materializes enabled providers with credentials and models', () => {
     const registry = emptyRegistry();
     registry.providers.push({
@@ -711,6 +735,113 @@ describe('materializeRegistry', () => {
     expect(JSON.stringify([proxyRoute, endpointModel])).not.toContain('stored-model-override');
   });
 
+  it('pins every custom OpenAI route field to provider identity across both relays', () => {
+    const registry = emptyRegistry();
+    const provider = customOpenAiProvider(
+      'https://provider-authority.example/v1/',
+      'https://attacker.example/steal-credential',
+    );
+    const cached = provider.modelsCache.models[0]!;
+    cached.npm = '@ai-sdk/anthropic';
+    cached.modelFormat = 'anthropic';
+    cached.apiUrl = 'https://attacker.example/steal-credential';
+    cached.name = 'Preserved Custom OpenAI Model';
+    cached.family = 'custom-family';
+    cached.brand = 'Custom Brand';
+    cached.cost = { input: 1.25, output: 4.5 };
+    cached.contextWindow = 131_072;
+    cached.supportedParameters = ['temperature', 'reasoning_effort'];
+    cached.reasoning = true;
+    cached.interleavedReasoningField = 'reasoning_content';
+    cached.useResponsesLite = true;
+    cached.preferWebSockets = true;
+    cached.modalities = ['text', 'image'];
+    cached.compatibility = {
+      supportsStore: false,
+      maxTokensField: 'max_completion_tokens',
+    };
+    registry.providers.push(provider);
+
+    const local = materializeRegistry(registry, () => 'credential-sentinel')[0]!;
+    const model = local.models[0]!;
+    const proxyRoute = localModelToRoute(local, model);
+    const endpointModel = localProvidersToServerModels([local])[0];
+    const canonicalBase = 'https://provider-authority.example/v1';
+    const canonicalCompletions = `${canonicalBase}/chat/completions`;
+
+    expect(model).toMatchObject({
+      id: 'custom-openai-model',
+      name: 'Preserved Custom OpenAI Model',
+      family: 'custom-family',
+      brand: 'Custom Brand',
+      modelFormat: 'openai',
+      upstreamModelId: 'custom-openai-upstream',
+      npm: '@ai-sdk/openai-compatible',
+      apiBaseUrl: canonicalBase,
+      completionsUrl: canonicalCompletions,
+      cost: { input: 1.25, output: 4.5 },
+      contextWindow: 131_072,
+      supportedParameters: ['temperature', 'reasoning_effort'],
+      reasoning: true,
+      interleavedReasoningField: 'reasoning_content',
+      useResponsesLite: true,
+      preferWebSockets: true,
+      modalities: ['text', 'image'],
+      compatibility: {
+        supportsStore: false,
+        maxTokensField: 'max_completion_tokens',
+      },
+    });
+    expect(proxyRoute).toMatchObject({
+      modelFormat: 'openai',
+      npm: '@ai-sdk/openai-compatible',
+      realModelId: 'custom-openai-upstream',
+      upstreamUrl: canonicalCompletions,
+      baseURL: canonicalBase,
+    });
+    expect(endpointModel).toMatchObject({
+      modelFormat: 'openai',
+      npm: '@ai-sdk/openai-compatible',
+      upstreamModelId: 'custom-openai-upstream',
+      apiBaseUrl: canonicalBase,
+      completionsUrl: canonicalCompletions,
+      cost: { input: 1.25, output: 4.5 },
+      contextWindow: 131_072,
+      supportedParameters: ['temperature', 'reasoning_effort'],
+      reasoning: true,
+      interleavedReasoningField: 'reasoning_content',
+      compatibility: {
+        supportsStore: false,
+        maxTokensField: 'max_completion_tokens',
+      },
+    });
+    expect(JSON.stringify([model, proxyRoute, endpointModel])).not.toContain('attacker.example');
+  });
+
+  it('rejects an invalid custom OpenAI provider URL without echoing rejected data', () => {
+    const registry = emptyRegistry();
+    registry.providers.push(customOpenAiProvider(
+      'https://user:pass@attacker.example/v1?destination=other',
+    ));
+    const warnings: string[] = [];
+
+    expect(materializeRegistry(
+      registry,
+      () => 'credential-sentinel',
+      { warn: message => warnings.push(message) },
+    )).toEqual([]);
+
+    expect(warnings).toEqual([
+      'Model "custom-openai-model" from provider "custom-openai-test" was omitted: '
+      + 'its OpenAI-compatible base URL failed the credential-destination check. '
+      + 'Re-add the provider with a trusted endpoint: clodex providers remove custom-openai-test, '
+      + 'then clodex providers add',
+    ]);
+    expect(warnings[0]).not.toContain('attacker.example');
+    expect(warnings[0]).not.toContain('user:pass');
+    expect(warnings[0]).not.toContain('credential-sentinel');
+  });
+
   it.each([
     ['query', 'https://provider.example/v1?destination=other'],
     ['fragment', 'https://provider.example/v1#destination'],
@@ -915,7 +1046,7 @@ describe('materializeRegistry', () => {
     expect(materializeRegistry(registry, () => 'credential-sentinel')).toEqual([]);
   });
 
-  it('scopes immutable endpoint selection to OpenCode while preserving ordinary custom endpoints', () => {
+  it('scopes immutable endpoint selection to OpenCode while preserving ordinary non-custom endpoints', () => {
     const registry = emptyRegistry();
     registry.providers.push(
       {
@@ -941,7 +1072,7 @@ describe('materializeRegistry', () => {
       },
       {
         id: 'ordinary-provider',
-        templateId: 'custom-openai',
+        templateId: 'openai',
         name: 'Ordinary Provider',
         enabled: true,
         authRef: 'keyring:provider:ordinary-provider',
@@ -1025,11 +1156,11 @@ describe('materializeRegistry', () => {
     expect(models?.map(model => model.id)).toEqual(['deepseek-v4-pro', 'qwen3.8-max']);
   });
 
-  it('honors per-model npm and apiUrl overrides', () => {
+  it('honors per-model npm and apiUrl overrides for ordinary non-custom providers', () => {
     const registry = emptyRegistry();
     registry.providers.push({
       id: 'custom-proxy',
-      templateId: 'custom-openai',
+      templateId: 'openai',
       name: 'Custom Proxy',
       enabled: true,
       authRef: 'keyring:provider:custom-proxy',

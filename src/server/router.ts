@@ -72,7 +72,7 @@ import {
   applyAnthropicMessagesEffort,
   transformOpenAiCompatibleRequestBody,
 } from '../model-runtime-compatibility.js';
-import { canonicalAnthropicBaseUrl } from '../registry/url-security.js';
+import { canonicalAnthropicBaseUrl, canonicalOpenAiBaseUrl } from '../registry/url-security.js';
 import {
   DEFAULT_UNSUPPORTED_EFFORT_POLICY,
   EffortResolutionError,
@@ -769,15 +769,15 @@ async function handleOpenAIChatCompletions(
   if (!model) return;
 
   if (supportsDirectOpenAIChatCompletions(model)) {
-    if (model.completionsUrl && !/^https?:\/\//i.test(model.completionsUrl)) {
-      sendJson(res, 400, { error: { message: `Invalid provider completionsUrl: must be http:// or https://` } });
-      return;
-    }
     if (!model.completionsUrl) {
       sendJson(res, 400, { error: { message: `Model ${model.id} has no completionsUrl configured` } });
       return;
     }
-    const completionsUrl = model.completionsUrl;
+    const completionsUrl = canonicalOpenAiBaseUrl(model.completionsUrl);
+    if (completionsUrl === null) {
+      sendJson(res, 400, { error: { message: 'Invalid provider completionsUrl: must be an unambiguous HTTP(S) URL without query, fragment, or userinfo' } });
+      return;
+    }
     let apiKey: string;
     try {
       apiKey = await resolveModelApiKey(model, options.apiKey);

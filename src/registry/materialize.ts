@@ -18,7 +18,7 @@ import { classifyFreeStatus, isFreeStatus } from '../free-models.js';
 import { openCodeGoEffortProfile } from '../data/opencode-go-effort-profiles.js';
 import { OAUTH_ACCOUNT_ENV } from '../oauth-account-selection.js';
 import { resolveAnthropicAuthMode } from '../anthropic-auth-mode.js';
-import { canonicalAnthropicBaseUrl } from './url-security.js';
+import { canonicalAnthropicBaseUrl, canonicalOpenAiBaseUrl } from './url-security.js';
 
 export { OAUTH_ACCOUNT_ENV } from '../oauth-account-selection.js';
 
@@ -36,10 +36,14 @@ export function resolveEndpoint(
   }
   if (npm === '@ai-sdk/openai-compatible') {
     if (!apiUrl) return null;
-    return {
-      format: 'openai',
-      completionsUrl: apiUrl.replace(/\/$/, '') + '/chat/completions',
-    };
+    const baseUrl = canonicalOpenAiBaseUrl(apiUrl);
+    return baseUrl === null
+      ? null
+      : {
+          format: 'openai',
+          baseUrl,
+          completionsUrl: `${baseUrl}/chat/completions`,
+        };
   }
   // Any other npm — SDK adapter owns endpoints.
   return { format: 'openai' };
@@ -78,10 +82,12 @@ function resolveMaterializedApiUrl(
   if (isRetainedOpenCodeGoProvider(provider)) {
     return openCodeGoPinnedApiUrl(npm);
   }
-  // An Anthropic model's provider owns the credential destination. Cached rows
-  // may select a package, but imported, migrated, or hand-edited model metadata
-  // cannot redirect the provider credential away from that authority.
-  if (npm === '@ai-sdk/anthropic') return provider.api.url ?? '';
+  // A custom provider owns the credential destination. Cached rows may select a
+  // package, but imported, migrated, or hand-edited model metadata cannot redirect
+  // the provider credential away from that authority.
+  if (provider.templateId === 'custom-anthropic' || provider.templateId === 'custom-openai') {
+    return provider.api.url ?? '';
+  }
   return cached.apiUrl ?? provider.api.url ?? '';
 }
 
@@ -116,11 +122,17 @@ export function cachedModelToLocal(
     templateId: provider.templateId,
   });
 
-  // `custom-anthropic` is the provider's persisted kind, not descriptive cache
-  // metadata. Imported, migrated, or hand-edited model rows cannot switch its
-  // credential onto another SDK/format and regain per-model destination control.
+  // Custom provider template IDs are the provider's persisted kind, not
+  // descriptive cache metadata. Imported, migrated, or hand-edited model rows
+  // cannot switch their credential onto another SDK/format or regain per-model
+  // destination control.
   const customAnthropic = provider.templateId === 'custom-anthropic';
-  const npm = customAnthropic ? '@ai-sdk/anthropic' : (cached.npm ?? provider.api.npm ?? '');
+  const customOpenAi = provider.templateId === 'custom-openai';
+  const npm = customAnthropic
+    ? '@ai-sdk/anthropic'
+    : customOpenAi
+      ? '@ai-sdk/openai-compatible'
+      : (cached.npm ?? provider.api.npm ?? '');
   const apiUrl = resolveMaterializedApiUrl(cached, provider, npm);
   if (apiUrl === null) {
     return reportOmittedModel(
@@ -138,9 +150,13 @@ export function cachedModelToLocal(
       provider,
       npm === '@ai-sdk/anthropic'
         ? 'its Anthropic base URL failed the credential-destination check'
-        : npm
-          ? 'no API URL is configured for its endpoint'
-          : 'it names no SDK package, so no trusted endpoint can be resolved for it',
+        : npm === '@ai-sdk/openai-compatible'
+          ? apiUrl
+            ? 'its OpenAI-compatible base URL failed the credential-destination check'
+            : 'no API URL is configured for its endpoint'
+          : npm
+            ? 'no API URL is configured for its endpoint'
+            : 'it names no SDK package, so no trusted endpoint can be resolved for it',
       `Re-add the provider with a trusted endpoint: clodex providers remove ${provider.id}, then clodex providers add`,
       warn,
     );
@@ -159,14 +175,18 @@ export function cachedModelToLocal(
     brand: npm === '@ai-sdk/google' ? deriveBrand(family) : (cached.brand ?? deriveBrand(cached.family ?? '')),
     modelFormat: customAnthropic
       ? 'anthropic'
-      : (cached.modelFormat === 'anthropic' || cached.modelFormat === 'openai'
-          ? cached.modelFormat
-          : endpoint.format),
+      : customOpenAi
+        ? 'openai'
+        : (cached.modelFormat === 'anthropic' || cached.modelFormat === 'openai'
+            ? cached.modelFormat
+            : endpoint.format),
     upstreamModelId: normalizedUpstream,
-    baseUrl: endpoint.baseUrl,
+    baseUrl: endpoint.format === 'anthropic' ? endpoint.baseUrl : undefined,
     completionsUrl: endpoint.completionsUrl,
     npm: npm || undefined,
-    apiBaseUrl: endpoint.format === 'anthropic' ? endpoint.baseUrl : (apiUrl || undefined),
+    apiBaseUrl: endpoint.format === 'anthropic'
+      ? endpoint.baseUrl
+      : (endpoint.baseUrl ?? (apiUrl || undefined)),
     cost: cached.cost,
     isFree: isFreeStatus(freeStatus),
     freeStatus,

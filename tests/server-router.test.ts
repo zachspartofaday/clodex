@@ -1333,6 +1333,38 @@ describe('server router', () => {
     });
   });
 
+  it.each([
+    ['query', 'https://provider.example/v1/chat/completions?destination=other'],
+    ['fragment', 'https://provider.example/v1/chat/completions#destination'],
+    ['userinfo', 'https://user:pass@provider.example/v1/chat/completions'],
+  ])('rejects a direct OpenAI destination with %s before credential resolution', async (_case, completionsUrl) => {
+    const server = await startTestServer({
+      catalog: createGatewayModelCatalog([{
+        ...model('invalid-openai-destination', 'openai', 'custom-openai', { completionsUrl }),
+        providerId: 'oauth-provider',
+        authRef: TEST_HELPER_REF,
+        authType: 'oauth',
+      }]),
+    });
+
+    const response = await fetch(`${server.url}/openai/v1/chat/completions`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        model: 'invalid-openai-destination',
+        messages: [{ role: 'user', content: 'do not dispatch' }],
+      }),
+    });
+
+    expect(response.status).toBe(400);
+    expect(await response.json()).toEqual({
+      error: {
+        message: 'Invalid provider completionsUrl: must be an unambiguous HTTP(S) URL without query, fragment, or userinfo',
+      },
+    });
+    expect(vi.mocked(resolveProviderCredential)).not.toHaveBeenCalled();
+  });
+
   it('applies direct OpenAI model compatibility before forwarding Chat Completions', async () => {
     const upstream = await startUpstream({
       id: 'chatcmpl-compatible',
