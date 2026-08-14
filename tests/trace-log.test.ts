@@ -18,6 +18,7 @@ import {
   writeProxyLifecycleLog,
   writeWebSocketDiagnosticRequestLog,
 } from '../src/trace-log.js';
+import { isCredentialBearingHeader } from '../src/credential-headers.js';
 
 describe('trace log redaction', () => {
   afterEach(() => {
@@ -51,6 +52,36 @@ describe('trace log redaction', () => {
   it('redacts full log content', () => {
     const log = redactTraceLog('line1\nBearer sk-test123456789012345678901234\nline3');
     expect(log).not.toContain('sk-test123456789012345678901234');
+  });
+
+  it.each([
+    ['x-auth', 'x-auth-secret'],
+    ['authentication', 'authentication-secret'],
+    ['x-auth-key', 'x-auth-key-secret'],
+    ['xapikey', 'xapikey-secret'],
+  ])('redacts %s values in JSON string diagnostics', (name, value) => {
+    const line = `diagnostic: ${JSON.stringify({ [name]: value })}`;
+    expect(redactTraceLine(line)).toBe(`diagnostic: {"${name}":"[REDACTED]"}`);
+  });
+
+  it.each(['x-auth-tracking', 'authentication-info', 'my-x-auth-hint'])(
+    'round-trips non-secret header name %s',
+    (name) => {
+      const value = `${name}-value`;
+      const line = `diagnostic: ${JSON.stringify({ [name]: value })}`;
+      expect(redactTraceLine(line)).toBe(line);
+    },
+  );
+
+  it('redacts case-insensitive aliases with JSON whitespace', () => {
+    expect(redactTraceLine('{ "X-Auth-Key" : "private-key" }'))
+      .toBe('{ "X-Auth-Key" : "[REDACTED]" }');
+  });
+
+  it('keeps redaction aliases aligned with the shared credential classifier', () => {
+    for (const name of ['x-auth', 'authentication', 'x-auth-key', 'xapikey']) {
+      expect(isCredentialBearingHeader(name)).toBe(true);
+    }
   });
 });
 

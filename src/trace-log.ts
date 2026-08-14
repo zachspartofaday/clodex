@@ -724,6 +724,10 @@ const REDACTION_PATTERNS: Array<(line: string) => string> = [
   line => line.replace(/Bearer\s+[A-Za-z0-9._\-+/=]+/gi, 'Bearer [REDACTED]'),
   line => line.replace(/("authorization"\s*:\s*")[^"]+/gi, '$1[REDACTED]'),
   line => line.replace(/(x-api-key"\s*:\s*")[^"]+/gi, '$1[REDACTED]'),
+  // Exact header-name spellings the shared credential classifier recognizes
+  // that neither pattern above reaches. Fully quoted, so `x-auth-tracking` and
+  // `authentication-info` stay readable.
+  line => line.replace(/("(?:x-auth|authentication|x-auth-key|xapikey)"\s*:\s*")[^"]+/gi, '$1[REDACTED]'),
   // Common API key prefixes
   line => line.replace(/\bsk-[A-Za-z0-9_-]{8,}\b/g, 'sk-[REDACTED]'),
   line => line.replace(/\bsk-ant-[A-Za-z0-9_-]{8,}\b/g, 'sk-ant-[REDACTED]'),
