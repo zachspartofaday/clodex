@@ -4,6 +4,28 @@ import { collectOpenAiStream, generateOpenAiResponse, streamOpenAiResponse, tran
 import { resetServiceTierWarningForTests, sdkTimeoutDetails } from '../src/sdk-adapter.js';
 import { installParentNoticeSink } from '../src/parent-notice.js';
 
+const finishReasonCases = [
+  { label: 'stop', unified: 'stop', raw: 'native-stop', openAi: 'stop', accepted: true },
+  { label: 'length', unified: 'length', raw: 'native-length', openAi: 'length', accepted: true },
+  { label: 'content-filter', unified: 'content-filter', raw: 'native-filter', openAi: 'content_filter', accepted: true },
+  { label: 'tool-calls', unified: 'tool-calls', raw: 'native-tools', openAi: 'tool_calls', accepted: true },
+  { label: 'other with raw', unified: 'other', raw: 'provider-defined', openAi: 'other', accepted: true },
+  { label: 'other without raw', unified: 'other', raw: undefined, accepted: false },
+  { label: 'error', unified: 'error', raw: 'provider-error', accepted: false },
+  { label: 'outside union', unified: 'not-a-finish-reason', raw: 'provider-outside', accepted: false },
+] as const;
+
+function finishPartForTest(testCase: typeof finishReasonCases[number]) {
+  return {
+    finishReason: testCase.unified,
+    ...(testCase.raw === undefined ? {} : { rawFinishReason: testCase.raw }),
+  };
+}
+
+function expectedFinishFailure(testCase: typeof finishReasonCases[number]): string {
+  return `unified=${testCase.unified}${testCase.raw === undefined ? '' : ` raw=${testCase.raw}`}`;
+}
+
 /** Observes the parent-notice channel, which is where request-time warnings go
  *  now: `clodex claude` mutes the parent's stdio for Claude Code's TUI, so a
  *  console.error here would never reach a user. */
@@ -265,6 +287,23 @@ describe('collectOpenAiStream', () => {
       .resolves.toMatchObject({ text: 'complete', finishReason });
   });
 
+  it.each(finishReasonCases)('handles $label in the collected-stream path', async testCase => {
+    async function* stream() {
+      yield { type: 'text-delta', text: 'complete' };
+      yield { type: 'finish', ...finishPartForTest(testCase) };
+    }
+
+    const result = collectOpenAiStream(stream());
+    if (testCase.accepted) {
+      await expect(result).resolves.toMatchObject({
+        text: 'complete',
+        finishReason: testCase.unified,
+      });
+    } else {
+      await expect(result).rejects.toThrow(expectedFinishFailure(testCase));
+    }
+  });
+
   it('propagates an SDK error part instead of returning a partial result', async () => {
     const upstreamError = { statusCode: 500, message: 'upstream exploded' };
     async function* stream() {
@@ -406,6 +445,56 @@ describe('ordinary OpenAI terminal validation', () => {
       expect(response.choices[0].finish_reason).toBe('other');
     } finally {
       vi.mocked(generateText).mockReset();
+    }
+  });
+
+  it.each(finishReasonCases)('handles $label in the generated/non-streaming path', async testCase => {
+    vi.mocked(generateText).mockResolvedValue({
+      text: 'complete',
+      toolCalls: [],
+      ...finishPartForTest(testCase),
+      usage: { inputTokens: 1, outputTokens: 1, totalTokens: 2 },
+    } as never);
+
+    try {
+      const result = generateOpenAiResponse({} as never, { messages: [] }, 'gpt-test');
+      if (testCase.accepted) {
+        const response: any = await result;
+        expect(response.choices[0].finish_reason).toBe(testCase.openAi);
+      } else {
+        await expect(result).rejects.toThrow(expectedFinishFailure(testCase));
+      }
+    } finally {
+      vi.mocked(generateText).mockReset();
+    }
+  });
+
+  it.each(finishReasonCases)('handles $label in the streamed writer', async testCase => {
+    async function* stream() {
+      yield { type: 'text-delta', text: 'complete' };
+      yield { type: 'finish', ...finishPartForTest(testCase) };
+    }
+    vi.mocked(streamText).mockReturnValue({ stream: stream() } as never);
+    let output = '';
+
+    try {
+      const result = streamOpenAiResponse(
+        {} as never,
+        { messages: [] },
+        'gpt-test',
+        chunk => { output += chunk; },
+      );
+      if (testCase.accepted) {
+        await result;
+        expect(output).toContain(`\"finish_reason\":\"${testCase.openAi}\"`);
+        expect(output).toContain('[DONE]');
+      } else {
+        await expect(result).rejects.toThrow(expectedFinishFailure(testCase));
+        expect(output).not.toContain(`\"finish_reason\":\"${testCase.unified}\"`);
+        expect(output).not.toContain('[DONE]');
+      }
+    } finally {
+      vi.mocked(streamText).mockReset();
     }
   });
 

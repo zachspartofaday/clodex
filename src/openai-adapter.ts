@@ -229,6 +229,12 @@ export interface CollectedOpenAiStream {
   usage: { inputTokens?: number; outputTokens?: number; totalTokens?: number } | undefined;
 }
 
+function mapOpenAiFinishReason(unifiedReason: string): string {
+  if (unifiedReason === 'tool-calls') return 'tool_calls';
+  if (unifiedReason === 'content-filter') return 'content_filter';
+  return unifiedReason;
+}
+
 /** Reduce an SDK full stream into the fields a non-streaming chat completion needs. */
 export async function collectOpenAiStream(stream: AsyncIterable<unknown>): Promise<CollectedOpenAiStream> {
   const collected: CollectedOpenAiStream = { text: '', toolCalls: [], finishReason: undefined, usage: undefined };
@@ -355,7 +361,11 @@ export async function generateOpenAiResponse(
     object: 'chat.completion',
     created: Math.floor(Date.now() / 1000),
     model: responseModelId,
-    choices: [{ index: 0, message, finish_reason: result.finishReason }],
+    choices: [{
+      index: 0,
+      message,
+      finish_reason: mapOpenAiFinishReason(result.finishReason!),
+    }],
     usage: {
       prompt_tokens: result.usage?.inputTokens ?? 0,
       completion_tokens: result.usage?.outputTokens ?? 0,
@@ -419,7 +429,11 @@ export async function streamOpenAiResponse(
     // part, and reporting that as a missing terminal event would hide the real
     // cause. Either way no completion frame and no [DONE] is emitted.
     watchdog.throwIfAborted();
-    send({}, requireOpenAiTerminalFinish(finishPart, 'Upstream OpenAI stream ended without a terminal event'));
+    const terminalReason = requireOpenAiTerminalFinish(
+      finishPart,
+      'Upstream OpenAI stream ended without a terminal event',
+    );
+    send({}, mapOpenAiFinishReason(terminalReason));
     onChunk('data: [DONE]\n\n');
   } catch (err) {
     watchdog.throwIfAborted();

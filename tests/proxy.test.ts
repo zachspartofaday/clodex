@@ -1427,6 +1427,86 @@ describe('SDK translated error logging', () => {
     }
   }, 20_000);
 
+  it('rejects an upstream error finish reason without emitting success artifacts', async () => {
+    vi.resetModules();
+    const payloadBodySentinel = 'PAYLOAD_BODY_SENTINEL';
+    vi.doMock('ai', async () => {
+      const actual = await vi.importActual<typeof import('ai')>('ai');
+      return {
+        ...actual,
+        streamText: vi.fn(() => ({
+          stream: (async function* () {
+            yield { type: 'start' };
+            yield { type: 'text-start', id: 'text-1' };
+            yield { type: 'text-delta', text: 'partial' };
+            yield {
+              type: 'finish',
+              finishReason: 'error',
+              rawFinishReason: 'provider-error',
+              payloadBody: payloadBodySentinel,
+            };
+          })(),
+        })),
+      };
+    });
+    vi.doMock('../src/provider-factory.js', async () => {
+      const actual = await vi.importActual<typeof import('../src/provider-factory.js')>('../src/provider-factory.js');
+      return { ...actual, createLanguageModel: vi.fn(async () => ({})) };
+    });
+
+    const dir = mkdtempSync(join(tmpdir(), 'clodex-sdk-error-finish-'));
+    const inferenceLogPath = join(dir, 'inference.jsonl');
+    const requestId = '00000000-0000-4000-8000-000000000109';
+    const route: ProxyRoute = {
+      aliasId: 'clodex:test:error-finish',
+      realModelId: 'translated-model',
+      displayName: 'Error Finish',
+      upstreamUrl: '',
+      apiKey: 'provider-key',
+      modelFormat: 'openai',
+      npm: '@ai-sdk/openai-compatible',
+      baseURL: 'http://unused.test/v1',
+      providerId: 'test-provider',
+    };
+
+    try {
+      const { startProxyCatalog: startMockedProxyCatalog } = await import('../src/proxy.js');
+      const handle = await startMockedProxyCatalog([route], route.aliasId, false, inferenceLogPath);
+      try {
+        const res = await postToProxy(handle.port, handle.token, {
+          model: route.aliasId,
+          max_tokens: 100,
+          messages: [{ role: 'user', content: 'error finish' }],
+          stream: true,
+        }, requestId);
+
+        expect(res.status).toBe(200);
+        expect(res.body).toContain('unified=error');
+        expect(res.body).toContain('raw=provider-error');
+        expect(res.body).not.toContain('event: message_delta');
+        expect(res.body).not.toContain('event: message_stop');
+        expect(res.body).not.toContain('[DONE]');
+        expect(res.body).not.toContain(payloadBodySentinel);
+
+        const entries = readFileSync(inferenceLogPath, 'utf8').trim().split('\n').map(line => JSON.parse(line));
+        expect(entries).toContainEqual(expect.objectContaining({
+          event: 'translation_failed',
+          requestId,
+          lastPartType: 'finish',
+          terminalOutcome: 'error',
+        }));
+        expect(entries.some(entry => entry.event === 'translation_completed' && entry.requestId === requestId)).toBe(false);
+      } finally {
+        handle.close();
+      }
+    } finally {
+      vi.doUnmock('../src/provider-factory.js');
+      vi.doUnmock('ai');
+      vi.resetModules();
+      rmSync(dir, { recursive: true, force: true });
+    }
+  }, 20_000);
+
   it('rejects translated SSE EOF without a genuine terminal reason and records translation failure', async () => {
     const dir = mkdtempSync(join(tmpdir(), 'clodex-sdk-terminal-integrity-'));
     const inferenceLogPath = join(dir, 'inference.jsonl');

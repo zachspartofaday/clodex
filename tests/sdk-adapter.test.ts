@@ -15,10 +15,33 @@ import {
   claudeSessionPromptCacheKey,
   sdkTimeoutDetails,
   sdkTranslationErrorSignature,
+  requireOpenAiTerminalFinish,
   resetServiceTierWarningForTests,
   silenceSdkWarnings,
 } from '../src/sdk-adapter.js';
 import { installParentNoticeSink } from '../src/parent-notice.js';
+
+const finishReasonCases = [
+  { label: 'stop', unified: 'stop', raw: 'native-stop', anthropic: 'end_turn', openAi: 'stop', accepted: true },
+  { label: 'length', unified: 'length', raw: 'native-length', anthropic: 'max_tokens', openAi: 'length', accepted: true },
+  { label: 'content-filter', unified: 'content-filter', raw: 'native-filter', anthropic: 'refusal', openAi: 'content_filter', accepted: true },
+  { label: 'tool-calls', unified: 'tool-calls', raw: 'native-tools', anthropic: 'tool_use', openAi: 'tool_calls', accepted: true },
+  { label: 'other with raw', unified: 'other', raw: 'provider-defined', anthropic: 'end_turn', openAi: 'other', accepted: true },
+  { label: 'other without raw', unified: 'other', raw: undefined, accepted: false },
+  { label: 'error', unified: 'error', raw: 'provider-error', accepted: false },
+  { label: 'outside union', unified: 'not-a-finish-reason', raw: 'provider-outside', accepted: false },
+] as const;
+
+function finishPartForTest(testCase: typeof finishReasonCases[number]) {
+  return {
+    finishReason: testCase.unified,
+    ...(testCase.raw === undefined ? {} : { rawFinishReason: testCase.raw }),
+  };
+}
+
+function expectedFinishFailure(testCase: typeof finishReasonCases[number]): string {
+  return `unified=${testCase.unified}${testCase.raw === undefined ? '' : ` raw=${testCase.raw}`}`;
+}
 
 describe('sdkTranslationErrorSignature', () => {
   it('classifies missing stream parts without exposing their dynamic ids', () => {
@@ -27,6 +50,17 @@ describe('sdkTranslationErrorSignature', () => {
     expect(sdkTranslationErrorSignature('text part msg-sensitive not found'))
       .toBe('text_part_not_found');
     expect(sdkTranslationErrorSignature(new Error('rate limited'))).toBeUndefined();
+  });
+});
+
+describe('requireOpenAiTerminalFinish', () => {
+  it.each(finishReasonCases)('classifies the $label finish reason', testCase => {
+    const part = finishPartForTest(testCase);
+    if (testCase.accepted) {
+      expect(requireOpenAiTerminalFinish(part)).toBe(testCase.unified);
+    } else {
+      expect(() => requireOpenAiTerminalFinish(part)).toThrow(expectedFinishFailure(testCase));
+    }
   });
 });
 
@@ -975,6 +1009,69 @@ describe('generateAnthropicResponse', () => {
     }
   });
 
+  it.each(finishReasonCases)('handles $label in the Anthropic force-stream writer', async testCase => {
+    vi.resetModules();
+    async function* stream() {
+      yield { type: 'start' };
+      yield { type: 'text-delta', text: 'complete' };
+      yield { type: 'finish', ...finishPartForTest(testCase) };
+    }
+    const streamText = vi.fn(() => ({ stream: stream() }));
+    vi.doMock('ai', () => ({
+      generateText: vi.fn(),
+      streamText,
+      tool: vi.fn((spec: unknown) => spec),
+      jsonSchema: vi.fn((schema: unknown) => schema),
+    }));
+
+    try {
+      const { generateAnthropicResponse } = await import('../src/sdk-adapter.js');
+      const result = generateAnthropicResponse(
+        {} as never,
+        { messages: [] },
+        'test-model',
+        { forceStream: true },
+      );
+      if (testCase.accepted) {
+        await expect(result).resolves.toMatchObject({ stop_reason: testCase.anthropic });
+      } else {
+        await expect(result).rejects.toThrow(expectedFinishFailure(testCase));
+      }
+    } finally {
+      vi.doUnmock('ai');
+      vi.resetModules();
+    }
+  });
+
+  it.each(finishReasonCases)('handles $label in the Anthropic buffered writer', async testCase => {
+    vi.resetModules();
+    const generateText = vi.fn(async () => ({
+      text: 'complete',
+      toolCalls: [],
+      ...finishPartForTest(testCase),
+      usage: { inputTokens: 1, outputTokens: 1 },
+    }));
+    vi.doMock('ai', () => ({
+      generateText,
+      streamText: vi.fn(),
+      tool: vi.fn((spec: unknown) => spec),
+      jsonSchema: vi.fn((schema: unknown) => schema),
+    }));
+
+    try {
+      const { generateAnthropicResponse } = await import('../src/sdk-adapter.js');
+      const result = generateAnthropicResponse({} as never, { messages: [] }, 'test-model');
+      if (testCase.accepted) {
+        await expect(result).resolves.toMatchObject({ stop_reason: testCase.anthropic });
+      } else {
+        await expect(result).rejects.toThrow(expectedFinishFailure(testCase));
+      }
+    } finally {
+      vi.doUnmock('ai');
+      vi.resetModules();
+    }
+  });
+
   it('rejects a late success after caller abort', async () => {
     vi.resetModules();
     let resolveLate!: (value: unknown) => void;
@@ -1469,6 +1566,33 @@ describe('writeAnthropicStream', () => {
 
     expect(events.map(event => event.event)).toContain('message_delta');
     expect(events.map(event => event.event)).toContain('message_stop');
+  });
+
+  it.each(finishReasonCases)('handles $label in the Anthropic streaming writer', async testCase => {
+    const parts = [
+      { type: 'start' },
+      { type: 'text-start', id: 't1' },
+      { type: 'text-delta', id: 't1', text: 'complete' },
+      { type: 'finish', ...finishPartForTest(testCase) },
+    ];
+    let raw = '';
+    const result = writeAnthropicStream(
+      (async function* () { for (const part of parts) yield part; })() as any,
+      'm',
+      chunk => { raw += chunk; },
+    );
+    if (testCase.accepted) {
+      await expect(result).resolves.toBeUndefined();
+      const messageDelta = raw.split('\n\n')
+        .find(block => block.startsWith('event: message_delta'))!;
+      expect(JSON.parse(messageDelta.split('\n')[1]!.replace('data: ', '')).delta.stop_reason)
+        .toBe(testCase.anthropic);
+      expect(raw).toContain('event: message_stop');
+    } else {
+      await expect(result).rejects.toThrow(expectedFinishFailure(testCase));
+      expect(raw).not.toContain('event: message_delta');
+      expect(raw).not.toContain('event: message_stop');
+    }
   });
 
   it('does not double-count the local estimate when final input is fully cached', async () => {

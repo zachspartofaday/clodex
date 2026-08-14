@@ -102,23 +102,28 @@ export function sdkTranslationErrorSignature(error: unknown): SdkTranslationErro
   return undefined;
 }
 
-/** Require a provider-supplied terminal reason before assembling a success response. */
+/** Require a provider-supplied successful terminal reason before assembling a response. */
 export function requireOpenAiTerminalFinish(
   part: { finishReason?: unknown; rawFinishReason?: unknown } | undefined,
   errorMessage = 'Upstream SDK stream ended without a terminal event',
 ): string {
-  if (
-    typeof part?.finishReason !== 'string'
-    || (part.finishReason === 'other' && part.rawFinishReason === undefined)
-  ) {
-    throw new Error(errorMessage);
+  const unified = part?.finishReason;
+  const raw = part?.rawFinishReason;
+  if (typeof unified !== 'string') throw new Error(errorMessage);
+  if (unified === 'other' && typeof raw !== 'string') {
+    throw new Error(`${errorMessage}: unified=${unified}`);
   }
-  return part.finishReason;
+  if (unified === 'stop' || unified === 'length' || unified === 'tool-calls' || unified === 'content-filter' || unified === 'other') {
+    return unified;
+  }
+  const rawDiagnostic = typeof raw === 'string' ? ` raw=${raw}` : '';
+  throw new Error(`Upstream SDK terminal finish rejected: unified=${unified}${rawDiagnostic}`);
 }
 
 function mapAnthropicStopReason(terminalReason: string, hasToolCall: boolean): string {
   if (terminalReason === 'length') return 'max_tokens';
   if (terminalReason === 'tool-calls' || hasToolCall) return 'tool_use';
+  if (terminalReason === 'content-filter') return 'refusal';
   return 'end_turn';
 }
 
