@@ -126,3 +126,79 @@ describe('materializeRegistry', () => {
     expect(locals[0]?.models.map(m => m.id)).toEqual(['gpt-5.6-sol']);
   });
 });
+
+/**
+ * A provider whose own validated resolver states coding capability must never
+ * be second-guessed by the models.dev heuristic.
+ *
+ * The authority is the PROVIDER IDENTITY, resolved at materialization, rather
+ * than a per-model flag carried in the persisted cache — a hand-edited or stale
+ * cache row therefore cannot claim the exemption, and cannot lose it either.
+ */
+describe('provider-authoritative models bypass the models.dev capability veto', () => {
+  it('exempts every materialized retained OpenCode Go model', () => {
+    const registry = {
+      schema_version: '1' as const,
+      providers: [{
+        id: 'opencode-go',
+        templateId: 'opencode-go',
+        name: 'OpenCode Go',
+        enabled: true,
+        authRef: 'keyring:provider:opencode-go',
+        authType: 'api' as const,
+        api: { npm: '@ai-sdk/openai-compatible', url: 'https://opencode.ai/zen/go/v1' },
+        addedAt: '2026-08-12T00:00:00.000Z',
+        modelsCache: {
+          fetchedAt: '2026-08-12T00:00:00.000Z',
+          models: [
+            { id: 'kimi-k3', name: 'Kimi K3', upstreamModelId: 'kimi-k3' },
+            { id: 'qwen3.8-max', name: 'Qwen 3.8 Max', upstreamModelId: 'qwen3.8-max' },
+            // A hand-edited row for a model the pinned catalog does not own.
+            // The pinned allowlist, not this flag, is what keeps it out.
+            { id: 'z-ai/glm4.7', name: 'GLM 4.7', upstreamModelId: 'z-ai/glm4.7' },
+          ],
+        },
+      }],
+    };
+    const models = materializeRegistry(registry, () => 'key', { agent: 'claude' })[0]?.models ?? [];
+    expect(models.length).toBeGreaterThan(0);
+    expect(models.map(model => model.id)).not.toContain('z-ai/glm4.7');
+    for (const model of models) {
+      expect(model.ignoreModelsDevCapabilities, model.id).toBe(true);
+      // The exemption is what the hide filter is actually given, so no
+      // models.dev heuristic can veto a row this provider vouches for.
+      expect(shouldHideModel({
+        providerId: 'opencode-go',
+        modelId: model.id,
+        agent: 'claude',
+        ignoreModelsDevCapabilities: model.ignoreModelsDevCapabilities,
+      }), model.id).toBe(false);
+    }
+  });
+
+  it('still applies the veto to the same model under an ordinary provider', () => {
+    const locals = materializeRegistry({
+      schema_version: '1' as const,
+      providers: [{
+        id: 'openai',
+        templateId: 'openai',
+        name: 'OpenAI',
+        enabled: true,
+        authRef: 'keyring:provider:openai',
+        api: { npm: '@ai-sdk/openai' },
+        addedAt: '2026-08-12T00:00:00.000Z',
+        modelsCache: {
+          fetchedAt: '2026-08-12T00:00:00.000Z',
+          models: [{
+            id: 'z-ai/glm4.7',
+            name: 'GLM 4.7',
+            upstreamModelId: 'z-ai/glm4.7',
+            modelFormat: 'openai' as const,
+            npm: '@ai-sdk/openai',
+          }],
+        },
+      }],
+    }, () => 'key', { agent: 'claude' });
+    expect(locals).toHaveLength(0);
+  });
+});

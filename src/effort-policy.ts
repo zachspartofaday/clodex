@@ -243,6 +243,32 @@ export function resolveEffort(
 }
 
 /**
+ * A one-line, non-identifying account of an effort decision, for the local
+ * debug log.
+ *
+ * Returned only when the answer was NOT the level the client asked for —
+ * rounding, or omitting the field entirely. Those are the cases an operator
+ * cannot otherwise see: the request simply behaves as if a different effort had
+ * been chosen, with nothing to explain why.
+ *
+ * Every component is drawn from the closed effort/policy/outcome vocabularies
+ * declared in this module. No model id, request id, session id, header, or
+ * message content appears, so this can never carry user or route identity, and
+ * it is a log line only — nothing is added to the response the client sees.
+ */
+export function effortResolutionDiagnostic(
+  resolution: EffortResolution | undefined,
+  profile: EffortProfile,
+): string | undefined {
+  if (resolution === undefined || resolution.outcome === 'exact') return undefined;
+  const supported = profileLevels(profile).join('|') || 'none';
+  return `requested=${resolution.requested} resolved=${resolution.resolved ?? 'provider-default'} `
+    + `outcome=${resolution.outcome}`
+    + (resolution.saturated ? ' saturated=true' : '')
+    + ` supported=${supported}`;
+}
+
+/**
  * Resolve the effort for one request, including the omitted-effort case.
  *
  * A client that sends no effort gets the profile's DECLARED default, and only

@@ -47,7 +47,7 @@ export interface ModelRuntimeCompatibility {
 }
 
 export type OpenAiCompatibleRequestBody = Record<string, unknown>;
-export type AnthropicMessagesRequestBody = Record<string, unknown>;
+type AnthropicMessagesRequestBody = Record<string, unknown>;
 
 type ChatMessage = Record<string, unknown> & { role?: unknown };
 

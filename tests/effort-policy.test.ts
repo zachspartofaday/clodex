@@ -4,6 +4,7 @@ import {
   DEFAULT_UNSUPPORTED_EFFORT_POLICY,
   EffortResolutionError,
   UNSUPPORTED_EFFORT_POLICIES,
+  effortResolutionDiagnostic,
   isCanonicalEffortLevel,
   isUnsupportedEffortPolicy,
   nativeEffortLevel,
@@ -365,5 +366,67 @@ describe('patched-client exposure stays within transform version 6', () => {
     // Every other reviewed ladder is sparse. Exposing one would need the sparse
     // picker representation, which is a separate transform-version change.
     expect(native).toEqual(['gpt-5.6-luna', 'qwen3.6-plus']);
+  });
+});
+
+/**
+ * An effort that rounded or was dropped is otherwise invisible: the request
+ * simply behaves as if a different level had been chosen. The diagnostic is a
+ * local log line only — never a response header — and is drawn entirely from
+ * this module's closed vocabularies, so it can carry no route or user identity.
+ */
+describe('effortResolutionDiagnostic', () => {
+  const profile: EffortProfile = {
+    modelId: 'qwen3.8-max',
+    transport: 'anthropic-messages',
+    defaultLevel: null,
+    levels: [
+      { level: 'high', native: { kind: 'anthropic-thinking', thinking: { budget_tokens: 16_000, type: 'enabled' } } },
+      { level: 'max', native: { kind: 'anthropic-thinking', thinking: { budget_tokens: 31_999, type: 'enabled' } } },
+    ],
+  };
+  const emptyProfile: EffortProfile = { ...profile, levels: [] };
+
+  it('says nothing when the request was honoured exactly', () => {
+    expect(effortResolutionDiagnostic(resolveRequestEffort('max', profile), profile)).toBeUndefined();
+  });
+
+  it('says nothing when no effort was requested and none is declared', () => {
+    expect(effortResolutionDiagnostic(resolveRequestEffort(undefined, profile), profile)).toBeUndefined();
+  });
+
+  it('reports a rounded level with the ladder it rounded along', () => {
+    expect(effortResolutionDiagnostic(resolveRequestEffort('low', profile, 'up'), profile))
+      .toBe('requested=low resolved=high outcome=rounded-up supported=high|max');
+  });
+
+  it('reports saturation when rounding ran out of ladder', () => {
+    expect(effortResolutionDiagnostic(resolveRequestEffort('low', profile, 'down'), profile))
+      .toBe('requested=low resolved=high outcome=rounded-down saturated=true supported=high|max');
+  });
+
+  it('reports an omitted effort as the provider default', () => {
+    expect(effortResolutionDiagnostic(resolveRequestEffort('low', profile), profile))
+      .toBe('requested=low resolved=provider-default outcome=provider-default supported=high|max');
+  });
+
+  it('reports a route with no effort control at all', () => {
+    expect(effortResolutionDiagnostic(resolveRequestEffort('max', emptyProfile), emptyProfile))
+      .toBe('requested=max resolved=provider-default outcome=no-effort-control supported=none');
+  });
+
+  it('carries no identifying value in any outcome', () => {
+    // Model ids, request ids, session ids, headers and content are all absent
+    // by construction: only closed-vocabulary tokens appear.
+    const allowed = /^[a-z=|\- ]+$/;
+    for (const policy of UNSUPPORTED_EFFORT_POLICIES) {
+      if (policy === 'exact') continue;
+      for (const requested of CANONICAL_EFFORT_LEVELS) {
+        const line = effortResolutionDiagnostic(resolveRequestEffort(requested, profile, policy), profile);
+        if (line === undefined) continue;
+        expect(line, `${policy}/${requested}`).toMatch(allowed);
+        expect(line).not.toContain(profile.modelId);
+      }
+    }
   });
 });

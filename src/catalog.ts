@@ -161,7 +161,19 @@ export function buildCatalogRoutes(
     reservedSlots: 1,
   });
   const droppedFavorites: FavoriteModel[] = [];
+  // `addFavorite` refuses a duplicate, but the saved list is a plain config file
+  // a user can hand-edit. Two identical entries would otherwise resolve to two
+  // routes with the same alias id — one Claude Code row per copy, each pointing
+  // at the same model — so uniqueness is enforced where the routes are built
+  // rather than trusted from the file.
+  const seenFavorites = new Set<string>();
   const tail = projection.exposedFavorites
+    .filter(fav => {
+      const key = `${fav.providerId}::${fav.modelId}`;
+      if (seenFavorites.has(key)) return false;
+      seenFavorites.add(key);
+      return true;
+    })
     .map(fav => {
       const route = resolveRoute(fav.providerId, fav.modelId);
       if (!route) droppedFavorites.push(fav);

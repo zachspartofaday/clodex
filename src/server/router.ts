@@ -76,6 +76,7 @@ import { canonicalAnthropicBaseUrl } from '../registry/url-security.js';
 import {
   DEFAULT_UNSUPPORTED_EFFORT_POLICY,
   EffortResolutionError,
+  effortResolutionDiagnostic,
   nativeEffortLevel,
   resolveRequestEffort,
   type UnsupportedEffortPolicy,
@@ -346,18 +347,21 @@ async function handleAnthropicMessages(
     // policy applied to every other route and silently to none of these.
     let forwardBody: Record<string, unknown>;
     try {
+      const resolution = model.effortProfile
+        ? resolveRequestEffort(
+            anthropicEffortFromRequest(body as AnthropicRequest) ?? model.defaultEffort,
+            model.effortProfile,
+            options.effortPolicy ?? DEFAULT_UNSUPPORTED_EFFORT_POLICY,
+          )
+        : undefined;
+      if (model.effortProfile) {
+        // Only when the answer differed from the request: an effort that
+        // rounded or was dropped is otherwise invisible to the operator.
+        const diagnostic = effortResolutionDiagnostic(resolution, model.effortProfile);
+        if (diagnostic) plog(() => `effort-resolution ${diagnostic}`);
+      }
       forwardBody = {
-        ...applyAnthropicMessagesEffort(
-          body,
-          model.effortProfile,
-          model.effortProfile
-            ? resolveRequestEffort(
-                anthropicEffortFromRequest(body as AnthropicRequest) ?? model.defaultEffort,
-                model.effortProfile,
-                options.effortPolicy ?? DEFAULT_UNSUPPORTED_EFFORT_POLICY,
-              )
-            : undefined,
-        ),
+        ...applyAnthropicMessagesEffort(body, model.effortProfile, resolution),
         model: upstreamModelId(model),
       };
     } catch (err) {

@@ -73,6 +73,7 @@ import {
 import {
   DEFAULT_UNSUPPORTED_EFFORT_POLICY,
   EffortResolutionError,
+  effortResolutionDiagnostic,
   resolveRequestEffort,
   type EffortProfile,
   type UnsupportedEffortPolicy,
@@ -612,17 +613,24 @@ export async function startProxyCatalog(
         // so leaving it off here made the effort setting silently route-shaped.
         let forwardBody: Record<string, unknown>;
         try {
+          const resolution = route.effortProfile
+            ? resolveRequestEffort(
+                anthropicEffortFromRequest(anthropicBody),
+                route.effortProfile,
+                effortPolicy ?? DEFAULT_UNSUPPORTED_EFFORT_POLICY,
+              )
+            : undefined;
+          if (route.effortProfile) {
+            // Only when the answer differed from the request: an effort that
+            // rounded or was dropped is otherwise invisible to the operator.
+            const diagnostic = effortResolutionDiagnostic(resolution, route.effortProfile);
+            if (diagnostic) plog(() => `effort-resolution ${diagnostic}`);
+          }
           forwardBody = {
             ...applyAnthropicMessagesEffort(
               anthropicBody as unknown as Record<string, unknown>,
               route.effortProfile,
-              route.effortProfile
-                ? resolveRequestEffort(
-                    anthropicEffortFromRequest(anthropicBody),
-                    route.effortProfile,
-                    effortPolicy ?? DEFAULT_UNSUPPORTED_EFFORT_POLICY,
-                  )
-                : undefined,
+              resolution,
             ),
             model: route.realModelId,
           };

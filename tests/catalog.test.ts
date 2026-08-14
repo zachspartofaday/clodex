@@ -45,6 +45,34 @@ describe('buildCatalogRoutes', () => {
     expect(droppedFavorites).toEqual([{ providerId: 'zen', modelId: 'claude-sonnet-4' }]);
   });
 
+  it('builds one route per distinct favorite even when the saved list repeats one', () => {
+    // addFavorite refuses a duplicate, but the saved list is a hand-editable
+    // config file. Two copies would otherwise produce two identical Claude Code
+    // rows pointing at the same model.
+    const favorites: FavoriteModel[] = [
+      { providerId: 'provider', modelId: 'model-a' },
+      { providerId: 'provider', modelId: 'model-b' },
+      { providerId: 'provider', modelId: 'model-a' },
+    ];
+    const result = buildCatalogRoutes(
+      starting,
+      favorites,
+      (providerId, modelId) => ({
+        ...starting,
+        aliasId: `anthropic-${providerId}__${modelId}`,
+        realModelId: modelId,
+      }),
+      MAX_MODEL_CATALOG,
+    );
+
+    expect(result.routes.map(route => route.aliasId)).toEqual([
+      'claude-sonnet-4',
+      'anthropic-provider__model-a',
+      'anthropic-provider__model-b',
+    ]);
+    expect(result.droppedFavorites).toEqual([]);
+  });
+
   it('reserves the starting-model slot and reports capacity omissions in saved order', () => {
     const favorites = Array.from({ length: 5 }, (_, index) => ({
       providerId: 'provider',

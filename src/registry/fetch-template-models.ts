@@ -36,6 +36,23 @@ interface ProviderModelListRow {
   prefer_websockets?: boolean;
 }
 
+/**
+ * Keep the first occurrence and order of each provider-reported model id.
+ *
+ * Provider `/models` endpoints occasionally repeat an id. Persisting the
+ * duplicates makes the add/refresh counts disagree with every runtime surface,
+ * all of which key routes by id and so collapse them anyway — and puts a second
+ * identical row in the picker.
+ */
+export function dedupeCachedModels(models: CachedModel[]): CachedModel[] {
+  const seen = new Set<string>();
+  return models.filter(model => {
+    if (seen.has(model.id)) return false;
+    seen.add(model.id);
+    return true;
+  });
+}
+
 function modelFormatForNpm(npm: string): 'anthropic' | 'openai' {
   return npm === '@ai-sdk/anthropic' ? 'anthropic' : 'openai';
 }
@@ -240,7 +257,7 @@ export function applyTemplateModelMetadata(
     ? discovered.filter(model => curated.has(model.id))
     : discovered;
 
-  return visible.map(model => {
+  return dedupeCachedModels(visible).map(model => {
     const overlay = curated.get(model.id);
     if (!overlay) return model;
     return {

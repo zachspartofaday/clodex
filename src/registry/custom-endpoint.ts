@@ -16,6 +16,7 @@ import {
   withProviderMutationLock,
   withRegistryWriteLock,
 } from './lock.js';
+import { dedupeCachedModels } from './fetch-template-models.js';
 import type { CachedModel, RegistryProvider } from './types.js';
 import { customProviderId, isValidProviderId, slugifyProviderId } from './validate.js';
 import { canonicalAnthropicBaseUrl, validateCustomEndpointUrl } from './url-security.js';
@@ -129,7 +130,9 @@ export async function fetchAnthropicModels(
           apiUrl: root,
         });
       }
-      if (models.length > 0) return { models, baseUrl: root };
+      // Same reason as the template discovery path: an endpoint that repeats an
+      // id must not persist a second row every runtime surface then collapses.
+      if (models.length > 0) return { models: dedupeCachedModels(models), baseUrl: root };
     }
 
     if (response.status === 401 || response.status === 403) {

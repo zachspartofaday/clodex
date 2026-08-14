@@ -2,7 +2,12 @@ import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
 import { mkdtempSync, readFileSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { fetchTemplateModels } from '../src/registry/fetch-template-models.js';
+import {
+  applyTemplateModelMetadata,
+  dedupeCachedModels,
+  fetchTemplateModels,
+} from '../src/registry/fetch-template-models.js';
+import type { CachedModel } from '../src/registry/types.js';
 import { getTemplateById, type ProviderTemplate } from '../src/provider-templates.js';
 import { clearTraceSecrets, getProviderDebugLogPath } from '../src/trace-log.js';
 import {
@@ -504,5 +509,34 @@ describe('fetchTemplateModels fixed OpenCode Go destination', () => {
 
     expect(result.models).toEqual([]);
     expect(result.error).toBe('Connected but no models were returned.');
+  });
+});
+
+describe('dedupeCachedModels', () => {
+  const row = (id: string, name = id): CachedModel => ({ id, name });
+
+  it('keeps the first occurrence and the reported order', () => {
+    expect(dedupeCachedModels([row('b'), row('a'), row('b', 'second b'), row('c')]))
+      .toEqual([row('b'), row('a'), row('c')]);
+  });
+
+  it('returns an already-unique list unchanged', () => {
+    const models = [row('a'), row('b')];
+    expect(dedupeCachedModels(models)).toEqual(models);
+  });
+});
+
+describe('discovered model ids reach the cache exactly once', () => {
+  it('drops a repeated id from the template discovery projection', () => {
+    // Every runtime surface keys routes by id, so a persisted duplicate makes
+    // the reported model count disagree with what the user can actually select.
+    const template = { id: 'acme', name: 'Acme', npm: '@ai-sdk/openai-compatible' } as unknown as ProviderTemplate;
+    const applied = applyTemplateModelMetadata(template, [
+      { id: 'one', name: 'One' },
+      { id: 'two', name: 'Two' },
+      { id: 'one', name: 'One again' },
+    ]);
+    expect(applied.map(model => model.id)).toEqual(['one', 'two']);
+    expect(applied[0]!.name).toBe('One');
   });
 });

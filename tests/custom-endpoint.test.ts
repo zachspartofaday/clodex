@@ -24,7 +24,10 @@ vi.mock('../src/env.js', async importOriginal => ({
   provisionProviderCredential: vi.fn(),
   saveProviderCredential: vi.fn(),
 }));
-vi.mock('../src/registry/fetch-template-models.js', () => ({
+vi.mock('../src/registry/fetch-template-models.js', async importOriginal => ({
+  // Keep the real dedupe: custom-endpoint discovery depends on it, and a stub
+  // would let a duplicate id through in tests while the real path drops it.
+  ...await importOriginal<typeof import('../src/registry/fetch-template-models.js')>(),
   fetchTemplateModels: vi.fn(),
 }));
 vi.mock('../src/registry/io.js', () => ({
