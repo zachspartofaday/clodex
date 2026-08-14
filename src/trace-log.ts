@@ -270,7 +270,13 @@ export type InferenceTerminalCategory =
   | 'total_timeout'
   | 'local_adapter_exception'
   | 'upstream_error'
-  | 'error_sse';
+  | 'error_sse'
+  | 'incomplete_sse';
+
+export type InferenceObservationGap =
+  | 'unsupported_encoding'
+  | 'oversized_sse_block'
+  | 'decoder_error';
 
 export interface InferenceResponseLifecycleLogEntry {
   event: InferenceResponseLifecycleEvent;
@@ -304,6 +310,7 @@ export interface InferenceResponseLifecycleLogEntry {
   terminationSource?: InferenceTerminationSource;
   terminalOutcome?: InferenceTerminalOutcome;
   terminalCategory?: InferenceTerminalCategory;
+  observationGap?: InferenceObservationGap;
   elapsedMs?: number;
   limitMs?: number;
   outputBegan?: boolean;
@@ -530,6 +537,7 @@ export function writeInferenceResponseLifecycleLog(
     ...(entry.terminationSource ? { terminationSource: entry.terminationSource } : {}),
     ...(entry.terminalOutcome ? { terminalOutcome: entry.terminalOutcome } : {}),
     ...(entry.terminalCategory ? { terminalCategory: entry.terminalCategory } : {}),
+    ...(entry.observationGap ? { observationGap: entry.observationGap } : {}),
     ...(elapsedMs !== undefined ? { elapsedMs } : {}),
     ...(limitMs !== undefined ? { limitMs } : {}),
     ...(entry.outputBegan !== undefined ? { outputBegan: entry.outputBegan } : {}),

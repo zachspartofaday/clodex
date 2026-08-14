@@ -53,6 +53,23 @@ const ERROR_SSE_BARE_CR = [
   '',
 ].join('\r');
 const ERROR_SSE_CRLF = ERROR_SSE.replace(/\n/g, '\r\n');
+const INCOMPLETE_SSE = [
+  'event: message_start',
+  'data: {"type":"message_start","message":{"usage":{"input_tokens":1,"output_tokens":0}}}',
+  '',
+  'event: message_delta',
+  'data: {"type":"message_delta","delta":{"stop_reason":"end_turn"},"usage":{"input_tokens":1,"output_tokens":1}}',
+  '',
+  '',
+].join('\n');
+const ERROR_SSE_WITH_MESSAGE_STOP = [
+  ERROR_SSE.replace(/\n+$/, ''),
+  '',
+  'event: message_stop',
+  'data: {"type":"message_stop"}',
+  '',
+  '',
+].join('\n');
 const compressedSseLifecycleCases = [
   { encodingName: 'gzip', contentEncoding: 'gzip', encode: gzipSync },
   { encodingName: 'deflate', contentEncoding: 'deflate', encode: deflateSync },
@@ -296,6 +313,84 @@ async function adapterResponseFailureEntries(
   }
 }
 
+async function runSseLifecycleCase(
+  logName: string,
+  routeKind: 'passthrough' | 'translated',
+  sse: string,
+  headers: Record<string, string> = {},
+): Promise<{ response: Buffer; entries: Array<Record<string, unknown>> }> {
+  const certificates = ensureHttpProxyCertificates();
+  const inferenceLogPath = join(testHome, logName);
+  rmSync(inferenceLogPath, { force: true });
+  const responseHeaders = {
+    'Content-Type': 'text/event-stream',
+    'Connection': 'close',
+    ...headers,
+  };
+  const origin = routeKind === 'passthrough'
+    ? https.createServer({ key: certificates.serverKey, cert: certificates.serverCert }, async (req, res) => {
+        req.resume();
+        await once(req, 'end');
+        res.writeHead(200, responseHeaders);
+        res.end(sse);
+      })
+    : undefined;
+  const adapter = routeKind === 'translated'
+    ? http.createServer(async (req, res) => {
+        req.resume();
+        await once(req, 'end');
+        res.writeHead(200, responseHeaders);
+        res.end(sse);
+      })
+    : undefined;
+  const originPort = origin ? await listen(origin) : undefined;
+  const adapterPort = adapter ? await listen(adapter) : undefined;
+  const proxy = await startHttpProxy({
+    routes: routeKind === 'translated' ? [TRANSLATED_ROUTE] : [],
+    ...(routeKind === 'translated'
+      ? {
+          adapterHandle: {
+            port: adapterPort!,
+            token: 'adapter-local-token',
+            close: () => {
+              adapter.closeAllConnections();
+              adapter.close();
+            },
+          },
+        }
+      : {}),
+    inferenceLogPath,
+    ...(originPort !== undefined
+      ? {
+          anthropicOrigin: `https://127.0.0.1:${originPort}`,
+          anthropicRejectUnauthorized: false,
+        }
+      : {}),
+  });
+
+  try {
+    const model = routeKind === 'translated' ? TRANSLATED_ROUTE.aliasId : 'claude-sonnet-4-6';
+    const response = await requestMitmBuffer(
+      proxy.port,
+      certificates.caCert,
+      '/v1/messages',
+      JSON.stringify({ model, messages: [{ role: 'user', content: 'synthetic SSE lifecycle' }], stream: true }),
+    );
+    await vi.waitFor(() => {
+      const entries = readFileSync(inferenceLogPath, 'utf8').trim().split('\n')
+        .map(line => JSON.parse(line) as Record<string, unknown>);
+      expect(entries.filter(entry => entry.event === 'response_failed' || entry.event === 'response_completed'))
+        .toHaveLength(1);
+    });
+    const entries = readFileSync(inferenceLogPath, 'utf8').trim().split('\n')
+      .map(line => JSON.parse(line) as Record<string, unknown>);
+    return { response, entries };
+  } finally {
+    await proxy.close();
+    if (origin) await new Promise<void>(resolve => origin.close(() => resolve()));
+  }
+}
+
 beforeAll(() => {
   process.env['CLODEX_HOME'] = testHome;
 });
@@ -395,6 +490,9 @@ describe('selective HTTP proxy', () => {
         '',
         'event: message_delta',
         'data: {"type":"message_delta","delta":{"stop_reason":"end_turn"},"usage":{"input_tokens":19,"output_tokens":8,"cache_creation_input_tokens":100,"cache_read_input_tokens":220}}',
+        '',
+        'event: message_stop',
+        'data: {"type":"message_stop"}',
         '',
         '',
       ].join('\n');
@@ -2092,6 +2190,89 @@ describe('selective HTTP proxy', () => {
       }
     },
     20_000,
+  );
+
+  const observedSseLifecycleCases = [
+    {
+      name: 'incomplete SSE at EOF',
+      sse: INCOMPLETE_SSE,
+      headers: {},
+      expected: {
+        event: 'response_failed',
+        terminalOutcome: 'error',
+        terminalCategory: 'incomplete_sse',
+        terminationSource: 'upstream_failure',
+      },
+    },
+    {
+      name: 'mixed-case content type error SSE',
+      sse: ERROR_SSE,
+      headers: { 'Content-Type': 'Text/Event-Stream' },
+      expected: {
+        event: 'response_failed',
+        terminalOutcome: 'error',
+        terminalCategory: 'error_sse',
+        terminationSource: 'upstream_failure',
+      },
+    },
+    {
+      name: 'error SSE without a trailing blank line',
+      sse: ERROR_SSE.replace(/\n+$/, ''),
+      headers: {},
+      expected: {
+        event: 'response_failed',
+        terminalOutcome: 'error',
+        terminalCategory: 'error_sse',
+        terminationSource: 'upstream_failure',
+      },
+    },
+    {
+      name: 'unsupported encoding success SSE',
+      sse: SUCCESS_SSE,
+      headers: { 'Content-Encoding': 'zstd' },
+      expected: {
+        event: 'response_completed',
+        observationGap: 'unsupported_encoding',
+      },
+    },
+    {
+      name: 'error SSE takes precedence over message_stop',
+      sse: ERROR_SSE_WITH_MESSAGE_STOP,
+      headers: {},
+      expected: {
+        event: 'response_failed',
+        terminalOutcome: 'error',
+        terminalCategory: 'error_sse',
+        terminationSource: 'upstream_failure',
+      },
+    },
+  ] as const;
+
+  it.each(observedSseLifecycleCases)(
+    'classifies $name once on passthrough and translated routes',
+    async ({ sse, headers, expected }) => {
+      for (const routeKind of ['passthrough', 'translated'] as const) {
+        const { response, entries } = await runSseLifecycleCase(
+          `${routeKind}-${expected.event}-${expected.observationGap ?? expected.terminalCategory}.jsonl`,
+          routeKind,
+          sse,
+          headers,
+        );
+        expect(response.toString()).toContain(sse);
+        const terminals = entries.filter(entry =>
+          entry.event === 'response_failed' || entry.event === 'response_completed');
+        expect(terminals).toHaveLength(1);
+        expect(terminals[0]).toMatchObject({
+          route: routeKind,
+          statusCode: 200,
+          ...expected,
+        });
+        if (expected.event === 'response_completed') {
+          expect(terminals[0]).not.toHaveProperty('terminalOutcome');
+          expect(terminals[0]).not.toHaveProperty('terminalCategory');
+        }
+      }
+    },
   );
 
   it('terminates and logs a translated response when the adapter closes before end', async () => {

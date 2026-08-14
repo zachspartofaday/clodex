@@ -38,6 +38,7 @@ import {
   writeInferenceResponseErrorLog,
   writeWebSocketDiagnosticRequestLog,
   type InferenceFailureSource,
+  type InferenceObservationGap,
   type InferenceResponsePhase,
 } from '../trace-log.js';
 
@@ -59,9 +60,16 @@ type ResponseUsage = {
  * Nothing about the HTTP exchange marks this as a failure, so without observing
  * the decoded event body the request would be recorded as completed.
  */
-type ResponseTerminal = {
-  terminalOutcome: 'error';
-  terminalCategory: 'error_sse';
+type ResponseTerminal = 'error_sse' | 'success';
+
+type ResponseObservation = {
+  ran: boolean;
+  gap?: InferenceObservationGap;
+};
+
+type ResponseSseCapture = {
+  write: (chunk: Buffer) => void;
+  flush: () => void;
 };
 
 function numericUsage(value: unknown): number | undefined {
@@ -110,9 +118,10 @@ function responseTerminalFromSseBlock(block: string): ResponseTerminal | undefin
 
   try {
     const parsed = JSON.parse(data) as Record<string, unknown>;
-    return parsed.type === 'error' && (!event || event === 'error')
-      ? { terminalOutcome: 'error', terminalCategory: 'error_sse' }
-      : undefined;
+    if (event && event !== parsed.type) return undefined;
+    if (parsed.type === 'error') return 'error_sse';
+    if (parsed.type === 'message_stop') return 'success';
+    return undefined;
   } catch {
     return undefined;
   }
@@ -121,14 +130,27 @@ function responseTerminalFromSseBlock(block: string): ResponseTerminal | undefin
 function createResponseSseCapture(
   onUsage?: (usage: ResponseUsage) => void,
   onTerminal?: (terminal: ResponseTerminal) => void,
-): (chunk: Buffer) => void {
+  onObservationGap?: (gap: InferenceObservationGap) => void,
+): ResponseSseCapture {
   let buffered = '';
   const decoder = new StringDecoder('utf8');
   let previousWasCr = false;
+  let flushed = false;
 
-  return chunk => {
+  const processBlock = (block: string) => {
+    if (Buffer.byteLength(block) > MAX_USAGE_SSE_BLOCK_BYTES) {
+      onObservationGap?.('oversized_sse_block');
+      return;
+    }
+    const usage = onUsage ? responseUsageFromSseBlock(block) : undefined;
+    if (usage) onUsage?.(usage);
+    const terminal = onTerminal ? responseTerminalFromSseBlock(block) : undefined;
+    if (terminal) onTerminal?.(terminal);
+  };
+
+  const appendText = (text: string) => {
     let normalized = '';
-    for (const character of decoder.write(chunk)) {
+    for (const character of text) {
       if (character === '\r') {
         normalized += '\n';
         previousWasCr = true;
@@ -145,16 +167,29 @@ function createResponseSseCapture(
     while ((boundary = buffered.indexOf('\n\n')) >= 0) {
       const block = buffered.slice(0, boundary);
       buffered = buffered.slice(boundary + 2);
-      if (Buffer.byteLength(block) > MAX_USAGE_SSE_BLOCK_BYTES) continue;
-      const usage = onUsage ? responseUsageFromSseBlock(block) : undefined;
-      if (usage) onUsage?.(usage);
-      const terminal = onTerminal ? responseTerminalFromSseBlock(block) : undefined;
-      if (terminal) onTerminal?.(terminal);
+      processBlock(block);
     }
 
     // Observed events are tiny. Drop an oversized unterminated event rather than
     // retaining arbitrary streamed response content in this observer.
-    if (Buffer.byteLength(buffered) > MAX_USAGE_SSE_BLOCK_BYTES) buffered = '';
+    if (Buffer.byteLength(buffered) > MAX_USAGE_SSE_BLOCK_BYTES) {
+      onObservationGap?.('oversized_sse_block');
+      buffered = '';
+    }
+  };
+
+  return {
+    write: chunk => {
+      if (!flushed) appendText(decoder.write(chunk));
+    },
+    flush: () => {
+      if (flushed) return;
+      flushed = true;
+      appendText(decoder.end());
+      if (buffered.length === 0) return;
+      processBlock(buffered);
+      buffered = '';
+    },
   };
 }
 
@@ -169,14 +204,31 @@ function observeResponseSse(
   contentEncoding: string | string[] | undefined,
   onUsage?: (usage: ResponseUsage) => void,
   onTerminal?: (terminal: ResponseTerminal) => void,
+  onObservation?: (observation: ResponseObservation) => void,
 ): Promise<void> | undefined {
+  let reported = false;
+  const reportObservation = (observation: ResponseObservation) => {
+    if (reported) return;
+    reported = true;
+    onObservation?.(observation);
+  };
   const encoding = (Array.isArray(contentEncoding) ? contentEncoding[0] : contentEncoding)
     ?.trim()
     .toLowerCase();
   if (!encoding || encoding === 'identity') {
-    const capture = createResponseSseCapture(onUsage, onTerminal);
-    upstream.on('data', capture);
-    upstream.once('end', () => upstream.off('data', capture));
+    let observationGap: InferenceObservationGap | undefined;
+    const capture = createResponseSseCapture(
+      onUsage,
+      onTerminal,
+      gap => { observationGap ??= gap; },
+    );
+    const finishObservation = () => {
+      upstream.off('data', capture.write);
+      capture.flush();
+      reportObservation({ ran: true, ...(observationGap ? { gap: observationGap } : {}) });
+    };
+    upstream.on('data', capture.write);
+    upstream.once('end', finishObservation);
     return undefined;
   }
 
@@ -187,25 +239,39 @@ function observeResponseSse(
       : encoding === 'deflate'
         ? createInflate()
         : undefined;
-  if (!decoder) return undefined;
+  if (!decoder) {
+    reportObservation({ ran: false, gap: 'unsupported_encoding' });
+    return undefined;
+  }
 
   return new Promise(resolve => {
+    let observationGap: InferenceObservationGap | undefined;
+    let settled = false;
     const onCompressedData = (chunk: Buffer) => {
       if (!decoder.destroyed) decoder.write(chunk);
     };
     const onCompressedEnd = () => {
       if (!decoder.destroyed) decoder.end();
     };
-    const cleanup = () => {
+    const capture = createResponseSseCapture(
+      onUsage,
+      onTerminal,
+      gap => { observationGap ??= gap; },
+    );
+    const cleanup = (gap?: InferenceObservationGap) => {
+      if (settled) return;
+      settled = true;
       upstream.off('data', onCompressedData);
       upstream.off('end', onCompressedEnd);
+      capture.flush();
       decoder.destroy();
+      const finalGap = gap ?? observationGap;
+      reportObservation({ ran: true, ...(finalGap ? { gap: finalGap } : {}) });
       resolve();
     };
-    const capture = createResponseSseCapture(onUsage, onTerminal);
-    decoder.on('data', capture);
-    decoder.once('error', cleanup);
-    decoder.once('end', cleanup);
+    decoder.on('data', capture.write);
+    decoder.once('error', () => cleanup('decoder_error'));
+    decoder.once('end', () => cleanup());
     upstream.on('data', onCompressedData);
     upstream.once('end', onCompressedEnd);
   });
@@ -290,21 +356,23 @@ function copyResponse(
   onErrorResponse?: (statusCode: number, body: string) => void,
   onResponseUsage?: (usage: ResponseUsage) => void,
   onResponseTerminal?: (terminal: ResponseTerminal) => void,
+  onResponseObservation?: (observation: ResponseObservation) => void,
 ): Promise<void> | undefined {
   const statusCode = upstream.statusCode ?? 502;
   const contentType = upstream.headers['content-type'];
   let responseInspection: Promise<void> | undefined;
   if (
     statusCode < 400
-    && (onResponseUsage || onResponseTerminal)
+    && (onResponseUsage || onResponseTerminal || onResponseObservation)
     && typeof contentType === 'string'
-    && contentType.includes('text/event-stream')
+    && contentType.toLowerCase().includes('text/event-stream')
   ) {
     responseInspection = observeResponseSse(
       upstream,
       upstream.headers['content-encoding'],
       onResponseUsage,
       onResponseTerminal,
+      onResponseObservation,
     );
   }
   const errorChunks: Buffer[] = [];
@@ -382,6 +450,7 @@ function forwardRawAnthropicRequest(
     let failed = false;
     let clientDisconnected = false;
     let responseTerminal: ResponseTerminal | undefined;
+    let responseObservation: ResponseObservation | undefined;
     let responseInspection: Promise<void> | undefined;
     const writeLifecycle = (
       event: Parameters<typeof writeInferenceResponseLifecycleLog>[1]['event'],
@@ -460,7 +529,12 @@ function forwardRawAnthropicRequest(
         res,
         onErrorResponse,
         onResponseUsage,
-        lifecycle ? terminal => { responseTerminal ??= terminal; } : undefined,
+        lifecycle
+          ? terminal => {
+              if (terminal === 'error_sse' || responseTerminal === undefined) responseTerminal = terminal;
+            }
+          : undefined,
+        lifecycle ? observation => { responseObservation ??= observation; } : undefined,
       );
       upstreamRes.once('end', () => {
         responseEnded = true;
@@ -494,7 +568,7 @@ function forwardRawAnthropicRequest(
       const classifyResponse = () => {
         if (failed || clientDisconnected) return;
         const now = Date.now();
-        if (responseTerminal) {
+        if (responseTerminal === 'error_sse') {
           failed = true;
           writeLifecycle('response_failed', {
             statusCode,
@@ -502,7 +576,33 @@ function forwardRawAnthropicRequest(
             ...(firstByteAt !== undefined ? { timeToFirstByteMs: firstByteAt - startedAt } : {}),
             bytes,
             chunks,
-            ...responseTerminal,
+            terminalOutcome: 'error',
+            terminalCategory: 'error_sse',
+            terminationSource: 'upstream_failure',
+          });
+          return;
+        }
+        if (responseObservation?.gap) {
+          writeLifecycle('response_completed', {
+            statusCode,
+            durationMs: now - startedAt,
+            ...(firstByteAt !== undefined ? { timeToFirstByteMs: firstByteAt - startedAt } : {}),
+            bytes,
+            chunks,
+            observationGap: responseObservation.gap,
+          });
+          return;
+        }
+        if (responseObservation?.ran && responseTerminal !== 'success') {
+          failed = true;
+          writeLifecycle('response_failed', {
+            statusCode,
+            durationMs: now - startedAt,
+            ...(firstByteAt !== undefined ? { timeToFirstByteMs: firstByteAt - startedAt } : {}),
+            bytes,
+            chunks,
+            terminalOutcome: 'error',
+            terminalCategory: 'incomplete_sse',
             terminationSource: 'upstream_failure',
           });
           return;
@@ -596,6 +696,7 @@ function forwardToAdapter(
     let failed = false;
     let clientDisconnected = false;
     let responseTerminal: ResponseTerminal | undefined;
+    let responseObservation: ResponseObservation | undefined;
     let responseInspection: Promise<void> | undefined;
     let adapterResponse: http.IncomingMessage | undefined;
     let upstream: http.ClientRequest | undefined;
@@ -644,7 +745,7 @@ function forwardToAdapter(
       const classifyResponse = () => {
         if (failed || clientDisconnected) return;
         const now = Date.now();
-        if (responseTerminal) {
+        if (responseTerminal === 'error_sse') {
           failed = true;
           writeLifecycle('response_failed', {
             statusCode,
@@ -652,7 +753,33 @@ function forwardToAdapter(
             ...(firstByteAt !== undefined ? { timeToFirstByteMs: firstByteAt - startedAt } : {}),
             bytes,
             chunks,
-            ...responseTerminal,
+            terminalOutcome: 'error',
+            terminalCategory: 'error_sse',
+            terminationSource: 'upstream_failure',
+          });
+          return;
+        }
+        if (responseObservation?.gap) {
+          writeLifecycle('response_completed', {
+            statusCode,
+            durationMs: now - startedAt,
+            ...(firstByteAt !== undefined ? { timeToFirstByteMs: firstByteAt - startedAt } : {}),
+            bytes,
+            chunks,
+            observationGap: responseObservation.gap,
+          });
+          return;
+        }
+        if (responseObservation?.ran && responseTerminal !== 'success') {
+          failed = true;
+          writeLifecycle('response_failed', {
+            statusCode,
+            durationMs: now - startedAt,
+            ...(firstByteAt !== undefined ? { timeToFirstByteMs: firstByteAt - startedAt } : {}),
+            bytes,
+            chunks,
+            terminalOutcome: 'error',
+            terminalCategory: 'incomplete_sse',
             terminationSource: 'upstream_failure',
           });
           return;
@@ -770,7 +897,12 @@ function forwardToAdapter(
         res,
         undefined,
         lifecycle ? usage => writeLifecycle('response_usage', usage) : undefined,
-        lifecycle ? terminal => { responseTerminal ??= terminal; } : undefined,
+        lifecycle
+          ? terminal => {
+              if (terminal === 'error_sse' || responseTerminal === undefined) responseTerminal = terminal;
+            }
+          : undefined,
+        lifecycle ? observation => { responseObservation ??= observation; } : undefined,
       );
       const failAdapterResponse = (
         err: Error,
