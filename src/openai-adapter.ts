@@ -158,6 +158,18 @@ export function translateOpenAiRequest(
 
 // ── Translation: SDK Response → OpenAI JSON / SSE ───────────────────────────
 
+function requireOpenAiTerminalFinish(
+  part: { finishReason?: unknown; rawFinishReason?: unknown } | undefined,
+): string {
+  if (
+    typeof part?.finishReason !== 'string'
+    || (part.finishReason === 'other' && part.rawFinishReason === undefined)
+  ) {
+    throw new Error('Upstream OpenAI stream ended without a terminal event');
+  }
+  return part.finishReason;
+}
+
 export interface CollectedOpenAiStream {
   text: string;
   toolCalls: Array<{ toolCallId: string; toolName: string; input: unknown }>;
@@ -168,6 +180,7 @@ export interface CollectedOpenAiStream {
 /** Reduce an SDK full stream into the fields a non-streaming chat completion needs. */
 export async function collectOpenAiStream(stream: AsyncIterable<unknown>): Promise<CollectedOpenAiStream> {
   const collected: CollectedOpenAiStream = { text: '', toolCalls: [], finishReason: undefined, usage: undefined };
+  let finishPart: { finishReason?: unknown; rawFinishReason?: unknown; totalUsage?: CollectedOpenAiStream['usage']; usage?: CollectedOpenAiStream['usage'] } | undefined;
   for await (const part of stream) {
     const p = part as any;
     switch (p.type) {
@@ -182,8 +195,7 @@ export async function collectOpenAiStream(stream: AsyncIterable<unknown>): Promi
         });
         break;
       case 'finish':
-        collected.finishReason = p.finishReason ?? collected.finishReason;
-        collected.usage = p.totalUsage ?? p.usage ?? collected.usage;
+        finishPart = p;
         break;
       case 'error':
         throw p.error instanceof Error || (p.error && typeof p.error === 'object')
@@ -191,6 +203,8 @@ export async function collectOpenAiStream(stream: AsyncIterable<unknown>): Promi
           : new Error(typeof p.error === 'string' ? p.error : 'Upstream stream failed');
     }
   }
+  collected.finishReason = requireOpenAiTerminalFinish(finishPart);
+  collected.usage = finishPart?.totalUsage ?? finishPart?.usage;
   return collected;
 }
 
@@ -266,6 +280,7 @@ export async function streamOpenAiResponse(
 
   const send = (delta: Record<string, any>, finish_reason: string | null = null) =>
     onChunk(`data: ${JSON.stringify({ ...baseData, choices: [{ index: 0, delta, finish_reason }] })}\n\n`);
+  let finishPart: { finishReason?: unknown; rawFinishReason?: unknown } | undefined;
 
   for await (const part of stream) {
     const p = part as any;
@@ -280,7 +295,7 @@ export async function streamOpenAiResponse(
         send({ tool_calls: [{ index: 0, function: { arguments: p.delta ?? p.text ?? p.argsTextDelta ?? '' } }] });
         break;
       case 'finish':
-        send({}, p.finishReason || 'stop');
+        finishPart = p;
         break;
       case 'error':
         throw p.error instanceof Error || (p.error && typeof p.error === 'object')
@@ -289,5 +304,6 @@ export async function streamOpenAiResponse(
     }
   }
 
+  send({}, requireOpenAiTerminalFinish(finishPart));
   onChunk('data: [DONE]\n\n');
 }

@@ -105,6 +105,45 @@ describe('streamOpenAiResponse', () => {
     expect(output).toContain('partial');
     expect(output).not.toContain('[DONE]');
   });
+
+  it('rejects a synthesized finish after the upstream stream ends without a terminal event', async () => {
+    async function* stream() {
+      yield { type: 'text-delta', text: 'partial' };
+      yield { type: 'finish', finishReason: 'other', rawFinishReason: undefined };
+    }
+    vi.mocked(streamText).mockReturnValue({ stream: stream() } as never);
+    let output = '';
+
+    await expect(streamOpenAiResponse(
+      {} as never,
+      { messages: [] },
+      'gpt-test',
+      chunk => { output += chunk; },
+    )).rejects.toThrow('Upstream OpenAI stream ended without a terminal event');
+
+    expect(output).toContain('partial');
+    expect(output).not.toContain('"finish_reason":"other"');
+    expect(output).not.toContain('[DONE]');
+  });
+
+  it('accepts a provider-defined other finish reason', async () => {
+    async function* stream() {
+      yield { type: 'text-delta', text: 'complete' };
+      yield { type: 'finish', finishReason: 'other', rawFinishReason: 'provider-defined' };
+    }
+    vi.mocked(streamText).mockReturnValue({ stream: stream() } as never);
+    let output = '';
+
+    await streamOpenAiResponse(
+      {} as never,
+      { messages: [] },
+      'gpt-test',
+      chunk => { output += chunk; },
+    );
+
+    expect(output).toContain('"finish_reason":"other"');
+    expect(output).toContain('[DONE]');
+  });
 });
 
 describe('translateOpenAiRequest OAuth shaping', () => {
@@ -193,6 +232,16 @@ describe('collectOpenAiStream', () => {
     expect(collected.usage).toEqual({ inputTokens: 11, outputTokens: 7, totalTokens: 18 });
   });
 
+  it.each(['length', 'content-filter'])('accepts a genuine %s finish reason', async finishReason => {
+    async function* stream() {
+      yield { type: 'text-delta', text: 'complete' };
+      yield { type: 'finish', finishReason };
+    }
+
+    await expect(collectOpenAiStream(stream()))
+      .resolves.toMatchObject({ text: 'complete', finishReason });
+  });
+
   it('propagates an SDK error part instead of returning a partial result', async () => {
     const upstreamError = { statusCode: 500, message: 'upstream exploded' };
     async function* stream() {
@@ -201,6 +250,15 @@ describe('collectOpenAiStream', () => {
     }
 
     await expect(collectOpenAiStream(stream())).rejects.toBe(upstreamError);
+  });
+
+  it('rejects EOF without a finish event instead of returning partial output', async () => {
+    async function* stream() {
+      yield { type: 'text-delta', text: 'partial' };
+    }
+
+    await expect(collectOpenAiStream(stream()))
+      .rejects.toThrow('Upstream OpenAI stream ended without a terminal event');
   });
 });
 
@@ -234,6 +292,21 @@ describe('generateOpenAiResponse with forceStream', () => {
       finish_reason: 'stop',
     }]);
     expect(response.usage).toEqual({ prompt_tokens: 3, completion_tokens: 2, total_tokens: 5 });
+  });
+
+  it('rejects a partial force-stream response with only a synthesized finish', async () => {
+    async function* stream() {
+      yield { type: 'text-delta', text: 'partial' };
+      yield { type: 'finish', finishReason: 'other', rawFinishReason: undefined };
+    }
+    vi.mocked(streamText).mockReturnValue({ stream: stream() } as never);
+
+    await expect(generateOpenAiResponse(
+      {} as never,
+      { messages: [] },
+      'gpt-test',
+      { forceStream: true },
+    )).rejects.toThrow('Upstream OpenAI stream ended without a terminal event');
   });
 
   it('uses a non-streaming upstream request when forceStream is not set', async () => {
