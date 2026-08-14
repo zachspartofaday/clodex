@@ -129,9 +129,12 @@ tweakcc's own repack reads back as an ordinary module name.
 - **PATCH 8d/8e preserve exact sparse effort lists.** Claude Code 2.1.228/229 split the retained
   five-level ladder declaration from its assignment and retain another lookalike ladder. Discovery
   selects only one binding carrying exactly one helper and two metadata consumers, with a 4096-byte
-  bounded assignment-prefix scan; missing, duplicate, or mismatched topology fails both optional
-  sites closed. The injected tables use the same saved alias/key order as PATCH 8a/8b/8c/9, and
-  built-in postcondition proofs retain the declaration, assignment, helper, and both consumers.
+  bounded assignment-prefix scan. PATCH 7 emits no result without context keys; PATCH 8d/8e emit no
+  result without the native effort ladder. If the construct is present but its topology is missing,
+  duplicated, or mismatched, 8d/8e report FAIL with `effort ladder topology matched N times
+  (expected 1)` and do not block publication because PATCH 8a/8b/8c carry the observable effort
+  ladder. The injected tables use the same saved alias/key order as PATCH 8a/8b/8c/9, and built-in
+  postcondition proofs retain the declaration, assignment, helper, and both consumers.
 - **PATCH 10 isolates proxy-mode bridge settings from standard child commands.**
   `computeWrapperEnv()` and `buildHttpProxyChildEnv()` write `CLAUDE_CODE_CLODEX_NETWORK_ENV`, a
   versioned compare-before-revert contract holding the external and injected values for the proxy
@@ -154,11 +157,12 @@ tweakcc's own repack reads back as an ordinary module name.
   mutation check (see `.claude/skills/pr-verification/SKILL.md`).
 - **Never patch on top of a patch, and never publish a partial patch.** `applyPatch` never writes
   the live binary in place. It builds into a *candidate* inside a sibling temp dir
-  (`.clodex-patch-*`, removed in a `finally`) and `renameSync`s it over the binary only after every
-  *required* site applied and the repack succeeded (PATCH 4 and 5 are `required:false` and may FAIL
-  without blocking) — which is what makes the "required effort patches failed" throw (PATCH
-  8a/8b/8c/9) safe: the install is still whole. Before that rename, publication keeps an
-  independently named hardlink rescue of the live binary until manifest publication succeeds or
+  (`.clodex-patch-*`, removed in a `finally`) and `renameSync`s it over the binary only after the
+  repack succeeds and publication is not blocked by required results: PATCH 1/3/6/7/10 use
+  `required:true`, the `requiredEffortPatchFailures` gate covers PATCH 8a/8b/8c/9, and config
+  validation throws `PatchApplyError`. PATCH 4/5/8d/8e may FAIL and still publish; a failed local
+  patch set is discarded while the complete built-ins publish. Before that rename, publication keeps
+  an independently named hardlink rescue of the live binary until manifest publication succeeds or
   rollback definitely succeeds. If both publication and rollback fail, the rescue remains and the
   error reports its path and instructs the operator to rename it over the live binary before
   rerunning `clodex patch`. Individual live-binary publication is atomic, but there is no durable
@@ -219,13 +223,17 @@ tweakcc's own repack reads back as an ordinary module name.
   `~/.tweakcc/native-binary.backup` is still mirrored from the pristine bytes for `tweakcc
   --restore`.
 - **`clodex patch --restore` must work on a binary that no longer runs** — that is what a pristine
-  backup is *for*. It resolves the version from `claude --version` when it can, and otherwise falls
-  back to the manifest's `claudeVersion` when `manifest.binaryPath` matches the resolved install,
-  establishing provenance without executing anything. The restore removes the manifest after the
-  binary rename; ENOENT is normal, but any other cleanup failure is reported as a partial/divergent
-  completion. Manually remove the stale `~/.clodex/patch-state.json` manifest before rerunning
-  `clodex patch`. The patch path keeps the hard `version-unknown` failure (patching is elective;
-  restoring is the way out), and its error message names `--restore` as the recovery.
+  backup is *for*. Restore holds `~/.clodex/patch.lock` across planning, publication, and manifest
+  cleanup, so it cannot race with patching. It resolves the version from `claude --version` when it
+  can, and otherwise falls back to the manifest's `claudeVersion` when `manifest.binaryPath` matches
+  the resolved install, establishing provenance without executing anything. When the version is
+  probed but this install has no matching manifest, a version-tagged pristine backup is selected by
+  version alone. After the binary rename, the manifest is removed only when it is null or its
+  `binaryPath` matches this install; an other-install manifest is warned about and left in place.
+  ENOENT is normal, but any other cleanup failure is reported as a partial/divergent completion.
+  Manually remove the stale `~/.clodex/patch-state.json` manifest before rerunning `clodex patch`.
+  The patch path keeps the hard `version-unknown` failure (patching is elective; restoring is the way
+  out), and its error message names `--restore` as the recovery.
 - **Binary resolution bypasses PATH shims** (cmux installs a shim copy):
   `TWEAKCC_CC_INSTALLATION_PATH` → `~/.local/bin/claude` → `findClaudeBinary()`. **The version is
   probed from that resolved binary** (`getClaudeVersionForBinary`), never from
