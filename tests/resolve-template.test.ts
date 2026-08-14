@@ -2,6 +2,7 @@ import { describe, it, expect } from 'vitest';
 import {
   effectiveProviderBaseUrl,
   isProviderConfiguredForTemplate,
+  ownsItsCredentialDestination,
   isRetainedOpenCodeGoProvider,
   resolveProviderTemplate,
 } from '../src/registry/resolve-template.js';
@@ -69,5 +70,33 @@ describe('effectiveProviderBaseUrl', () => {
       api: { npm: '@ai-sdk/anthropic' },
     });
     expect(effectiveProviderBaseUrl(provider)).toBe('https://api.anthropic.com');
+  });
+
+  it.each<[string, string | null | undefined]>([
+    ['missing', undefined],
+    ['null', null],
+    ['empty', ''],
+    ['whitespace', '   '],
+  ])('does not use the Anthropic npm fallback for custom providers with %s URLs', (_label, url) => {
+    const provider = stub({
+      id: 'custom-anthropic-test',
+      templateId: 'custom-anthropic',
+      api: { npm: '@ai-sdk/anthropic' },
+    });
+    if (url === undefined) delete provider.api.url;
+    else (provider.api as { npm?: string; url?: string | null }).url = url;
+
+    expect(effectiveProviderBaseUrl(provider)).toBeUndefined();
+  });
+});
+
+describe('credential destination ownership', () => {
+  it.each([
+    ['custom-anthropic', true],
+    ['custom-openai', true],
+    ['anthropic', false],
+    ['openai', false],
+  ])('classifies %s as %s', (templateId, expected) => {
+    expect(ownsItsCredentialDestination({ templateId })).toBe(expected);
   });
 });

@@ -985,6 +985,83 @@ describe('refreshProviderModels', () => {
     expect(fetchAnthropicModels).toHaveBeenCalledWith('https://192.0.2.2/v1', 'sk-ant-real-key');
   });
 
+  it.each<[string, string | null | undefined]>([
+    ['missing', undefined],
+    ['null', null],
+    ['empty', ''],
+    ['whitespace', '   '],
+  ])('rejects custom Anthropic refreshes with a %s provider URL before discovery', async (_label, providerUrl) => {
+    const provider: ProviderRegistry['providers'][number] = {
+      id: 'custom-anthropic-refresh',
+      templateId: 'custom-anthropic',
+      name: 'Custom Anthropic Refresh',
+      enabled: true,
+      authRef: 'keyring:provider:custom-anthropic-refresh',
+      authType: 'api',
+      api: { npm: '@ai-sdk/anthropic' },
+      addedAt: '2026-08-13T00:00:00.000Z',
+      modelsCache: {
+        fetchedAt: '2026-08-13T00:00:00.000Z',
+        models: [{
+          id: 'cached-model',
+          name: 'Cached Model',
+          upstreamModelId: 'cached-model',
+          modelFormat: 'anthropic',
+          apiUrl: 'https://hostile-cached.example/steal-credential',
+        }],
+      },
+    };
+    if (providerUrl === undefined) delete provider.api.url;
+    else (provider.api as { npm?: string; url?: string | null }).url = providerUrl;
+    const registry: ProviderRegistry = { schemaVersion: 1, providers: [provider] };
+
+    const result = await refreshProviderModels(provider.id, 'credential-sentinel', registry);
+
+    expect(result).toMatchObject({
+      ok: false,
+      reason: 'Provider has no API base URL configured.',
+    });
+    expect(result.reason).not.toContain('hostile-cached.example');
+    expect(result.reason).not.toContain('credential-sentinel');
+    expect(fetchAnthropicModels).not.toHaveBeenCalled();
+    expect(fetchTemplateModels).not.toHaveBeenCalled();
+    expect(saveRegistry).not.toHaveBeenCalled();
+  });
+
+  it('keeps the ordinary Anthropic provider default when no URL is configured', async () => {
+    const registry: ProviderRegistry = {
+      schemaVersion: 1,
+      providers: [{
+        id: 'anthropic',
+        templateId: 'anthropic',
+        name: 'Anthropic',
+        enabled: true,
+        authRef: 'keyring:provider:anthropic',
+        authType: 'api',
+        api: { npm: '@ai-sdk/anthropic' },
+        addedAt: '2026-08-13T00:00:00.000Z',
+      }],
+    };
+    vi.mocked(fetchAnthropicModels).mockResolvedValue({
+      baseUrl: 'https://api.anthropic.com',
+      models: [{
+        id: 'ordinary-model',
+        name: 'Ordinary Model',
+        upstreamModelId: 'ordinary-model',
+        modelFormat: 'anthropic',
+      }],
+    });
+    vi.mocked(loadRegistryStrict).mockReturnValue(registry);
+
+    const result = await refreshProviderModels('anthropic', 'credential-sentinel', registry);
+
+    expect(result).toMatchObject({ ok: true, modelCount: 1 });
+    expect(fetchAnthropicModels).toHaveBeenCalledWith(
+      'https://api.anthropic.com',
+      'credential-sentinel',
+    );
+  });
+
   // The destination pin above only decides WHERE the key goes. It says nothing
   // about which discovery routine reads the answer, and a record storing
   // `api.npm: '@ai-sdk/anthropic'` at the pinned OpenCode Anthropic address

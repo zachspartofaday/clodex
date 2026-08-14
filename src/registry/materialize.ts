@@ -12,6 +12,7 @@ import { isValidProviderId } from './validate.js';
 import {
   isRetainedOpenCodeGoProvider,
   openCodeGoPinnedApiUrl,
+  ownsItsCredentialDestination,
   retainedOpenCodeGoTemplate,
 } from './resolve-template.js';
 import { classifyFreeStatus, isFreeStatus } from '../free-models.js';
@@ -85,7 +86,7 @@ function resolveMaterializedApiUrl(
   // A custom provider owns the credential destination. Cached rows may select a
   // package, but imported, migrated, or hand-edited model metadata cannot redirect
   // the provider credential away from that authority.
-  if (provider.templateId === 'custom-anthropic' || provider.templateId === 'custom-openai') {
+  if (ownsItsCredentialDestination(provider)) {
     return provider.api.url ?? '';
   }
   return cached.apiUrl ?? provider.api.url ?? '';
@@ -140,6 +141,15 @@ export function cachedModelToLocal(
       provider,
       `its retained OpenCode Go identity has no pinned API URL for SDK package "${npm}"`,
       `Refresh the provider's models with: clodex providers refresh-models ${provider.id}`,
+      warn,
+    );
+  }
+  if (ownsItsCredentialDestination(provider) && !provider.api.url?.trim()) {
+    return reportOmittedModel(
+      cached,
+      provider,
+      'no API URL is configured for its endpoint',
+      `Re-add the provider with a trusted endpoint: clodex providers remove ${provider.id}, then clodex providers add`,
       warn,
     );
   }

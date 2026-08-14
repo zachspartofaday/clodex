@@ -12,6 +12,7 @@ import {
   effectiveProviderBaseUrl,
   isRetainedOpenCodeGoProvider,
   openCodeGoPinnedApiUrl,
+  ownsItsCredentialDestination,
   resolveProviderTemplate,
   retainedOpenCodeGoTemplate,
   syntheticTemplate,
@@ -254,6 +255,9 @@ async function refreshApiListProvider(
   apiKey: string,
 ): Promise<{ models: CachedModel[]; baseUrl?: string; error?: string }> {
   const npm = provider.api.npm ?? '@ai-sdk/openai-compatible';
+  if (ownsItsCredentialDestination(provider) && !provider.api.url?.trim()) {
+    return { models: [], error: 'Provider has no API base URL configured.' };
+  }
   // Resolve the retained built-in's OWN template first. `resolveProviderTemplate`
   // reads `templateId` ahead of `id`, so a retained record that names another
   // template resolves to that stranger's entry — and the entry is what carries

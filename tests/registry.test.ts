@@ -921,6 +921,87 @@ describe('materializeRegistry', () => {
     expect(warnings[0]).not.toContain('credential-sentinel');
   });
 
+  it.each<[string, string | null | undefined]>([
+    ['missing', undefined],
+    ['null', null],
+    ['empty', ''],
+    ['whitespace', '   '],
+  ])('omits custom Anthropic models when the provider URL is %s, even with a hostile cached URL', (_label, providerUrl) => {
+    const registry = emptyRegistry();
+    const provider = customAnthropicProvider(
+      'https://provider-authority.example/v1',
+      'https://hostile-cached.example/steal-credential',
+    );
+    if (providerUrl === undefined) delete provider.api.url;
+    else (provider.api as { npm?: string; url?: string | null }).url = providerUrl;
+    registry.providers.push(provider);
+    const warnings: string[] = [];
+
+    expect(materializeRegistry(
+      registry,
+      () => 'credential-sentinel',
+      { warn: message => warnings.push(message) },
+    )).toEqual([]);
+    expect(warnings).toEqual([
+      'Model "custom-model" from provider "custom-anthropic-test" was omitted: '
+      + 'no API URL is configured for its endpoint. '
+      + 'Re-add the provider with a trusted endpoint: clodex providers remove custom-anthropic-test, '
+      + 'then clodex providers add',
+    ]);
+    expect(warnings[0]).not.toContain('hostile-cached.example');
+    expect(warnings[0]).not.toContain('credential-sentinel');
+  });
+
+  it('keeps custom OpenAI providers fail-closed when their URL is blank', () => {
+    const registry = emptyRegistry();
+    registry.providers.push(customOpenAiProvider(
+      '   ',
+      'https://hostile-cached.example/steal-credential',
+    ));
+    const warnings: string[] = [];
+
+    expect(materializeRegistry(
+      registry,
+      () => 'credential-sentinel',
+      { warn: message => warnings.push(message) },
+    )).toEqual([]);
+    expect(warnings[0]).toContain('no API URL is configured for its endpoint');
+    expect(warnings[0]).not.toContain('hostile-cached.example');
+    expect(warnings[0]).not.toContain('credential-sentinel');
+  });
+
+  it('keeps ordinary Anthropic providers on the built-in npm default', () => {
+    const registry = emptyRegistry();
+    registry.providers.push({
+      id: 'anthropic',
+      templateId: 'anthropic',
+      name: 'Anthropic',
+      enabled: true,
+      authRef: 'keyring:provider:anthropic',
+      authType: 'api',
+      api: { npm: '@ai-sdk/anthropic' },
+      addedAt: '2026-08-13T00:00:00.000Z',
+      modelsCache: {
+        fetchedAt: '2026-08-13T00:00:00.000Z',
+        models: [{
+          id: 'ordinary-anthropic-model',
+          name: 'Ordinary Anthropic Model',
+          upstreamModelId: 'ordinary-anthropic-model',
+          modelFormat: 'anthropic',
+          npm: '@ai-sdk/anthropic',
+        }],
+      },
+    });
+
+    const local = materializeRegistry(registry, () => 'credential-sentinel')[0];
+
+    expect(local?.models[0]).toMatchObject({
+      modelFormat: 'anthropic',
+      baseUrl: 'https://api.anthropic.com',
+      apiBaseUrl: 'https://api.anthropic.com',
+    });
+  });
+
   // Exercised directly rather than through materializeRegistry: the retained
   // OpenCode allowlist projection pins every surviving row's SDK package, so
   // this rejection is unreachable through the registry today. It stays covered

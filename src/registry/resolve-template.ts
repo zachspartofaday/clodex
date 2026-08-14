@@ -29,6 +29,11 @@ const NPM_DEFAULT_BASE_URL: Record<string, string> = {
 export type ProviderTemplateIdentity = Pick<RegistryProvider, 'templateId'>
   & Partial<Pick<RegistryProvider, 'id'>>;
 
+/** Custom provider templates exclusively own their credential destination. */
+export function ownsItsCredentialDestination(provider: ProviderTemplateIdentity): boolean {
+  return provider.templateId === 'custom-anthropic' || provider.templateId === 'custom-openai';
+}
+
 export function resolveProviderTemplate(provider: ProviderTemplateIdentity): ProviderTemplate | undefined {
   const candidates = [
     TEMPLATE_ID_ALIASES[provider.templateId],
@@ -96,6 +101,7 @@ export function isProviderConfiguredForTemplate(
 export function effectiveProviderBaseUrl(provider: RegistryProvider, template?: ProviderTemplate): string | undefined {
   const fromRegistry = provider.api.url?.trim();
   if (fromRegistry) return fromRegistry;
+  if (ownsItsCredentialDestination(provider)) return undefined;
   if (template?.defaultBaseUrl?.trim()) return template.defaultBaseUrl.trim();
   const npm = provider.api.npm?.trim();
   if (npm && NPM_DEFAULT_BASE_URL[npm]) return NPM_DEFAULT_BASE_URL[npm];
