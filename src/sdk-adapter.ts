@@ -102,6 +102,20 @@ export function sdkTranslationErrorSignature(error: unknown): SdkTranslationErro
   return undefined;
 }
 
+/** Require a provider-supplied terminal reason before assembling a success response. */
+export function requireOpenAiTerminalFinish(
+  part: { finishReason?: unknown; rawFinishReason?: unknown } | undefined,
+  errorMessage = 'Upstream SDK stream ended without a terminal event',
+): string {
+  if (
+    typeof part?.finishReason !== 'string'
+    || (part.finishReason === 'other' && part.rawFinishReason === undefined)
+  ) {
+    throw new Error(errorMessage);
+  }
+  return part.finishReason;
+}
+
 // ── Anthropic request shapes (only the fields we read) ───────────────────────
 interface AnthropicBlock {
   type: string;
@@ -847,7 +861,9 @@ export async function writeAnthropicStream(
     }
   };
   let openToolId: string | null = null;
-  let finishReason = 'end_turn';
+  let finishPart: { finishReason?: unknown; rawFinishReason?: unknown } | undefined;
+  let finishReason: string;
+  let sawToolCall = false;
   let usage: AnthropicUsage = {
     input_tokens: observer?.initialInputTokens ?? 0,
     output_tokens: 0,
@@ -973,7 +989,7 @@ export async function writeAnthropicStream(
       case 'tool-input-end': break;
 
       case 'tool-call': {
-        finishReason = 'tool_use';
+        sawToolCall = true;
         const id = part.toolCallId ?? '';
         if (idToBlock.has(id)) {
           // Streamed input: emit the sanitized complete input as one delta,
@@ -1006,6 +1022,7 @@ export async function writeAnthropicStream(
       }
 
       case 'finish':
+        finishPart = part;
         if (part.totalUsage) {
           const finalUsage = toAnthropicUsage(part.totalUsage);
           const hasFinalInputUsage = finalUsage.input_tokens
@@ -1015,9 +1032,6 @@ export async function writeAnthropicStream(
             ? finalUsage
             : { ...usage, output_tokens: finalUsage.output_tokens };
         }
-        if (part.finishReason === 'tool-calls') finishReason = 'tool_use';
-        else if (part.finishReason === 'length') finishReason = 'max_tokens';
-        else if (part.finishReason === 'stop' && finishReason !== 'tool_use') finishReason = 'end_turn';
         break;
 
       case 'error': {
@@ -1038,6 +1052,19 @@ export async function writeAnthropicStream(
   // Some SDK transports end the iterator without yielding an explicit abort
   // part. Never synthesize completion frames for an already-cancelled request.
   if (observer?.abortSignal?.aborted) throw streamAbortError(observer.abortSignal);
+
+  let terminalReason: string;
+  try {
+    terminalReason = requireOpenAiTerminalFinish(finishPart);
+  } catch (error) {
+    closeOpen('terminal-error');
+    throw error;
+  }
+
+  finishReason = sawToolCall ? 'tool_use' : 'end_turn';
+  if (terminalReason === 'tool-calls') finishReason = 'tool_use';
+  else if (terminalReason === 'length') finishReason = 'max_tokens';
+  else if (terminalReason === 'stop' && !sawToolCall) finishReason = 'end_turn';
 
   closeOpen();
   ensureStart();
@@ -1169,7 +1196,8 @@ export async function generateAnthropicResponse(
     } as Parameters<typeof streamText>[0]);
     const streamedText: string[] = [];
     const streamedToolCalls: Array<{ toolCallId: string; toolName: string; input: unknown }> = [];
-    let streamedFinishReason = 'stop';
+    let streamedFinishPart: { finishReason?: unknown; rawFinishReason?: unknown } | undefined;
+    let streamedFinishReason: string;
     let streamedUsage: SdkUsage | undefined;
     try {
       for await (const part of r.stream as AsyncIterable<FullStreamPart>) {
@@ -1196,11 +1224,12 @@ export async function generateAnthropicResponse(
             input: part.input,
           });
         } else if (part.type === 'finish') {
-          streamedFinishReason = part.finishReason ?? streamedFinishReason;
+          streamedFinishPart = part;
           streamedUsage = part.totalUsage;
         }
       }
       if (abortSignal.aborted) throw streamAbortError(abortSignal);
+      streamedFinishReason = requireOpenAiTerminalFinish(streamedFinishPart);
     } finally {
       stopForwardingAbort();
       clearTimeout(idleTimer);
@@ -1234,7 +1263,11 @@ export async function generateAnthropicResponse(
         maxRetries: upstreamMaxRetries(),
         abortSignal: generateAbort.signal,
       } as Parameters<typeof generateText>[0]);
-      ({ text, toolCalls, finishReason, usage, warnings } = r);
+      finishReason = requireOpenAiTerminalFinish({
+        finishReason: r.finishReason,
+        rawFinishReason: (r as unknown as { rawFinishReason?: unknown }).rawFinishReason,
+      });
+      ({ text, toolCalls, usage, warnings } = r);
     } finally {
       stopForwardingAbort();
       clearTimeout(totalTimer);

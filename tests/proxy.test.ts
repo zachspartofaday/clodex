@@ -1427,6 +1427,70 @@ describe('SDK translated error logging', () => {
     }
   }, 20_000);
 
+  it('rejects translated SSE EOF without a genuine terminal reason and records translation failure', async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'clodex-sdk-terminal-integrity-'));
+    const inferenceLogPath = join(dir, 'inference.jsonl');
+    const upstream = http.createServer((req, res) => {
+      req.resume();
+      req.once('end', () => {
+        res.writeHead(200, { 'Content-Type': 'text/event-stream', 'Connection': 'close' });
+        res.end([
+          'data: {"id":"chatcmpl-1","object":"chat.completion.chunk","created":1,"model":"translated-model","choices":[{"index":0,"delta":{"role":"assistant","content":"partial"},"finish_reason":null}]}',
+          '',
+          'data: [DONE]',
+          '',
+        ].join('\n'));
+      });
+    });
+    await new Promise<void>((resolve, reject) => {
+      upstream.once('error', reject);
+      upstream.listen(0, '127.0.0.1', () => resolve());
+    });
+    const address = upstream.address();
+    if (!address || typeof address === 'string') throw new Error('test upstream did not bind');
+
+    const route: ProxyRoute = {
+      aliasId: 'clodex:test:translated-terminal-integrity',
+      realModelId: 'translated-model',
+      displayName: 'Translated Terminal Integrity',
+      upstreamUrl: '',
+      apiKey: 'provider-key',
+      modelFormat: 'openai',
+      npm: '@ai-sdk/openai-compatible',
+      baseURL: `http://127.0.0.1:${address.port}/v1`,
+      providerId: 'test-provider',
+    };
+    const handle = await startProxyCatalog([route], route.aliasId, false, inferenceLogPath);
+    const requestId = '00000000-0000-4000-8000-000000000107';
+
+    try {
+      const res = await postToProxy(handle.port, handle.token, {
+        model: route.aliasId,
+        max_tokens: 100,
+        messages: [{ role: 'user', content: 'terminal integrity' }],
+        stream: true,
+      }, requestId);
+
+      expect(res.status).toBe(200);
+      expect(res.body).toContain('error');
+      expect(res.body).not.toContain('event: message_stop');
+      expect(res.body).not.toContain('event: message_delta');
+
+      const entries = readFileSync(inferenceLogPath, 'utf8').trim().split('\n').map(line => JSON.parse(line));
+      expect(entries).toContainEqual(expect.objectContaining({
+        event: 'translation_failed',
+        requestId,
+        terminalOutcome: 'error',
+        terminalCategory: 'local_adapter_exception',
+      }));
+      expect(entries.some(entry => entry.event === 'translation_completed' && entry.requestId === requestId)).toBe(false);
+    } finally {
+      handle.close();
+      await new Promise<void>(resolve => upstream.close(() => resolve()));
+      rmSync(dir, { recursive: true, force: true });
+    }
+  }, 20_000);
+
   it('emits keepalive pings while a tool-call argument is buffered with no downstream output', async () => {
     const dir = mkdtempSync(join(tmpdir(), 'clodex-sdk-keepalive-'));
     const inferenceLogPath = join(dir, 'inference.jsonl');

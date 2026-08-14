@@ -8,6 +8,7 @@ import {
   SdkTimeoutError,
   oauthServiceTier,
   reportUnsupportedServiceTier,
+  requireOpenAiTerminalFinish,
   streamAbortError,
 } from './sdk-adapter.js';
 import { upstreamMaxRetries } from './upstream-retry.js';
@@ -165,18 +166,6 @@ export function translateOpenAiRequest(
 
 // ── Translation: SDK Response → OpenAI JSON / SSE ───────────────────────────
 
-function requireOpenAiTerminalFinish(
-  part: { finishReason?: unknown; rawFinishReason?: unknown } | undefined,
-): string {
-  if (
-    typeof part?.finishReason !== 'string'
-    || (part.finishReason === 'other' && part.rawFinishReason === undefined)
-  ) {
-    throw new Error('Upstream OpenAI stream ended without a terminal event');
-  }
-  return part.finishReason;
-}
-
 /**
  * The Anthropic adapter's stream liveness policy, applied to the OpenAI routes.
  *
@@ -266,7 +255,7 @@ export async function collectOpenAiStream(stream: AsyncIterable<unknown>): Promi
           : new Error(typeof p.error === 'string' ? p.error : 'Upstream stream failed');
     }
   }
-  collected.finishReason = requireOpenAiTerminalFinish(finishPart);
+  collected.finishReason = requireOpenAiTerminalFinish(finishPart, 'Upstream OpenAI stream ended without a terminal event');
   collected.usage = finishPart?.totalUsage ?? finishPart?.usage;
   return collected;
 }
@@ -422,7 +411,7 @@ export async function streamOpenAiResponse(
     // part, and reporting that as a missing terminal event would hide the real
     // cause. Either way no completion frame and no [DONE] is emitted.
     watchdog.throwIfAborted();
-    send({}, requireOpenAiTerminalFinish(finishPart));
+    send({}, requireOpenAiTerminalFinish(finishPart, 'Upstream OpenAI stream ended without a terminal event'));
     onChunk('data: [DONE]\n\n');
   } catch (err) {
     watchdog.throwIfAborted();

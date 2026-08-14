@@ -830,6 +830,101 @@ describe('generateAnthropicResponse', () => {
     vi.resetModules();
   });
 
+  it.each([
+    ['EOF', [{ type: 'start' }, { type: 'text-delta', text: 'partial' }]],
+    ['synthetic other', [
+      { type: 'start' },
+      { type: 'text-delta', text: 'partial' },
+      { type: 'finish', finishReason: 'other', rawFinishReason: undefined },
+    ]],
+  ])('forceStream rejects %s without a genuine terminal reason', async (_label, parts) => {
+    vi.resetModules();
+    async function* stream() {
+      for (const part of parts) yield part;
+    }
+    const streamText = vi.fn(() => ({ stream: stream() }));
+    vi.doMock('ai', () => ({
+      generateText: vi.fn(),
+      streamText,
+      tool: vi.fn((spec: unknown) => spec),
+      jsonSchema: vi.fn((schema: unknown) => schema),
+    }));
+
+    try {
+      const { generateAnthropicResponse } = await import('../src/sdk-adapter.js');
+      await expect(generateAnthropicResponse(
+        {} as never,
+        { messages: [] },
+        'gpt-5.6-sol',
+        { forceStream: true },
+      )).rejects.toThrow('Upstream SDK stream ended without a terminal event');
+    } finally {
+      vi.doUnmock('ai');
+      vi.resetModules();
+    }
+  });
+
+  it('forceStream accepts a provider-defined other finish reason', async () => {
+    vi.resetModules();
+    async function* stream() {
+      yield { type: 'start' };
+      yield { type: 'text-delta', text: 'complete' };
+      yield { type: 'finish', finishReason: 'other', rawFinishReason: 'provider-defined' };
+    }
+    const streamText = vi.fn(() => ({ stream: stream() }));
+    vi.doMock('ai', () => ({
+      generateText: vi.fn(),
+      streamText,
+      tool: vi.fn((spec: unknown) => spec),
+      jsonSchema: vi.fn((schema: unknown) => schema),
+    }));
+
+    try {
+      const { generateAnthropicResponse } = await import('../src/sdk-adapter.js');
+      const body = await generateAnthropicResponse(
+        {} as never,
+        { messages: [] },
+        'gpt-5.6-sol',
+        { forceStream: true },
+      );
+      expect(body.content).toEqual([{ type: 'text', text: 'complete' }]);
+    } finally {
+      vi.doUnmock('ai');
+      vi.resetModules();
+    }
+  });
+
+  it.each([
+    ['absent', { text: 'partial', toolCalls: [] }],
+    ['synthetic other', {
+      text: 'partial',
+      toolCalls: [],
+      finishReason: 'other',
+      rawFinishReason: undefined,
+    }],
+  ])('non-streaming rejects %s terminal output before assembling success', async (_label, result) => {
+    vi.resetModules();
+    const generateText = vi.fn(async () => result);
+    vi.doMock('ai', () => ({
+      generateText,
+      streamText: vi.fn(),
+      tool: vi.fn((spec: unknown) => spec),
+      jsonSchema: vi.fn((schema: unknown) => schema),
+    }));
+
+    try {
+      const { generateAnthropicResponse } = await import('../src/sdk-adapter.js');
+      await expect(generateAnthropicResponse(
+        {} as never,
+        { messages: [] },
+        'test-model',
+      )).rejects.toThrow('Upstream SDK stream ended without a terminal event');
+    } finally {
+      vi.doUnmock('ai');
+      vi.resetModules();
+    }
+  });
+
   it('forceStream propagates an SDK error part with its upstream status', async () => {
     vi.resetModules();
     const upstreamError = { statusCode: 401, message: 'Unauthorized' };
@@ -1218,6 +1313,45 @@ describe('writeAnthropicStream', () => {
       cache_creation_input_tokens: 0,
       cache_read_input_tokens: 0,
     });
+  });
+
+  it.each([
+    ['EOF', [
+      { type: 'start' },
+      { type: 'text-start', id: 't1' },
+      { type: 'text-delta', id: 't1', text: 'partial' },
+    ]],
+    ['synthetic other', [
+      { type: 'start' },
+      { type: 'text-start', id: 't1' },
+      { type: 'text-delta', id: 't1', text: 'partial' },
+      { type: 'finish', finishReason: 'other', rawFinishReason: undefined },
+    ]],
+  ])('rejects a translated stream with %s terminal state before completion frames', async (_label, parts) => {
+    let raw = '';
+    async function* stream() {
+      for (const part of parts) yield part;
+    }
+
+    await expect(writeAnthropicStream(
+      stream() as any,
+      'm',
+      chunk => { raw += chunk; },
+    )).rejects.toThrow('Upstream SDK stream ended without a terminal event');
+    expect(raw).not.toContain('event: message_delta');
+    expect(raw).not.toContain('event: message_stop');
+  });
+
+  it('accepts a provider-defined other finish reason in a translated stream', async () => {
+    const { events } = await collect([
+      { type: 'start' },
+      { type: 'text-start', id: 't1' },
+      { type: 'text-delta', id: 't1', text: 'complete' },
+      { type: 'finish', finishReason: 'other', rawFinishReason: 'provider-defined' },
+    ]);
+
+    expect(events.map(event => event.event)).toContain('message_delta');
+    expect(events.map(event => event.event)).toContain('message_stop');
   });
 
   it('does not double-count the local estimate when final input is fully cached', async () => {
