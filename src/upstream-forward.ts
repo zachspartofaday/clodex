@@ -10,6 +10,7 @@ import {
   type AnthropicCapabilityRouteFacts,
 } from './anthropic-beta-policy.js';
 import { isCredentialBearingHeader } from './credential-headers.js';
+import { fetchWithoutRedirects } from './redirect-policy.js';
 import { clampRetryAfterSeconds } from './upstream-error.js';
 import {
   ANTHROPIC_X_API_KEY_ONLY_AUTH_MODE,
@@ -292,7 +293,7 @@ export async function relayAnthropicMessages(
   clientWantsStream: boolean,
   options: RelayAnthropicOptions = {},
 ): Promise<void> {
-  const doFetch = (key: string) => fetch(messagesUrl, {
+  const doFetch = (key: string) => fetchWithoutRedirects(messagesUrl, {
     method: 'POST',
     headers: anthropicUpstreamHeaders(
       key,

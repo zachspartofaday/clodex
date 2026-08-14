@@ -4,6 +4,7 @@ import { positiveSecondsToMs, sleepMs } from './pkce.js';
 import type { OAuthTokenResponse } from './types.js';
 import { VERSION } from '../constants.js';
 import { postOAuthRefresh } from './refresh-http.js';
+import { fetchWithoutRedirects } from '../redirect-policy.js';
 
 const CLIENT_ID = 'app_EMoamEEZ73f0CkXaXp7hrann';
 const ISSUER = 'https://auth.openai.com';
@@ -39,7 +40,7 @@ export function extractOpenAiAccountId(tokens: OAuthTokenResponse): string | und
 }
 
 export async function requestOpenAiDeviceCode(): Promise<OpenAiDeviceCodeData> {
-  const response = await fetch(`${ISSUER}/api/accounts/deviceauth/usercode`, {
+  const response = await fetchWithoutRedirects(`${ISSUER}/api/accounts/deviceauth/usercode`, {
     method: 'POST',
     headers: {
       'Content-Type': 'application/json',
@@ -67,7 +68,7 @@ export async function pollOpenAiDeviceCodeToken(
   const deadline = now() + positiveSecondsToMs(deviceData.expires_in, DEVICE_CODE_DEFAULT_EXPIRES_MS);
 
   while (now() < deadline) {
-    const response = await fetch(`${ISSUER}/api/accounts/deviceauth/token`, {
+    const response = await fetchWithoutRedirects(`${ISSUER}/api/accounts/deviceauth/token`, {
       method: 'POST',
       headers: {
         'Content-Type': 'application/json',
@@ -81,7 +82,7 @@ export async function pollOpenAiDeviceCodeToken(
 
     if (response.ok) {
       const data = await response.json() as { authorization_code: string; code_verifier: string };
-      const tokenResponse = await fetch(`${ISSUER}/oauth/token`, {
+      const tokenResponse = await fetchWithoutRedirects(`${ISSUER}/oauth/token`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
         body: new URLSearchParams({

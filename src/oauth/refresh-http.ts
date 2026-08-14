@@ -1,3 +1,4 @@
+import { fetchWithoutRedirects } from '../redirect-policy.js';
 import type { OAuthTokenResponse } from './types.js';
 
 const OAUTH_REFRESH_TIMEOUT_MS = 30_000;
@@ -25,7 +26,7 @@ export async function postOAuthRefresh(
   }, OAUTH_REFRESH_TIMEOUT_MS);
   timeout.unref();
   try {
-    const response = await fetch(url, {
+    const response = await fetchWithoutRedirects(url, {
       method: 'POST',
       signal: abortController.signal,
       headers: {

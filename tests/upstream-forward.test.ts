@@ -1,7 +1,9 @@
 // tests/upstream-forward.test.ts
 import { describe, it, expect, vi, afterEach } from 'vitest';
+import { createServer } from 'node:http';
 import { Writable, type Transform } from 'node:stream';
 import {
+  UpstreamUnreachableError,
   anthropicUpstreamHeaders,
   fetchWithOAuthRetry,
   anthropicSseModelRewrite,
@@ -37,6 +39,24 @@ const DEFERRED_TOOLS = [{ name: 'mcp__docs__search', defer_loading: true }];
 const ORDINARY_TOOLS = [{ name: 'Read', description: 'read a file', input_schema: { type: 'object' } }];
 
 const ANTHROPIC_MESSAGES_URL = 'https://api.anthropic.com/v1/messages';
+
+async function startRedirectTestServer(
+  handler: Parameters<typeof createServer>[0],
+): Promise<{ url: string; close: () => Promise<void> }> {
+  const server = createServer(handler);
+  await new Promise<void>((resolve, reject) => {
+    server.once('error', reject);
+    server.listen(0, '127.0.0.1', () => resolve());
+  });
+  const address = server.address();
+  if (!address || typeof address === 'string') throw new Error('missing test server address');
+  return {
+    url: `http://127.0.0.1:${address.port}`,
+    close: () => new Promise<void>((resolve, reject) => {
+      server.close(error => (error ? reject(error) : resolve()));
+    }),
+  };
+}
 
 function capability(over: Partial<AnthropicCapabilityRequest> = {}): AnthropicCapabilityRequest {
   return {
@@ -643,6 +663,41 @@ describe('anthropic beta policy tokens', () => {
     expect(resolveOutboundBeta({ 'anthropic-beta': ' , ' })).toEqual({ source: 'none' });
     expect(resolveOutboundBeta({ 'Anthropic-Beta': 'a, b' }))
       .toEqual({ source: 'configured', value: 'a,b' });
+  });
+});
+
+describe('relayAnthropicMessages redirect boundary', () => {
+  it('wraps a redirect refusal as UpstreamUnreachableError without contacting its target', async () => {
+    const targetRequests: unknown[] = [];
+    const target = await startRedirectTestServer((_req, res) => {
+      targetRequests.push(true);
+      res.writeHead(200, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({ type: 'message', model: 'target', content: [] }));
+    });
+    const redirect = await startRedirectTestServer((_req, res) => {
+      res.writeHead(308, { Location: `${target.url}/leak` });
+      res.end();
+    });
+
+    try {
+      const error = await relayAnthropicMessages(
+        { writeHead() {}, end() {} } as never,
+        redirect.url,
+        { model: 'redirect-test' },
+        'secret-key',
+        false,
+      ).catch(caught => caught);
+
+      expect(error).toBeInstanceOf(UpstreamUnreachableError);
+      expect(String(error)).toBe('UpstreamUnreachableError: Upstream unreachable: Redirect blocked (308)');
+      expect(String(error)).not.toContain(redirect.url);
+      expect(String(error)).not.toContain(target.url);
+      expect(String(error)).not.toContain('Location');
+      expect(targetRequests).toHaveLength(0);
+    } finally {
+      await redirect.close();
+      await target.close();
+    }
   });
 });
 
