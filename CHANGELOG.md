@@ -1,5 +1,22 @@
 # Changelog
 
+## 2.6.0-limitless.1 (2026-08-13)
+
+
+### Features
+
+* **profiles:** Save and switch reusable model profiles of favorites and ordered aliases without changing the names your agents use.
+* **providers:** Add Meta AI as an API-key provider with live model discovery and curated context windows.
+* **effort:** Keep model-specific effort choices, including sparse effort ladders, working when patching current Claude Code builds.
+
+### Bug Fixes
+
+* **responses:** Reject incomplete or truncated provider responses instead of reporting success, while preserving token-limit and tool-call outcomes.
+* **auth:** Keep provider credentials and prompts on trusted configured endpoints, and OAuth tokens on their issuer, by rejecting redirects and unsafe cached endpoint overrides; recognize and redact credential-header aliases.
+* **patch:** Make live-binary patch and restore publication atomic and locked, retain a named rescue for double failure, and keep manifest state tied to the binary it describes.
+* **launch:** Reject standalone account and provider-credential overrides when an already-running server owns credential selection.
+* **diagnostics:** Keep default diagnostics sanitized with allowlisted terminal facts; retain full structured details only for opt-in debug logs.
+
 ## [2.6.0](https://github.com/bman654/clodex/compare/v2.5.2...v2.6.0) (2026-08-13)
 
 
