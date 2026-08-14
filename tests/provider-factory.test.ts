@@ -131,16 +131,47 @@ describe('maxToolsForNpm', () => {
 describe('getReasoningCapabilities', () => {
   it('returns anthropic levels for claude-sonnet-4-6', () => {
     const caps = getReasoningCapabilities('@ai-sdk/anthropic', 'claude-sonnet-4-6');
-    expect(caps.levels).toEqual(['low', 'medium', 'high']);
+    // Adaptive but not xhigh-documented: the ladder tops out at the `max` this
+    // route's mapping actually sends.
+    expect(caps.levels).toEqual(['low', 'medium', 'high', 'max']);
     expect(caps.defaultLevel).toBe('high');
     expect(caps.supportsSummaries).toBe(true);
   });
 
   it('returns anthropic levels for Vertex Claude models', () => {
     const caps = getReasoningCapabilities(VERTEX_ANTHROPIC_NPM, 'claude-sonnet-4-6');
-    expect(caps.levels).toEqual(['low', 'medium', 'high']);
+    expect(caps.levels).toEqual(['low', 'medium', 'high', 'max']);
     expect(caps.defaultLevel).toBe('high');
     expect(caps.wireFormat).toEqual({ kind: 'anthropic-thinking' });
+  });
+
+  it('keeps the conservative three levels for a Claude route known only from metadata', () => {
+    // No documented adaptive family, so the ladder must stay exactly what the
+    // mapping can produce for it: low/medium/high.
+    const caps = getReasoningCapabilities('@ai-sdk/anthropic', 'claude-experimental-preview', {
+      reasoning: true,
+    });
+    expect(caps.levels).toEqual(['low', 'medium', 'high']);
+    expect(caps.source).toBe('model-metadata');
+  });
+
+  it.each([
+    'claude-opus-4-7',
+    'claude-opus-4-8-20260501',
+    'claude-fable-5',
+    'claude-sonnet-5-20260101',
+  ])('advertises the xhigh ladder for the documented family %s', modelId => {
+    expect(getReasoningCapabilities('@ai-sdk/anthropic', modelId).levels)
+      .toEqual(['low', 'medium', 'high', 'xhigh', 'max']);
+  });
+
+  it.each([
+    'claude-sonnet-4-6',
+    'claude-opus-4-6-20260101',
+    'claude-haiku-4-6',
+  ])('withholds xhigh from the adaptive-but-undocumented family %s', modelId => {
+    expect(getReasoningCapabilities('@ai-sdk/anthropic', modelId).levels)
+      .toEqual(['low', 'medium', 'high', 'max']);
   });
 
   it('returns empty levels for non-reasoning anthropic model', () => {
@@ -458,6 +489,76 @@ describe('effortProviderOptions + deepMergeProviderOptions', () => {
   it('maps Vertex Claude effort to Anthropic thinking options', () => {
     expect(effortProviderOptions(VERTEX_ANTHROPIC_NPM, 'medium', 'claude-sonnet-4-6')).toEqual({
       anthropic: { thinking: { type: 'adaptive', effort: 'medium' } },
+    });
+  });
+
+  /**
+   * The top of the Claude ladder is per-family, so the request behavior is
+   * pinned as a matrix rather than one example: an xhigh-documented family
+   * sends `xhigh` as itself, an adaptive family without it saturates to `max`,
+   * and a route known only from metadata downgrades to `high`.
+   */
+  describe('Claude xhigh/max is resolved per family', () => {
+    const claudeEffort = (modelId: string, effort: string, metadata?: { reasoning: boolean }) =>
+      (effortProviderOptions('@ai-sdk/anthropic', effort, modelId, metadata) as
+        { anthropic?: { thinking?: { effort?: string } } } | undefined)
+        ?.anthropic?.thinking?.effort;
+
+    it.each([
+      ['claude-opus-4-7', 'xhigh', 'xhigh'],
+      ['claude-opus-4-7', 'max', 'max'],
+      ['claude-sonnet-5-20260101', 'xhigh', 'xhigh'],
+      ['claude-fable-5', 'xhigh', 'xhigh'],
+      ['claude-sonnet-4-6', 'xhigh', 'max'],
+      ['claude-sonnet-4-6', 'max', 'max'],
+      ['claude-opus-4-6-20260101', 'xhigh', 'max'],
+      ['claude-opus-4-7', 'high', 'high'],
+      ['claude-opus-4-7', 'medium', 'medium'],
+      ['claude-opus-4-7', 'low', 'low'],
+      ['claude-opus-4-7', 'minimal', 'low'],
+      ['claude-opus-4-7', 'none', 'low'],
+    ])('%s asked for %s sends %s', (modelId, requested, expected) => {
+      expect(claudeEffort(modelId, requested)).toBe(expected);
+    });
+
+    it('sends no anthropic effort at all on a Claude route known only from metadata', () => {
+      // Unchanged contract: only a documented Claude family gets thinking
+      // options, so the model-aware ladder cannot leak `xhigh`/`max` onto a
+      // route whose acceptance of them was never reviewed.
+      expect(effortProviderOptions('@ai-sdk/anthropic', 'xhigh', 'claude-experimental-preview', {
+        reasoning: true,
+      })).toBeUndefined();
+      expect(effortProviderOptions('@ai-sdk/anthropic', 'max', 'claude-experimental-preview', {
+        reasoning: true,
+      })).toBeUndefined();
+    });
+
+    it('sends only levels it advertises, on every Claude family', () => {
+      for (const modelId of [
+        'claude-opus-4-7',
+        'claude-sonnet-5-20260101',
+        'claude-fable-5',
+        'claude-sonnet-4-6',
+        'claude-opus-4-6-20260101',
+      ]) {
+        const advertised = getReasoningCapabilities('@ai-sdk/anthropic', modelId).levels;
+        for (const level of advertised) {
+          // Every advertised level must map to something, and to a value the
+          // same family advertises — otherwise the picker offers a control the
+          // wire silently reinterprets.
+          expect(advertised).toContain(claudeEffort(modelId, level));
+        }
+      }
+    });
+
+    it('keeps every advertised level distinct for the patched-client picker', () => {
+      // getPatchReasoningCapabilities drops levels whose provider options
+      // duplicate an earlier one, so an advertisement that collapses on the
+      // wire silently shrinks the picker.
+      for (const modelId of ['claude-opus-4-7', 'claude-sonnet-4-6']) {
+        expect(getPatchReasoningCapabilities('@ai-sdk/anthropic', modelId).levels)
+          .toEqual(getReasoningCapabilities('@ai-sdk/anthropic', modelId).levels);
+      }
     });
   });
 });

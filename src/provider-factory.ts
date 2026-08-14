@@ -437,6 +437,10 @@ export interface ReasoningCapabilities {
 }
 
 const ANTHROPIC_EFFORT_LEVELS = ['low', 'medium', 'high'] as const;
+/** Adaptive-thinking Claude models additionally accept `max`. */
+const ANTHROPIC_ADAPTIVE_EFFORT_LEVELS = ['low', 'medium', 'high', 'max'] as const;
+/** Adaptive families the Anthropic SDK additionally documents as accepting `xhigh`. */
+const ANTHROPIC_XHIGH_EFFORT_LEVELS = ['low', 'medium', 'high', 'xhigh', 'max'] as const;
 const OPENAI_EFFORT_LEVELS = ['low', 'medium', 'high', 'xhigh'] as const;
 const GPT_56_EFFORT_LEVELS = ['none', 'low', 'medium', 'high', 'xhigh', 'max'] as const;
 const GEMINI_EFFORT_LEVELS = ['low', 'medium', 'high'] as const;
@@ -488,6 +492,33 @@ function isClaudeReasoningModel(modelId: string): boolean {
   const major = Number(m[1]);
   const minor = Number(m[2]);
   return major > 4 || (major === 4 && minor >= 6);
+}
+
+/**
+ * The reviewed adaptive Claude families that additionally accept `xhigh`.
+ *
+ * Named literally rather than derived from the "4.6 or newer" rule above:
+ * `xhigh` is a per-family wire capability the Anthropic SDK documents one
+ * release at a time, so inferring it from a version floor would send it to a
+ * family that rejects it. Everything adaptive but unlisted keeps the safe
+ * downgrade.
+ */
+function isClaudeXhighEffortModel(modelId: string): boolean {
+  return /^claude-(?:opus-4-(?:7|8)|fable-5|sonnet-5)(?:[-@]|$)/i.test(modelId);
+}
+
+/**
+ * The exact ladder one documented Claude family advertises.
+ *
+ * This is the same set the request mapping below can actually produce, which is
+ * what keeps the advertisement, the wire, and the patched-client picker
+ * agreeing: advertising a level the mapping collapses onto another would let
+ * the picker offer a control that changes nothing.
+ */
+function claudeEffortLevels(modelId: string): readonly string[] {
+  return isClaudeXhighEffortModel(modelId)
+    ? ANTHROPIC_XHIGH_EFFORT_LEVELS
+    : ANTHROPIC_ADAPTIVE_EFFORT_LEVELS;
 }
 
 function isGeminiReasoningModel(modelId: string): boolean {
@@ -648,7 +679,16 @@ function deepSeekEffortProviderOptions(
   };
 }
 
-function mapCodexEffortToAnthropic(effort: string): string | undefined {
+/**
+ * Map one global effort onto the value this exact Claude model accepts.
+ *
+ * Model-aware, because the top of the ladder is not uniform: a family the SDK
+ * documents for `xhigh` sends it as itself, while an adaptive family without
+ * that documentation saturates to `max` rather than being flattened to `high` —
+ * which is what silently discarded the difference between the three highest
+ * levels. Callers guarantee an adaptive Claude id.
+ */
+function mapCodexEffortToAnthropic(effort: string, modelId: string): string | undefined {
   switch (effort) {
     case 'none':
     case 'minimal':
@@ -657,14 +697,13 @@ function mapCodexEffortToAnthropic(effort: string): string | undefined {
     case 'medium':
       return 'medium';
     case 'high':
+      return 'high';
     case 'xhigh':
+      return isClaudeXhighEffortModel(modelId) ? 'xhigh' : 'max';
     case 'max':
-      return effort === 'xhigh' ? 'high' : effort === 'max' ? 'max' : 'high';
+      return 'max';
     default:
-      if (ANTHROPIC_EFFORT_LEVELS.includes(effort as typeof ANTHROPIC_EFFORT_LEVELS[number])) {
-        return effort;
-      }
-      return undefined;
+      return claudeEffortLevels(modelId).includes(effort) ? effort : undefined;
   }
 }
 
@@ -854,7 +893,10 @@ export function getReasoningCapabilities(
     const isClaude = isClaudeReasoningModel(modelId);
     if (isClaude || metadata?.reasoning) {
       return {
-        levels: [...ANTHROPIC_EFFORT_LEVELS],
+        // Only a documented Claude family earns the adaptive/xhigh top of the
+        // ladder; a route inferred purely from `metadata.reasoning` keeps the
+        // conservative three, which is exactly what the mapping sends for it.
+        levels: isClaude ? [...claudeEffortLevels(modelId)] : [...ANTHROPIC_EFFORT_LEVELS],
         defaultLevel: 'high',
         supportsSummaries: true,
         mode: 'controllable',
@@ -1107,7 +1149,7 @@ export function effortProviderOptions(
 
   if (npm === '@ai-sdk/anthropic' || npm === VERTEX_ANTHROPIC_NPM) {
     if (!modelId || !isClaudeReasoningModel(modelId)) return undefined;
-    const mapped = mapCodexEffortToAnthropic(effort);
+    const mapped = mapCodexEffortToAnthropic(effort, modelId);
     return mapped
       ? { anthropic: { thinking: { type: 'adaptive', effort: mapped } } }
       : undefined;

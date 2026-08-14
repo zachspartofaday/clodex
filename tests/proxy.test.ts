@@ -1791,7 +1791,7 @@ describe('anthropic passthrough debug logging', () => {
     vi.stubGlobal('fetch', vi.fn().mockResolvedValue({
       ok: false,
       status: 429,
-      headers: { get: () => 'application/json' },
+      headers: new Headers({ 'content-type': 'application/json' }),
       text: async () => JSON.stringify({ error: { type: 'rate_limit_error', message: 'rate limit exceeded' } }),
     }));
 
@@ -1833,7 +1833,7 @@ describe('anthropic passthrough debug logging', () => {
     vi.stubGlobal('fetch', vi.fn().mockResolvedValue({
       ok: false,
       status: 429,
-      headers: { get: () => 'application/json' },
+      headers: new Headers({ 'content-type': 'application/json' }),
       text: async () => JSON.stringify({ error: { type: 'rate_limit_error', message: 'rate limit exceeded' } }),
     }));
 
@@ -1880,7 +1880,7 @@ describe('anthropic passthrough debug logging', () => {
     vi.stubGlobal('fetch', vi.fn().mockResolvedValue({
       ok: true,
       status: 200,
-      headers: { get: () => 'application/json' },
+      headers: new Headers({ 'content-type': 'application/json' }),
       json: async () => ({ type: 'message', content: [] }),
       text: async () => JSON.stringify({ type: 'message', content: [] }),
     }));
@@ -2173,7 +2173,7 @@ describe('routed Anthropic beta and identity are negative-only', () => {
   const stubJson = () => vi.stubGlobal('fetch', vi.fn().mockResolvedValue({
     ok: true,
     status: 200,
-    headers: { get: () => 'application/json' },
+    headers: new Headers({ 'content-type': 'application/json' }),
     text: async () => JSON.stringify({ type: 'message', model: 'claude-sonnet-4-6', content: [] }),
   }));
 
@@ -2364,7 +2364,7 @@ describe('routed Anthropic beta and identity are negative-only', () => {
     vi.stubGlobal('fetch', vi.fn().mockResolvedValue({
       ok: true,
       status: 200,
-      headers: { get: () => 'text/event-stream' },
+      headers: new Headers({ 'content-type': 'text/event-stream' }),
       body: new ReadableStream({
         start(controller) {
           controller.enqueue(new TextEncoder().encode(sse));
@@ -2401,7 +2401,7 @@ describe('routed Anthropic beta and identity are negative-only', () => {
     vi.stubGlobal('fetch', vi.fn().mockResolvedValue({
       ok: true,
       status: 200,
-      headers: { get: () => 'text/event-stream' },
+      headers: new Headers({ 'content-type': 'text/event-stream' }),
       body: new ReadableStream({
         start(controller) {
           controller.enqueue(new TextEncoder().encode(sse));
