@@ -318,30 +318,37 @@ describe('clodex-claude process wrapper', () => {
     expect(existsSync(launchMarker)).toBe(false);
   });
 
-  it('default mode remains fail-open when no server exists', async () => {
-    const result = await runWrapper(claudeInvocation(23));
+  it('default mode passes process overrides through when no server exists', async () => {
+    const result = await runWrapper(claudeInvocation(23), {
+      CLODEX_OAUTH_ACCOUNT: 'work',
+      CLODEX_KEY_OPENAI_OAUTH: 'temporary-provider-token',
+    });
 
     expect(result).toMatchObject({ code: 23, signal: null });
     expect(result.stdout).toBe('fake-claude-launched\n');
     expect(existsSync(launchMarker)).toBe(true);
   });
 
-  it('warns and launches when a standalone server cannot apply an account override', async () => {
+  it('fails direct-terminal launch when a standalone server cannot apply an account override', async () => {
     const endpoint = await openLoopbackServer();
     advertiseEndpoint(endpoint.port);
     try {
-      const result = await runWrapper(claudeInvocation(), { CLODEX_OAUTH_ACCOUNT: 'work' });
+      const result = await runWrapper([helperPath, launchMarker, '0'], {
+        CLODEX_CLAUDE_PATH: process.execPath,
+        CLODEX_OAUTH_ACCOUNT: 'sensitive-account-slot',
+      });
 
-      expect(result).toMatchObject({ code: 0, signal: null });
-      expect(result.stderr).toContain('CLODEX_OAUTH_ACCOUNT is ignored');
-      expect(result.stderr).toContain('restart that server with the override');
-      expect(existsSync(launchMarker)).toBe(true);
+      expect(result).toMatchObject({ code: 1, signal: null });
+      expect(result.stderr).toContain('CLODEX_OAUTH_ACCOUNT cannot select an account');
+      expect(result.stderr).toContain('server owns credential selection');
+      expect(result.stderr).not.toContain('sensitive-account-slot');
+      expect(existsSync(launchMarker)).toBe(false);
     } finally {
       await closeServer(endpoint.server);
     }
   });
 
-  it('warns without exposing a provider key and still launches through the server', async () => {
+  it('fails process-wrapper launch without exposing a provider key', async () => {
     const endpoint = await openLoopbackServer();
     advertiseEndpoint(endpoint.port);
     try {
@@ -349,17 +356,17 @@ describe('clodex-claude process wrapper', () => {
         CLODEX_KEY_OPENAI_OAUTH: 'temporary-provider-token',
       });
 
-      expect(result).toMatchObject({ code: 0, signal: null });
-      expect(result.stderr).toContain('CLODEX_KEY_OPENAI_OAUTH is ignored');
-      expect(result.stderr).toContain('save that credential as a provider or account');
+      expect(result).toMatchObject({ code: 1, signal: null });
+      expect(result.stderr).toContain('CLODEX_KEY_OPENAI_OAUTH cannot override credential selection');
+      expect(result.stderr).toContain('server owns credential selection and its model catalog');
       expect(result.stderr).not.toContain('temporary-provider-token');
-      expect(existsSync(launchMarker)).toBe(true);
+      expect(existsSync(launchMarker)).toBe(false);
     } finally {
       await closeServer(endpoint.server);
     }
   });
 
-  it('does not block launch for an unrelated provider key', async () => {
+  it('fails closed for a nonblank key whose provider cannot be proven unrelated', async () => {
     const endpoint = await openLoopbackServer();
     advertiseEndpoint(endpoint.port);
     try {
@@ -367,10 +374,10 @@ describe('clodex-claude process wrapper', () => {
         CLODEX_KEY_UNRELATED: 'temporary-unrelated-token',
       });
 
-      expect(result).toMatchObject({ code: 0, signal: null });
-      expect(result.stderr).toContain('CLODEX_KEY_UNRELATED is ignored');
+      expect(result).toMatchObject({ code: 1, signal: null });
+      expect(result.stderr).toContain('CLODEX_KEY_UNRELATED cannot override credential selection');
       expect(result.stderr).not.toContain('temporary-unrelated-token');
-      expect(existsSync(launchMarker)).toBe(true);
+      expect(existsSync(launchMarker)).toBe(false);
     } finally {
       await closeServer(endpoint.server);
     }

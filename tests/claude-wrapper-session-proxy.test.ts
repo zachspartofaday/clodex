@@ -239,7 +239,7 @@ describe('clodex-claude inherited session routing', () => {
     }
   });
 
-  it('reports a provider key when a dead private session falls back to a standalone server', async () => {
+  it('fails closed when a dead private session with a key falls back to a standalone server', async () => {
     const deadSession = await openLoopbackServer('::1', true);
     const standalone = await openLoopbackServer();
     advertiseEndpoint(standalone.port);
@@ -248,22 +248,11 @@ describe('clodex-claude inherited session routing', () => {
         claudeInvocation(),
         sessionEnv(deadSession.port, { CLODEX_KEY_OPENAI_OAUTH: 'fallback-token' }),
       );
-      // A down bridge must never break launching claude, so this candidate
-      // WARNS about the process-only key and launches through the standalone
-      // server the dead session fell back to. The key's value is never echoed,
-      // and the dead session's own proxy vars/marker do not survive.
-      expect(result).toMatchObject({ code: 0, signal: null });
-      expect(result.stderr).toContain('CLODEX_KEY_OPENAI_OAUTH is ignored');
+      expect(result).toMatchObject({ code: 1, signal: null });
+      expect(result.stderr).toContain('CLODEX_KEY_OPENAI_OAUTH cannot override credential selection');
+      expect(result.stderr).toContain('server owns credential selection and its model catalog');
       expect(result.stderr).not.toContain('fallback-token');
-      expect(readLaunchEnv()).toEqual({
-        baseUrl: `http://127.0.0.1:${standalone.port}/anthropic`,
-        httpProxy: null,
-        sessionProxy: null,
-        // The dead session's remap was OUR injection (sentinel-claimed), so a
-        // fallback launch clears it rather than routing a built-in at a port
-        // nobody is listening on.
-        fable: null,
-      });
+      expect(existsSync(launchMarker)).toBe(false);
     } finally {
       await Promise.all([closeServer(deadSession.server), closeServer(standalone.server)]);
     }
