@@ -326,6 +326,73 @@ describe('generateOpenAiResponse with forceStream', () => {
   });
 });
 
+describe('ordinary OpenAI terminal validation', () => {
+  it.each([
+    ['absent', { text: 'partial', toolCalls: [] }],
+    ['synthetic other', {
+      text: 'partial',
+      toolCalls: [],
+      finishReason: 'other',
+      rawFinishReason: undefined,
+    }],
+  ])('rejects %s terminal output before assembling success', async (_label, result) => {
+    vi.mocked(generateText).mockResolvedValue(result as never);
+
+    try {
+      await expect(generateOpenAiResponse(
+        {} as never,
+        { messages: [] },
+        'gpt-test',
+      )).rejects.toThrow('Upstream SDK stream ended without a terminal event');
+    } finally {
+      vi.mocked(generateText).mockReset();
+    }
+  });
+
+  it('accepts a provider-defined other finish reason', async () => {
+    vi.mocked(generateText).mockResolvedValue({
+      text: 'complete',
+      toolCalls: [],
+      finishReason: 'other',
+      rawFinishReason: 'provider-defined',
+    } as never);
+
+    try {
+      const response: any = await generateOpenAiResponse({} as never, { messages: [] }, 'gpt-test');
+      expect(response.choices[0].finish_reason).toBe('other');
+    } finally {
+      vi.mocked(generateText).mockReset();
+    }
+  });
+
+  it('rejects a late success after the total deadline aborts the request', async () => {
+    vi.useFakeTimers();
+    let resolveLate!: (value: unknown) => void;
+    vi.mocked(generateText).mockImplementation((() => new Promise(resolve => {
+      resolveLate = resolve;
+    })) as never);
+
+    try {
+      const settled = generateOpenAiResponse({} as never, { messages: [] }, 'gpt-test')
+        .then(() => undefined, reason => reason);
+
+      await vi.advanceTimersByTimeAsync(10 * 60_000);
+      resolveLate({
+        text: 'late',
+        toolCalls: [],
+        finishReason: 'stop',
+        usage: { inputTokens: 1, outputTokens: 1, totalTokens: 2 },
+      });
+
+      const error = await settled;
+      expect(error).toMatchObject({ category: 'total_timeout' });
+    } finally {
+      vi.useRealTimers();
+      vi.mocked(generateText).mockReset();
+    }
+  });
+});
+
 describe('OpenAI-format service tier omission warning', () => {
   it('surfaces the structured tier omission warning on non-streaming responses, once per process', async () => {
     const prior = process.env.CLODEX_SERVICE_TIER;

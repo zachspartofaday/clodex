@@ -320,12 +320,20 @@ export async function generateOpenAiResponse(
       SDK_NON_STREAMING_TIMEOUT_MS,
     );
     try {
-      result = (await generateText({
+      const generated = (await generateText({
         model,
         ...(params as any),
         maxRetries: upstreamMaxRetries(),
         abortSignal: totalAbort.signal,
       })) as any;
+      if (totalAbort.signal.aborted) throw streamAbortError(totalAbort.signal);
+      result = {
+        ...generated,
+        finishReason: requireOpenAiTerminalFinish({
+          finishReason: generated.finishReason,
+          rawFinishReason: generated.rawFinishReason,
+        }),
+      };
     } finally {
       clearTimeout(totalTimer);
       if (!totalAbort.signal.aborted) totalAbort.abort();
@@ -347,7 +355,7 @@ export async function generateOpenAiResponse(
     object: 'chat.completion',
     created: Math.floor(Date.now() / 1000),
     model: responseModelId,
-    choices: [{ index: 0, message, finish_reason: result.finishReason || 'stop' }],
+    choices: [{ index: 0, message, finish_reason: result.finishReason }],
     usage: {
       prompt_tokens: result.usage?.inputTokens ?? 0,
       completion_tokens: result.usage?.outputTokens ?? 0,

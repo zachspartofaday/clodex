@@ -925,6 +925,123 @@ describe('generateAnthropicResponse', () => {
     }
   });
 
+  it('maps a non-streaming length finish to max_tokens', async () => {
+    vi.resetModules();
+    const generateText = vi.fn(async () => ({
+      text: 'truncated',
+      toolCalls: [],
+      finishReason: 'length',
+      usage: { inputTokens: 1, outputTokens: 2 },
+    }));
+    vi.doMock('ai', () => ({
+      generateText,
+      streamText: vi.fn(),
+      tool: vi.fn((spec: unknown) => spec),
+      jsonSchema: vi.fn((schema: unknown) => schema),
+    }));
+
+    try {
+      const { generateAnthropicResponse } = await import('../src/sdk-adapter.js');
+      const body = await generateAnthropicResponse({} as never, { messages: [] }, 'test-model');
+      expect(body.stop_reason).toBe('max_tokens');
+    } finally {
+      vi.doUnmock('ai');
+      vi.resetModules();
+    }
+  });
+
+  it('maps a non-streaming stop with an actual tool call to tool_use', async () => {
+    vi.resetModules();
+    const generateText = vi.fn(async () => ({
+      text: '',
+      toolCalls: [{ toolCallId: 'call_1', toolName: 'Read', input: { path: 'a' } }],
+      finishReason: 'stop',
+      usage: { inputTokens: 1, outputTokens: 2 },
+    }));
+    vi.doMock('ai', () => ({
+      generateText,
+      streamText: vi.fn(),
+      tool: vi.fn((spec: unknown) => spec),
+      jsonSchema: vi.fn((schema: unknown) => schema),
+    }));
+
+    try {
+      const { generateAnthropicResponse } = await import('../src/sdk-adapter.js');
+      const body = await generateAnthropicResponse({} as never, { messages: [] }, 'test-model');
+      expect(body.stop_reason).toBe('tool_use');
+    } finally {
+      vi.doUnmock('ai');
+      vi.resetModules();
+    }
+  });
+
+  it('rejects a late success after caller abort', async () => {
+    vi.resetModules();
+    let resolveLate!: (value: unknown) => void;
+    const generateText = vi.fn(() => new Promise(resolve => {
+      resolveLate = resolve;
+    }));
+    vi.doMock('ai', () => ({
+      generateText,
+      streamText: vi.fn(),
+      tool: vi.fn((spec: unknown) => spec),
+      jsonSchema: vi.fn((schema: unknown) => schema),
+    }));
+
+    try {
+      const { generateAnthropicResponse } = await import('../src/sdk-adapter.js');
+      const callerAbort = new AbortController();
+      const reason = new Error('Client disconnected');
+      const settled = generateAnthropicResponse(
+        {} as never,
+        { messages: [] },
+        'test-model',
+        { abortSignal: callerAbort.signal },
+      ).then(() => undefined, error => error);
+
+      callerAbort.abort(reason);
+      resolveLate({ text: 'late', toolCalls: [], finishReason: 'stop' });
+
+      expect(await settled).toBe(reason);
+    } finally {
+      vi.doUnmock('ai');
+      vi.resetModules();
+    }
+  });
+
+  it('rejects a late success after the total deadline aborts the request', async () => {
+    vi.resetModules();
+    vi.useFakeTimers();
+    let resolveLate!: (value: unknown) => void;
+    const generateText = vi.fn(() => new Promise(resolve => {
+      resolveLate = resolve;
+    }));
+    vi.doMock('ai', () => ({
+      generateText,
+      streamText: vi.fn(),
+      tool: vi.fn((spec: unknown) => spec),
+      jsonSchema: vi.fn((schema: unknown) => schema),
+    }));
+
+    try {
+      const { generateAnthropicResponse } = await import('../src/sdk-adapter.js');
+      const settled = generateAnthropicResponse(
+        {} as never,
+        { messages: [] },
+        'test-model',
+      ).then(() => undefined, error => error);
+
+      await vi.advanceTimersByTimeAsync(10 * 60_000);
+      resolveLate({ text: 'late', toolCalls: [], finishReason: 'stop' });
+
+      expect(await settled).toMatchObject({ category: 'total_timeout' });
+    } finally {
+      vi.useRealTimers();
+      vi.doUnmock('ai');
+      vi.resetModules();
+    }
+  });
+
   it('forceStream propagates an SDK error part with its upstream status', async () => {
     vi.resetModules();
     const upstreamError = { statusCode: 401, message: 'Unauthorized' };

@@ -116,6 +116,12 @@ export function requireOpenAiTerminalFinish(
   return part.finishReason;
 }
 
+function mapAnthropicStopReason(terminalReason: string, hasToolCall: boolean): string {
+  if (terminalReason === 'length') return 'max_tokens';
+  if (terminalReason === 'tool-calls' || hasToolCall) return 'tool_use';
+  return 'end_turn';
+}
+
 // ── Anthropic request shapes (only the fields we read) ───────────────────────
 interface AnthropicBlock {
   type: string;
@@ -1061,10 +1067,7 @@ export async function writeAnthropicStream(
     throw error;
   }
 
-  finishReason = sawToolCall ? 'tool_use' : 'end_turn';
-  if (terminalReason === 'tool-calls') finishReason = 'tool_use';
-  else if (terminalReason === 'length') finishReason = 'max_tokens';
-  else if (terminalReason === 'stop' && !sawToolCall) finishReason = 'end_turn';
+  finishReason = mapAnthropicStopReason(terminalReason, sawToolCall);
 
   closeOpen();
   ensureStart();
@@ -1263,6 +1266,7 @@ export async function generateAnthropicResponse(
         maxRetries: upstreamMaxRetries(),
         abortSignal: generateAbort.signal,
       } as Parameters<typeof generateText>[0]);
+      if (generateAbort.signal.aborted) throw streamAbortError(generateAbort.signal);
       finishReason = requireOpenAiTerminalFinish({
         finishReason: r.finishReason,
         rawFinishReason: (r as unknown as { rawFinishReason?: unknown }).rawFinishReason,
@@ -1288,7 +1292,7 @@ export async function generateAnthropicResponse(
         input: sanitizeToolInput(tc.input as Record<string, unknown> ?? {}, requiredProps.get(tc.toolName), tc.toolName),
       })),
     ],
-    stop_reason: finishReason === 'tool-calls' ? 'tool_use' : 'end_turn',
+    stop_reason: mapAnthropicStopReason(finishReason, toolCalls.length > 0),
     usage: toAnthropicUsage(usage),
   };
 }
