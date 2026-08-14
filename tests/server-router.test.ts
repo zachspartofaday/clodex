@@ -498,6 +498,109 @@ describe('server router', () => {
     });
   });
 
+  /**
+   * The Messages passthrough is verbatim, which is precisely why the one graded
+   * control it CAN carry has to be applied here: a global effort that reached
+   * every SDK-translated route and none of these would be a setting whose
+   * meaning depended on which transport a model happened to use.
+   */
+  describe('applies the reviewed effort ladder on the Anthropic passthrough', () => {
+    const thinkingProfile = {
+      modelId: 'qwen3.8-max',
+      transport: 'anthropic-messages',
+      defaultLevel: null,
+      levels: [
+        { level: 'high' as const, native: { kind: 'anthropic-thinking' as const, thinking: { budget_tokens: 16_000, type: 'enabled' } } },
+        { level: 'max' as const, native: { kind: 'anthropic-thinking' as const, thinking: { budget_tokens: 31_999, type: 'enabled' } } },
+      ],
+    };
+
+    async function passthroughServer(
+      upstreamBaseUrl: string,
+      overrides: Partial<ServerModelInfo> = {},
+      serverOptions: Partial<Parameters<typeof startServer>[0]> = {},
+    ): Promise<ServerHandle> {
+      return startTestServer({
+        catalog: createGatewayModelCatalog([{
+          id: 'graded-model',
+          name: 'Graded Model',
+          isFree: false,
+          brand: 'Other',
+          providerId: 'local',
+          sourceBackend: 'go',
+          modelFormat: 'anthropic',
+          baseUrl: upstreamBaseUrl,
+          apiKey: 'key',
+          authType: 'api',
+          effortProfile: thinkingProfile,
+          ...overrides,
+        } as ServerModelInfo]),
+        ...serverOptions,
+      });
+    }
+
+    async function post(server: ServerHandle, body: Record<string, unknown>): Promise<Response> {
+      return fetch(`${server.url}/anthropic/v1/messages`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ model: 'graded-model', messages: [{ role: 'user', content: 'hi' }], ...body }),
+      });
+    }
+
+    it('translates the requested level into the upstream thinking object', async () => {
+      const upstream = await startUpstream({ id: 'msg-graded', type: 'message', role: 'assistant', content: [] });
+      handles.push(upstream);
+      const server = await passthroughServer(upstream.baseUrl);
+
+      expect((await post(server, { output_config: { effort: 'max' } })).status).toBe(200);
+      const forwarded = upstream.requests[0]!.body as Record<string, unknown>;
+      expect(forwarded.thinking).toEqual({ budget_tokens: 31_999, type: 'enabled' });
+      // The upstream never sees clodex's own effort vocabulary.
+      expect(forwarded.output_config).toBeUndefined();
+    });
+
+    it('rounds an unsupported level along the ladder under the up policy', async () => {
+      const upstream = await startUpstream({ id: 'msg-graded', type: 'message', role: 'assistant', content: [] });
+      handles.push(upstream);
+      const server = await passthroughServer(upstream.baseUrl, {}, { effortPolicy: 'up' });
+
+      expect((await post(server, { output_config: { effort: 'low' } })).status).toBe(200);
+      expect((upstream.requests[0]!.body as Record<string, unknown>).thinking)
+        .toEqual({ budget_tokens: 16_000, type: 'enabled' });
+    });
+
+    it('refuses an unsupported level under the exact policy without calling upstream', async () => {
+      const upstream = await startUpstream({ id: 'msg-graded', type: 'message', role: 'assistant', content: [] });
+      handles.push(upstream);
+      const server = await passthroughServer(upstream.baseUrl, {}, { effortPolicy: 'exact' });
+
+      const response = await post(server, { output_config: { effort: 'low' } });
+      expect(response.status).toBe(400);
+      expect(upstream.requests).toHaveLength(0);
+    });
+
+    it('sends no thinking when the client requests no effort', async () => {
+      const upstream = await startUpstream({ id: 'msg-graded', type: 'message', role: 'assistant', content: [] });
+      handles.push(upstream);
+      const server = await passthroughServer(upstream.baseUrl);
+
+      expect((await post(server, {})).status).toBe(200);
+      expect(upstream.requests[0]!.body).not.toHaveProperty('thinking');
+    });
+
+    it('leaves a passthrough route without a reviewed ladder byte-identical', async () => {
+      const upstream = await startUpstream({ id: 'msg-plain', type: 'message', role: 'assistant', content: [] });
+      handles.push(upstream);
+      const server = await passthroughServer(upstream.baseUrl, { effortProfile: undefined });
+
+      expect((await post(server, { output_config: { effort: 'max' } })).status).toBe(200);
+      const forwarded = upstream.requests[0]!.body as Record<string, unknown>;
+      expect(forwarded).not.toHaveProperty('thinking');
+      // Untouched means untouched: the client's own spelling still travels.
+      expect(forwarded.output_config).toEqual({ effort: 'max' });
+    });
+  });
+
   it('forwards anonymous OpenAI chat completions without authentication headers', async () => {
     const upstream = await startUpstream({
       id: 'chatcmpl-anonymous',

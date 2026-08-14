@@ -232,14 +232,25 @@ describe('generated OpenCode Go profiles', () => {
       const entry = openCodeGoEffortProfile(model.id);
       expect(entry, model.id).toBeDefined();
       const map = model.compatibility?.reasoningEffortMap;
+      const budgets = model.compatibility?.anthropicThinkingBudgetMap;
       const suppressed = model.compatibility?.supportsReasoningEffort === false;
-      const executable = suppressed || !map
+      const executable = suppressed
         ? []
-        : Object.entries(map).filter(([, value]) => value !== null).map(([level]) => level);
+        : budgets
+          ? Object.keys(budgets)
+          : map
+            ? Object.entries(map).filter(([, value]) => value !== null).map(([level]) => level)
+            : [];
       expect(profileLevels(entry!).slice().sort(), model.id).toEqual(executable.slice().sort());
       for (const level of entry!.levels) {
-        expect(level.native, `${model.id}.${level.level}`)
-          .toEqual({ kind: 'reasoning-effort', value: map![level.level] });
+        expect(level.native, `${model.id}.${level.level}`).toEqual(
+          budgets
+            ? {
+                kind: 'anthropic-thinking',
+                thinking: { budget_tokens: budgets[level.level], type: 'enabled' },
+              }
+            : { kind: 'reasoning-effort', value: map![level.level] },
+        );
       }
     }
   });

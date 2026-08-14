@@ -1,5 +1,9 @@
 import { describe, expect, it } from 'vitest';
-import { transformOpenAiCompatibleRequestBody } from '../src/model-runtime-compatibility.js';
+import {
+  applyAnthropicMessagesEffort,
+  transformOpenAiCompatibleRequestBody,
+} from '../src/model-runtime-compatibility.js';
+import { resolveRequestEffort, type EffortProfile } from '../src/effort-policy.js';
 
 describe('transformOpenAiCompatibleRequestBody', () => {
   it('applies OpenAI-compatible field and message compatibility rules without mutating input', () => {
@@ -145,5 +149,114 @@ describe('transformOpenAiCompatibleRequestBody', () => {
       { max_tokens: 2048 },
       { maxTokensField: 'max_completion_tokens' },
     )).toEqual({ max_completion_tokens: 2048 });
+  });
+});
+
+describe('applyAnthropicMessagesEffort', () => {
+  const budgetProfile: EffortProfile = {
+    modelId: 'qwen3.8-max',
+    transport: 'anthropic-messages',
+    defaultLevel: null,
+    levels: [
+      { level: 'high', native: { kind: 'anthropic-thinking', thinking: { budget_tokens: 16_000, type: 'enabled' } } },
+      { level: 'max', native: { kind: 'anthropic-thinking', thinking: { budget_tokens: 31_999, type: 'enabled' } } },
+    ],
+  };
+  const effortProfile: EffortProfile = {
+    modelId: 'kimi-k3',
+    transport: 'openai-completions',
+    defaultLevel: null,
+    levels: [{ level: 'max', native: { kind: 'reasoning-effort', value: 'max' } }],
+  };
+  const emptyProfile: EffortProfile = {
+    modelId: 'minimax-m3',
+    transport: 'anthropic-messages',
+    defaultLevel: null,
+    levels: [],
+  };
+
+  const request = (effort?: string) => ({
+    model: 'qwen3.8-max',
+    messages: [{ role: 'user', content: 'hi' }],
+    ...(effort === undefined ? {} : { output_config: { effort } }),
+  });
+
+  it('translates the resolved level into the upstream thinking object', () => {
+    const body = request('max');
+    const out = applyAnthropicMessagesEffort(
+      body,
+      budgetProfile,
+      resolveRequestEffort('max', budgetProfile),
+    );
+    expect(out.thinking).toEqual({ budget_tokens: 31_999, type: 'enabled' });
+    // clodex's own vocabulary does not travel alongside its translation.
+    expect(out.output_config).toBeUndefined();
+    expect(out.messages).toBe(body.messages);
+    // The caller's body is never mutated.
+    expect(body).toEqual(request('max'));
+  });
+
+  it('sends the rounded level when the policy rounds an unsupported one', () => {
+    const out = applyAnthropicMessagesEffort(
+      request('low'),
+      budgetProfile,
+      resolveRequestEffort('low', budgetProfile, 'up'),
+    );
+    expect(out.thinking).toEqual({ budget_tokens: 16_000, type: 'enabled' });
+  });
+
+  it('sends no thinking when the policy defers to the provider', () => {
+    const out = applyAnthropicMessagesEffort(
+      request('low'),
+      budgetProfile,
+      resolveRequestEffort('low', budgetProfile, 'provider-default'),
+    );
+    expect(out.thinking).toBeUndefined();
+    expect(out.output_config).toBeUndefined();
+  });
+
+  it('overrides a thinking object the client wrote itself', () => {
+    // The route advertises a graded ladder, so the resolved grade is the one
+    // clodex is accountable for — leaving the client's value would make the
+    // advertised control a no-op.
+    const out = applyAnthropicMessagesEffort(
+      { ...request('high'), thinking: { budget_tokens: 1, type: 'enabled' } },
+      budgetProfile,
+      resolveRequestEffort('high', budgetProfile),
+    );
+    expect(out.thinking).toEqual({ budget_tokens: 16_000, type: 'enabled' });
+  });
+
+  it('keeps other output_config keys while dropping only the effort', () => {
+    const out = applyAnthropicMessagesEffort(
+      { ...request('high'), output_config: { effort: 'high', verbosity: 'low' } },
+      budgetProfile,
+      resolveRequestEffort('high', budgetProfile),
+    );
+    expect(out.output_config).toEqual({ verbosity: 'low' });
+  });
+
+  it.each<[string, EffortProfile | undefined]>([
+    ['a route with no profile at all', undefined],
+    ['a Messages route with no executable ladder', emptyProfile],
+    ['a route graded by reasoning_effort instead', effortProfile],
+  ])('leaves the body byte-identical for %s', (_label, profile) => {
+    const body = request('max');
+    const out = applyAnthropicMessagesEffort(
+      body,
+      profile,
+      profile ? resolveRequestEffort('max', profile) : undefined,
+    );
+    expect(out).toBe(body);
+  });
+
+  it('leaves a body with no effort untouched apart from carrying no thinking', () => {
+    const out = applyAnthropicMessagesEffort(
+      request(),
+      budgetProfile,
+      resolveRequestEffort(undefined, budgetProfile),
+    );
+    expect(out.thinking).toBeUndefined();
+    expect(out).toEqual(request());
   });
 });

@@ -450,7 +450,10 @@
     ],
     "compatibility": {
       "supportsCountTokens": false,
-      "supportsReasoningEffort": false
+      "anthropicThinkingBudgetMap": {
+        "high": 16000,
+        "max": 31999
+      }
     },
     "upstreamModelId": "qwen3.7-max",
     "family": "qwen3.7-max"
@@ -475,7 +478,10 @@
     ],
     "compatibility": {
       "supportsCountTokens": false,
-      "supportsReasoningEffort": false
+      "anthropicThinkingBudgetMap": {
+        "high": 16000,
+        "max": 31999
+      }
     },
     "upstreamModelId": "qwen3.7-plus",
     "family": "qwen3.7-plus"
@@ -500,7 +506,10 @@
     ],
     "compatibility": {
       "supportsCountTokens": false,
-      "supportsReasoningEffort": false
+      "anthropicThinkingBudgetMap": {
+        "high": 16000,
+        "max": 31999
+      }
     },
     "upstreamModelId": "qwen3.8-max",
     "family": "qwen3.8-max"

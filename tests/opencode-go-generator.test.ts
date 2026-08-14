@@ -11,6 +11,7 @@ import snapshot from '../src/data/opencode-go-cli-snapshot.json';
 // part of the published TypeScript API surface.
 // @ts-expect-error no declaration file for the maintenance script
 import {
+  assertAnthropicThinkingBudgets,
   assertEffortMapsIdempotent,
   assertResolvedModels,
   assertSnapshotMeta,
@@ -709,32 +710,45 @@ describe('OpenCode Go resolver snapshot generator', () => {
  * allowed to resolve to. A regeneration that widens a ladder, drops a level, or
  * lets a resolver variant reach the wire should fail here with the id named.
  */
-const EXECUTABLE_INTERSECTION: Array<[string, string, Array<[string, string]>]> = [
-  ['deepseek-v4-flash', 'openai-completions', [['high', 'high'], ['max', 'max']]],
-  ['deepseek-v4-pro', 'openai-completions', [['high', 'high'], ['max', 'max']]],
+const EXECUTABLE_INTERSECTION: Array<[string, string, Array<[string, string, string | number]>]> = [
+  ['deepseek-v4-flash', 'openai-completions', [['high', 'reasoning-effort', 'high'], ['max', 'reasoning-effort', 'max']]],
+  ['deepseek-v4-pro', 'openai-completions', [['high', 'reasoning-effort', 'high'], ['max', 'reasoning-effort', 'max']]],
   ['glm-5.1', 'openai-completions', []],
-  ['glm-5.2', 'openai-completions', [['high', 'high'], ['max', 'max']]],
+  ['glm-5.2', 'openai-completions', [['high', 'reasoning-effort', 'high'], ['max', 'reasoning-effort', 'max']]],
   ['gpt-5.6-luna', 'openai-completions', [
-    ['off', 'none'], ['low', 'low'], ['medium', 'medium'],
-    ['high', 'high'], ['xhigh', 'xhigh'], ['max', 'max'],
+    ['off', 'reasoning-effort', 'none'], ['low', 'reasoning-effort', 'low'],
+    ['medium', 'reasoning-effort', 'medium'], ['high', 'reasoning-effort', 'high'],
+    ['xhigh', 'reasoning-effort', 'xhigh'], ['max', 'reasoning-effort', 'max'],
   ]],
-  ['hy3', 'openai-completions', [['off', 'none'], ['low', 'low'], ['high', 'high']]],
+  ['hy3', 'openai-completions', [
+    ['off', 'reasoning-effort', 'none'], ['low', 'reasoning-effort', 'low'], ['high', 'reasoning-effort', 'high'],
+  ]],
   ['kimi-k2.6', 'openai-completions', []],
   ['kimi-k2.7-code', 'openai-completions', []],
-  ['kimi-k3', 'openai-completions', [['max', 'max']]],
+  ['kimi-k3', 'openai-completions', [['max', 'reasoning-effort', 'max']]],
   ['mimo-v2.5', 'openai-completions', []],
   ['mimo-v2.5-pro', 'openai-completions', []],
   ['minimax-m2.7', 'openai-completions', []],
+  // Anthropic-format and never graded: the resolver's `disabled`/`adaptive`
+  // variants carry no budget, so there is nothing for a ladder to execute.
   ['minimax-m3', 'anthropic-messages', []],
   ['qwen3.6-plus', 'openai-completions', [
-    ['low', 'low'], ['medium', 'medium'], ['high', 'high'],
-    ['xhigh', 'xhigh'], ['max', 'max'],
+    ['low', 'reasoning-effort', 'low'], ['medium', 'reasoning-effort', 'medium'],
+    ['high', 'reasoning-effort', 'high'], ['xhigh', 'reasoning-effort', 'xhigh'],
+    ['max', 'reasoning-effort', 'max'],
   ]],
-  ['qwen3.7-max', 'anthropic-messages', []],
-  ['qwen3.7-plus', 'anthropic-messages', []],
-  ['qwen3.8-max', 'anthropic-messages', []],
+  // Anthropic-format WITH reviewed thinking budgets: the Messages passthrough
+  // carries the `thinking` object, so these grades are executable.
+  ['qwen3.7-max', 'anthropic-messages', [
+    ['high', 'anthropic-thinking', 16_000], ['max', 'anthropic-thinking', 31_999],
+  ]],
+  ['qwen3.7-plus', 'anthropic-messages', [
+    ['high', 'anthropic-thinking', 16_000], ['max', 'anthropic-thinking', 31_999],
+  ]],
+  ['qwen3.8-max', 'anthropic-messages', [
+    ['high', 'anthropic-thinking', 16_000], ['max', 'anthropic-thinking', 31_999],
+  ]],
 ];
-
 type EffortProfileTable = {
   schemaVersion: number;
   provider: string;
@@ -742,7 +756,10 @@ type EffortProfileTable = {
     modelId: string;
     transport: string;
     defaultLevel: string | null;
-    levels: Array<{ level: string; native: { kind: string; value: string } }>;
+    levels: Array<{
+      level: string;
+      native: { kind: string; value?: string; thinking?: { type: string; budget_tokens?: number } };
+    }>;
   }>;
   disagreements: Array<{
     modelId: string;
@@ -771,9 +788,26 @@ describe('OpenCode Go validated effort profiles', () => {
     for (const [id, transport, levels] of EXECUTABLE_INTERSECTION) {
       const profile = byId.get(id)!;
       expect(profile.transport, id).toBe(transport);
-      expect(profile.levels.map(entry => [entry.level, entry.native.value]), id).toEqual(levels);
+      expect(
+        profile.levels.map(entry => [
+          entry.level,
+          entry.native.kind,
+          entry.native.kind === 'reasoning-effort'
+            ? entry.native.value
+            : entry.native.thinking?.budget_tokens,
+        ]),
+        id,
+      ).toEqual(levels);
       for (const entry of profile.levels) {
-        expect(entry.native.kind, `${id}.${entry.level}`).toBe('reasoning-effort');
+        // A thinking representation is executable on the Messages transport and
+        // nowhere else; the reverse is true of a reasoning_effort value.
+        expect(
+          entry.native.kind === 'anthropic-thinking' ? 'anthropic-messages' : 'openai-completions',
+          `${id}.${entry.level}`,
+        ).toBe(transport);
+        if (entry.native.kind === 'anthropic-thinking') {
+          expect(entry.native.thinking?.type, `${id}.${entry.level}`).toBe('enabled');
+        }
       }
     }
   });
@@ -788,23 +822,46 @@ describe('OpenCode Go validated effort profiles', () => {
 
   it('denies every Anthropic thinking representation the running transport cannot carry', () => {
     const denied = generatedProfiles().disagreements
-      .filter(entry => entry.advertised?.kind === 'anthropic-thinking')
+      .filter(entry => entry.advertised?.kind === 'anthropic-thinking'
+        && String(entry.reason).includes('carries no clodex-controlled'))
       .map(entry => `${entry.modelId}/${entry.variant}`);
 
     // qwen3.6-plus is the case where the resolver advertises Anthropic budgets
     // for a model clodex runs over Chat Completions: the budgets are denied, and
-    // the reviewed effort map — not the snapshot — governs that route.
-    expect(denied).toEqual([
-      'minimax-m3/none', 'minimax-m3/thinking',
-      'qwen3.6-plus/high', 'qwen3.6-plus/max',
-      'qwen3.7-max/high', 'qwen3.7-max/max',
-      'qwen3.7-plus/high', 'qwen3.7-plus/max',
-      'qwen3.8-max/high', 'qwen3.8-max/max',
-    ]);
+    // the reviewed effort map — not the snapshot — governs that route. The
+    // Messages-transport Qwens are NOT here: that transport does carry the
+    // representation, so their budgets are reviewed rather than denied.
+    expect(denied).toEqual(['qwen3.6-plus/high', 'qwen3.6-plus/max']);
     const qwen36 = generatedProfiles().profiles.find(profile => profile.modelId === 'qwen3.6-plus')!;
     for (const entry of qwen36.levels) {
       expect(entry.native.kind).toBe('reasoning-effort');
       expect(entry.native).not.toHaveProperty('thinking');
+    }
+  });
+
+  it('still denies an ungraded Anthropic thinking variant on the Messages transport', () => {
+    // minimax-m3 routes over Messages but its variants are `disabled`/`adaptive`
+    // — a toggle, not a ladder. Carrying the transport is not the same as having
+    // something to grade, so the profile stays empty.
+    const table = generatedProfiles();
+    const denied = table.disagreements
+      .filter(entry => entry.modelId === 'minimax-m3')
+      .map(entry => [entry.variant, entry.reason]);
+    expect(denied).toEqual([
+      ['none', 'the reviewed route declares no clodex-operable effort control'],
+      ['thinking', 'the reviewed route declares no clodex-operable effort control'],
+    ]);
+    expect(table.profiles.find(profile => profile.modelId === 'minimax-m3')!.levels).toEqual([]);
+  });
+
+  it('records the reviewed Messages thinking ladder as agreement, not disagreement', () => {
+    const table = generatedProfiles();
+    for (const id of ['qwen3.7-max', 'qwen3.7-plus', 'qwen3.8-max']) {
+      expect(table.disagreements.filter(entry => entry.modelId === id), id).toEqual([]);
+      expect(table.profiles.find(profile => profile.modelId === id)!.levels, id).toEqual([
+        { level: 'high', native: { kind: 'anthropic-thinking', thinking: { budget_tokens: 16_000, type: 'enabled' } } },
+        { level: 'max', native: { kind: 'anthropic-thinking', thinking: { budget_tokens: 31_999, type: 'enabled' } } },
+      ]);
     }
   });
 
@@ -833,15 +890,55 @@ describe('OpenCode Go validated effort profiles', () => {
 
   it('records every disagreement and nothing else', () => {
     const table = generatedProfiles();
-    expect(table.disagreements).toHaveLength(12);
+    expect(table.disagreements).toHaveLength(6);
     expect(new Set(table.disagreements.map(entry => entry.modelId))).toEqual(new Set([
       'deepseek-v4-flash', 'minimax-m3', 'qwen3.6-plus',
-      'qwen3.7-max', 'qwen3.7-plus', 'qwen3.8-max',
     ]));
   });
 
   it('accepts the committed maps as idempotent and injective', () => {
     expect(assertEffortMapsIdempotent()).toBe(true);
+  });
+
+  it('accepts the committed Anthropic thinking budgets', () => {
+    expect(assertAnthropicThinkingBudgets()).toBe(true);
+  });
+
+  it.each<[string, Record<string, unknown>, Record<string, string>, RegExp]>([
+    [
+      // The whole point of the ladder is that this transport can carry it; on
+      // any other route it would advertise a control no request path executes.
+      'a thinking ladder on a Chat Completions route',
+      { 'qwen3.6-plus': { anthropicThinkingBudgetMap: { high: 16_000 } } },
+      { 'qwen3.6-plus': 'openai-completions' },
+      /the reviewed runtime transport is openai-completions/,
+    ],
+    [
+      'a thinking ladder alongside a reasoning_effort map',
+      { 'qwen3.8-max': { anthropicThinkingBudgetMap: { high: 16_000 }, reasoningEffortMap: { high: 'high' } } },
+      { 'qwen3.8-max': 'anthropic-messages' },
+      /cannot declare both a reasoningEffortMap and a thinking budget ladder/,
+    ],
+    [
+      'a budget the Messages API cannot accept',
+      { 'qwen3.8-max': { anthropicThinkingBudgetMap: { high: 0 } } },
+      { 'qwen3.8-max': 'anthropic-messages' },
+      /must be a positive integer token budget/,
+    ],
+    [
+      'a budget keyed on a level outside the global vocabulary',
+      { 'qwen3.8-max': { anthropicThinkingBudgetMap: { turbo: 16_000 } } },
+      { 'qwen3.8-max': 'anthropic-messages' },
+      /is not a global effort level/,
+    ],
+    [
+      'an empty ladder that should have been an explicit suppression',
+      { 'qwen3.8-max': { anthropicThinkingBudgetMap: {} } },
+      { 'qwen3.8-max': 'anthropic-messages' },
+      /state supportsReasoningEffort: false instead/,
+    ],
+  ])('refuses to generate from %s', (_label, patches, transports, expected) => {
+    expect(() => assertAnthropicThinkingBudgets(patches, transports)).toThrow(expected);
   });
 
   it.each<[string, Record<string, unknown>, RegExp]>([

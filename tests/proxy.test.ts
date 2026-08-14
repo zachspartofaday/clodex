@@ -5,6 +5,7 @@ import { mkdtempSync, readFileSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { aliasModelId, startProxy, startProxyCatalog, type ProxyRoute } from '../src/proxy.js';
+import type { EffortProfile } from '../src/effort-policy.js';
 import { makeRouteResolver, resolveCatalogModelAliases } from '../src/catalog.js';
 import { getProxyDebugLogPath } from '../src/trace-log.js';
 import { anthropicMessagesEndpoint, estimateAnthropicInputTokens } from '../src/anthropic-endpoints.js';
@@ -2453,5 +2454,130 @@ describe('routed Anthropic beta and identity are negative-only', () => {
     expect(url).toBe('https://gateway.example.test/v1/messages');
     expect(readFileSync(getProxyDebugLogPath(), 'utf8'))
       .toContain('destination-not-canonical-native');
+  });
+});
+
+/**
+ * The `clodex claude` proxy and the server router share one passthrough
+ * contract, so the reviewed thinking ladder must be applied on both. Applying
+ * it on only one would make the same model answer differently depending on how
+ * clodex was launched.
+ */
+describe('anthropic passthrough applies the reviewed thinking ladder', () => {
+  afterEach(() => {
+    vi.unstubAllGlobals();
+    vi.clearAllMocks();
+  });
+
+  const thinkingProfile: EffortProfile = {
+    modelId: 'qwen3.8-max',
+    transport: 'anthropic-messages',
+    defaultLevel: null,
+    levels: [
+      { level: 'high', native: { kind: 'anthropic-thinking', thinking: { budget_tokens: 16_000, type: 'enabled' } } },
+      { level: 'max', native: { kind: 'anthropic-thinking', thinking: { budget_tokens: 31_999, type: 'enabled' } } },
+    ],
+  };
+
+  function gradedRoute(overrides: Partial<ProxyRoute> = {}): ProxyRoute {
+    return {
+      aliasId: 'anthropic-zen__qwen3.8-max',
+      realModelId: 'qwen3.8-max',
+      displayName: 'Qwen 3.8 Max',
+      upstreamUrl: 'https://opencode.ai/zen/go',
+      apiKey: 'key',
+      modelFormat: 'anthropic',
+      providerId: 'opencode-go',
+      authType: 'api',
+      effortProfile: thinkingProfile,
+      ...overrides,
+    };
+  }
+
+  function stubUpstream(): ReturnType<typeof vi.fn> {
+    const fetchMock = vi.fn().mockResolvedValue({
+      ok: true,
+      status: 200,
+      headers: new Headers({ 'content-type': 'application/json' }),
+      body: {},
+      text: async () => JSON.stringify({ id: 'msg_1', type: 'message', model: 'qwen3.8-max', content: [] }),
+    });
+    vi.stubGlobal('fetch', fetchMock);
+    return fetchMock;
+  }
+
+  const forwardedBody = (fetchMock: ReturnType<typeof vi.fn>): Record<string, unknown> =>
+    JSON.parse((fetchMock.mock.calls[0]![1] as { body: string }).body) as Record<string, unknown>;
+
+  it('translates the requested level into the upstream thinking object', async () => {
+    const fetchMock = stubUpstream();
+    const route = gradedRoute();
+    const handle = await startProxyCatalog([route], route.aliasId, false);
+    const res = await postToProxy(handle.port, handle.token, {
+      model: route.aliasId,
+      max_tokens: 100,
+      messages: [{ role: 'user', content: 'hi' }],
+      output_config: { effort: 'max' },
+    });
+    handle.close();
+
+    expect(res.status).toBe(200);
+    const body = forwardedBody(fetchMock);
+    expect(body.thinking).toEqual({ budget_tokens: 31_999, type: 'enabled' });
+    expect(body.output_config).toBeUndefined();
+  });
+
+  it('honours the launch effort policy when rounding an unsupported level', async () => {
+    const fetchMock = stubUpstream();
+    const route = gradedRoute();
+    const handle = await startProxyCatalog(
+      [route], route.aliasId, false, undefined, undefined, undefined, undefined, 'down',
+    );
+    const res = await postToProxy(handle.port, handle.token, {
+      model: route.aliasId,
+      max_tokens: 100,
+      messages: [{ role: 'user', content: 'hi' }],
+      output_config: { effort: 'xhigh' },
+    });
+    handle.close();
+
+    expect(res.status).toBe(200);
+    expect(forwardedBody(fetchMock).thinking).toEqual({ budget_tokens: 16_000, type: 'enabled' });
+  });
+
+  it('refuses an unsupported level under the exact policy without calling upstream', async () => {
+    const fetchMock = stubUpstream();
+    const route = gradedRoute();
+    const handle = await startProxyCatalog(
+      [route], route.aliasId, false, undefined, undefined, undefined, undefined, 'exact',
+    );
+    const res = await postToProxy(handle.port, handle.token, {
+      model: route.aliasId,
+      max_tokens: 100,
+      messages: [{ role: 'user', content: 'hi' }],
+      output_config: { effort: 'low' },
+    });
+    handle.close();
+
+    expect(res.status).toBe(400);
+    expect(fetchMock).not.toHaveBeenCalled();
+  });
+
+  it('leaves a passthrough route without a reviewed ladder byte-identical', async () => {
+    const fetchMock = stubUpstream();
+    const route = gradedRoute({ effortProfile: undefined });
+    const handle = await startProxyCatalog([route], route.aliasId, false);
+    const res = await postToProxy(handle.port, handle.token, {
+      model: route.aliasId,
+      max_tokens: 100,
+      messages: [{ role: 'user', content: 'hi' }],
+      output_config: { effort: 'max' },
+    });
+    handle.close();
+
+    expect(res.status).toBe(200);
+    const body = forwardedBody(fetchMock);
+    expect(body).not.toHaveProperty('thinking');
+    expect(body.output_config).toEqual({ effort: 'max' });
   });
 });

@@ -116,14 +116,35 @@ describe('opencode-go catalog invariants', () => {
   });
 
   it('no anthropic-format entry advertises an effort ladder it cannot send', () => {
-    // Effort reaches an upstream through effortProviderOptions and the
-    // thinkingFormat transform, both of which act on an
-    // OpenAiCompatibleRequestBody. A passthrough Messages body is forwarded
-    // untouched, so a graded effort on this route can never reach the wire.
+    // A `reasoning_effort` reaches an upstream through effortProviderOptions and
+    // the thinkingFormat transform, both of which act on an
+    // OpenAiCompatibleRequestBody, so no Messages route can send one. The one
+    // graded control this route DOES carry is the Messages `thinking` object,
+    // and only a reviewed budget ladder may claim it — every other
+    // anthropic-format entry keeps the structural denial.
     for (const model of models.filter(entry => entry.modelFormat === 'anthropic')) {
-      expect(model.compatibility?.supportsReasoningEffort, model.id).toBe(false);
+      const compatibility = model.compatibility;
+      if (compatibility?.anthropicThinkingBudgetMap) {
+        expect(compatibility.supportsReasoningEffort, model.id).toBeUndefined();
+        for (const [level, budget] of Object.entries(compatibility.anthropicThinkingBudgetMap)) {
+          expect(Number.isInteger(budget) && budget > 0, `${model.id}.${level}`).toBe(true);
+        }
+      } else {
+        expect(compatibility?.supportsReasoningEffort, model.id).toBe(false);
+      }
       // The same route cannot answer count_tokens upstream either.
-      expect(model.compatibility?.supportsCountTokens, model.id).toBe(false);
+      expect(compatibility?.supportsCountTokens, model.id).toBe(false);
+    }
+  });
+
+  it('states a thinking budget ladder only on the Messages transport', () => {
+    for (const model of models) {
+      if (!model.compatibility?.anthropicThinkingBudgetMap) continue;
+      expect(model.modelFormat, model.id).toBe('anthropic');
+      expect(model.npm, model.id).toBe('@ai-sdk/anthropic');
+      // Two ladders for one model would leave the two request paths disagreeing
+      // about which control grades it.
+      expect(model.compatibility.reasoningEffortMap, model.id).toBeUndefined();
     }
   });
 

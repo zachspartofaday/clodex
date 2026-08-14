@@ -40,6 +40,7 @@ import {
 import { createLanguageModel, isSdkMigratedNpm, maxToolsForNpm } from './provider-factory.js';
 import { randomUUID } from 'node:crypto';
 import {
+  anthropicEffortFromRequest,
   isOpenAiOAuthRoute,
   oauthServiceTier,
   translateRequest as sdkTranslateRequest,
@@ -65,8 +66,17 @@ import {
 import { withResponsesWebSocketDiagnosticContext } from './oauth/responses-websocket.js';
 import { resolveContextWindow } from './context-window.js';
 import { listenTcpServer } from './listener-ready.js';
-import type { ModelRuntimeCompatibility } from './model-runtime-compatibility.js';
-import type { EffortProfile, UnsupportedEffortPolicy } from './effort-policy.js';
+import {
+  applyAnthropicMessagesEffort,
+  type ModelRuntimeCompatibility,
+} from './model-runtime-compatibility.js';
+import {
+  DEFAULT_UNSUPPORTED_EFFORT_POLICY,
+  EffortResolutionError,
+  resolveRequestEffort,
+  type EffortProfile,
+  type UnsupportedEffortPolicy,
+} from './effort-policy.js';
 import type { AnthropicAuthMode } from './anthropic-auth-mode.js';
 import { canonicalAnthropicBaseUrl } from './registry/url-security.js';
 
@@ -596,7 +606,31 @@ export async function startProxyCatalog(
       // Forward raw Anthropic body (with real model id) directly to the upstream.
       // No translation needed — the upstream speaks Anthropic natively.
       if (route.modelFormat === 'anthropic') {
-        const forwardBody = { ...anthropicBody, model: route.realModelId };
+        // Verbatim except for the controls clodex operates: the upstream model
+        // id, and — where the reviewed ladder is the Messages `thinking` object
+        // — the resolved effort. The SDK path already applies the same policy,
+        // so leaving it off here made the effort setting silently route-shaped.
+        let forwardBody: Record<string, unknown>;
+        try {
+          forwardBody = {
+            ...applyAnthropicMessagesEffort(
+              anthropicBody as unknown as Record<string, unknown>,
+              route.effortProfile,
+              route.effortProfile
+                ? resolveRequestEffort(
+                    anthropicEffortFromRequest(anthropicBody),
+                    route.effortProfile,
+                    effortPolicy ?? DEFAULT_UNSUPPORTED_EFFORT_POLICY,
+                  )
+                : undefined,
+            ),
+            model: route.realModelId,
+          };
+        } catch (err) {
+          if (!(err instanceof EffortResolutionError)) throw err;
+          anthropicError(res, err.statusCode, err.message);
+          return;
+        }
         const targetUrl = `${upstreamUrl}/v1/messages`;
         // The request body is forwarded as the client wrote it: no metadata
         // user identity and no billing system line. Both asserted a native

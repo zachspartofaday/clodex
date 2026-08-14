@@ -328,15 +328,16 @@ describe('getReasoningCapabilities', () => {
 
   it('keeps every OpenCode Go catalog block expressing an explicit reasoning opinion', () => {
     // Why the conservation above costs OpenCode Go nothing: each shipped entry
-    // states supportsReasoningEffort, a reasoningEffortMap, or a
-    // thinkingFormat, so none of them is a wire-shape-only block and none
-    // depends on the model-name fallback.
+    // states supportsReasoningEffort, a reasoningEffortMap, an
+    // anthropicThinkingBudgetMap, or a thinkingFormat, so none of them is a
+    // wire-shape-only block and none depends on the model-name fallback.
     for (const model of buildOpenCodeGoModels()) {
       const compatibility = model.compatibility;
       expect(compatibility, model.id).toBeDefined();
       expect(
         compatibility!.supportsReasoningEffort !== undefined
         || compatibility!.reasoningEffortMap !== undefined
+        || compatibility!.anthropicThinkingBudgetMap !== undefined
         || compatibility!.thinkingFormat !== undefined,
         model.id,
       ).toBe(true);

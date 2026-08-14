@@ -68,7 +68,10 @@ import {
   type ModelAliasRejection,
 } from '../model-aliases.js';
 import { routeUnavailableMessage } from '../route-unavailable.js';
-import { transformOpenAiCompatibleRequestBody } from '../model-runtime-compatibility.js';
+import {
+  applyAnthropicMessagesEffort,
+  transformOpenAiCompatibleRequestBody,
+} from '../model-runtime-compatibility.js';
 import { canonicalAnthropicBaseUrl } from '../registry/url-security.js';
 import {
   DEFAULT_UNSUPPORTED_EFFORT_POLICY,
@@ -337,7 +340,31 @@ async function handleAnthropicMessages(
       return;
     }
     const clientWantsStream = Boolean(body.stream);
-    const forwardBody: Record<string, unknown> = { ...body, model: upstreamModelId(model) };
+    // The passthrough is verbatim except for the controls clodex operates: the
+    // upstream model id, and — on a route whose reviewed ladder is the Messages
+    // `thinking` object — the resolved effort. Without this the global effort
+    // policy applied to every other route and silently to none of these.
+    let forwardBody: Record<string, unknown>;
+    try {
+      forwardBody = {
+        ...applyAnthropicMessagesEffort(
+          body,
+          model.effortProfile,
+          model.effortProfile
+            ? resolveRequestEffort(
+                anthropicEffortFromRequest(body as AnthropicRequest) ?? model.defaultEffort,
+                model.effortProfile,
+                options.effortPolicy ?? DEFAULT_UNSUPPORTED_EFFORT_POLICY,
+              )
+            : undefined,
+        ),
+        model: upstreamModelId(model),
+      };
+    } catch (err) {
+      if (!(err instanceof EffortResolutionError)) throw err;
+      sendJson(res, err.statusCode, { error: { message: err.message } });
+      return;
+    }
     const authType = model.authType ?? 'api';
     const isOAuth = authType === 'oauth';
 

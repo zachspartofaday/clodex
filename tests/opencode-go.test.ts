@@ -623,9 +623,12 @@ describe('retained effort profiles at runtime', () => {
     const byId = new Map(providers[0]!.models.map(model => [model.id, model]));
     expect(byId.get('gpt-5.6-luna')?.effortProfile?.levels.map(entry => entry.level))
       .toEqual(['off', 'low', 'medium', 'high', 'xhigh', 'max']);
-    // The Messages passthrough carries no clodex-operable effort control, and
-    // the profile says so rather than omitting the model.
-    expect(byId.get('qwen3.8-max')?.effortProfile?.levels).toEqual([]);
+    // The Messages passthrough carries the reviewed `thinking` ladder, so this
+    // route's grades are executable rather than structurally denied.
+    expect(byId.get('qwen3.8-max')?.effortProfile?.levels).toEqual([
+      { level: 'high', native: { kind: 'anthropic-thinking', thinking: { budget_tokens: 16_000, type: 'enabled' } } },
+      { level: 'max', native: { kind: 'anthropic-thinking', thinking: { budget_tokens: 31_999, type: 'enabled' } } },
+    ]);
     expect(byId.get('qwen3.8-max')?.effortProfile?.defaultLevel).toBeNull();
   });
 

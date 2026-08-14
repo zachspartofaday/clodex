@@ -306,6 +306,28 @@ const PATCHES = Object.assign(Object.create(null), {
     thinkingFormat: 'qwen',
     maxTokensField: 'max_tokens',
   },
+  // ── Anthropic-format Qwen deployments ────────────────────────────────
+  //
+  // These three route over `anthropic-messages`, where the control is not
+  // `reasoning_effort` at all but the Messages `thinking` object — the one
+  // graded reasoning control this transport actually carries. The relay applies
+  // it to the forwarded body, so unlike the openai-completions Qwens above
+  // these grades reach the wire as the vendor's own field rather than as an
+  // internal signal.
+  //
+  // The budgets are REVIEWED values that happen to agree with the resolver
+  // snapshot, not values read from it: `buildEffortProfiles` cross-checks the
+  // snapshot's advertised `thinking` variants against these and records any
+  // divergence as a disagreement rather than adopting it.
+  'qwen3.7-max': {
+    anthropicThinkingBudgetMap: { high: 16_000, max: 31_999 },
+  },
+  'qwen3.7-plus': {
+    anthropicThinkingBudgetMap: { high: 16_000, max: 31_999 },
+  },
+  'qwen3.8-max': {
+    anthropicThinkingBudgetMap: { high: 16_000, max: 31_999 },
+  },
 });
 
 // The global effort vocabulary, in ascending order. `off` and `none` are two
@@ -837,6 +859,18 @@ function assertEffortLadders(supported, devModels) {
       }
       continue;
     }
+    if (compatibility.anthropicThinkingBudgetMap) {
+      // The feed's `reasoning_options` describes effort STRINGS; this route's
+      // control is a token budget on the Messages `thinking` object, so there is
+      // no published ladder to compare against in either direction.
+      notes.push(
+        `${model.id}: graded by Messages thinking budgets `
+        + `(${Object.entries(compatibility.anthropicThinkingBudgetMap)
+          .map(([level, budget]) => `${level}=${budget}`).join('/')}), `
+        + 'which the feed publishes no effort ladder for',
+      );
+      continue;
+    }
     const map = compatibility.reasoningEffortMap;
     if (!map) {
       notes.push(`${model.id}: no local map — falls back to generic rules, cannot be cross-checked`);
@@ -904,16 +938,25 @@ function toClodexModel(resolved) {
   // the proxy answers count_tokens from its local estimate instead of
   // forwarding to a path that 404s into the client's token accounting.
   //
-  // supportsReasoningEffort: structural, not a vendor claim. Effort reaches an
-  // upstream through `effortProviderOptions` and the `thinkingFormat`
-  // transform, both of which act on an OpenAiCompatibleRequestBody. A
-  // passthrough Messages body is forwarded untouched, so there is no way to
-  // send a graded effort on this route however the vendor spells it — these
-  // models still reason, via whatever `thinking` the client itself sends.
-  // Advertising a control clodex cannot operate is what this prevents.
+  // supportsReasoningEffort: structural, not a vendor claim. A `reasoning_effort`
+  // reaches an upstream through `effortProviderOptions` and the `thinkingFormat`
+  // transform, both of which act on an OpenAiCompatibleRequestBody, so no
+  // Messages route can carry that field however the vendor spells it.
+  //
+  // A REVIEWED `anthropicThinkingBudgetMap` is the exception, and the only one:
+  // the Messages `thinking` object is a control this transport does carry, and
+  // the passthrough applies it to the forwarded body. Such a model therefore
+  // has a real, clodex-operated effort ladder and must not claim otherwise;
+  // everything else keeps the structural denial, because advertising a control
+  // clodex cannot operate is what this prevents.
+  const patch = PATCHES[id];
   const compatibility = anthropic
-    ? { supportsCountTokens: false, supportsReasoningEffort: false, ...(PATCHES[id] ?? {}) }
-    : PATCHES[id];
+    ? {
+        supportsCountTokens: false,
+        ...(patch?.anthropicThinkingBudgetMap ? {} : { supportsReasoningEffort: false }),
+        ...(patch ?? {}),
+      }
+    : patch;
   const modalities = ['text', 'image'].filter(modality => resolved.capabilities?.input?.[modality] === true);
   // Where the upstream streams its reasoning text. Previously left unset, so
   // every consumer fell back to whatever the bundled models.dev cache happened
@@ -1033,6 +1076,64 @@ export function assertEffortMapsIdempotent(patches = PATCHES) {
   return true;
 }
 
+/**
+ * Fail closed unless every reviewed Anthropic thinking budget is executable.
+ *
+ * The budgets go on the wire as `thinking.budget_tokens`, which the Messages
+ * API accepts only as a positive integer, and only on a route clodex actually
+ * forwards in that format. A budget map on a Chat Completions model would
+ * advertise a ladder no request path can execute, so it is an error here rather
+ * than a silently empty profile.
+ */
+export function assertAnthropicThinkingBudgets(patches = PATCHES, transports = TRANSPORTS) {
+  const errors = [];
+  for (const [id, patch] of Object.entries(patches)) {
+    const budgets = patch?.anthropicThinkingBudgetMap;
+    if (budgets === undefined) continue;
+    if (!isPlainObject(budgets)) {
+      errors.push(`${id}: anthropicThinkingBudgetMap must be an object`);
+      continue;
+    }
+    if (transports[id] !== 'anthropic-messages') {
+      errors.push(
+        `${id}: anthropicThinkingBudgetMap declares a Messages thinking ladder, but the reviewed `
+        + `runtime transport is ${transports[id] ?? 'unmapped'}`,
+      );
+    }
+    if (patch.reasoningEffortMap !== undefined) {
+      errors.push(`${id}: a model cannot declare both a reasoningEffortMap and a thinking budget ladder`);
+    }
+    if (Object.keys(budgets).length === 0) {
+      errors.push(`${id}: anthropicThinkingBudgetMap is empty; state supportsReasoningEffort: false instead`);
+    }
+    for (const [level, budget] of Object.entries(budgets)) {
+      if (!CANONICAL_EFFORT_LEVELS.includes(level)) {
+        errors.push(`${id}: anthropicThinkingBudgetMap key ${JSON.stringify(level)} is not a global effort level`);
+        continue;
+      }
+      if (!Number.isInteger(budget) || budget <= 0) {
+        errors.push(`${id}: anthropicThinkingBudgetMap.${level} must be a positive integer token budget`);
+      }
+    }
+  }
+  raiseEffortProfileErrors(errors);
+  return true;
+}
+
+/**
+ * Identify one reasoning representation by the facts that decide the wire.
+ *
+ * Spelling-insensitive on purpose for the thinking arm: the resolver snapshot
+ * says `budgetTokens` while the Messages wire field is `budget_tokens`, and
+ * comparing the raw objects would report every agreement as a disagreement.
+ */
+function nativeRepresentationKey(representation) {
+  if (representation.kind === 'reasoning-effort') return `reasoning-effort:${representation.value}`;
+  const thinking = representation.thinking ?? {};
+  const budget = thinking.budgetTokens ?? thinking.budget_tokens;
+  return `anthropic-thinking:${thinking.type}:${budget === undefined ? 'none' : budget}`;
+}
+
 /** The reasoning representation one resolver variant advertises, if any. */
 function advertisedVariantRepresentation(variant) {
   if (typeof variant?.reasoningEffort === 'string' && variant.reasoningEffort.trim() !== '') {
@@ -1065,6 +1166,7 @@ function advertisedVariantRepresentation(variant) {
  */
 export function buildEffortProfiles(snapshotModels, supported) {
   assertEffortMapsIdempotent();
+  assertAnthropicThinkingBudgets();
   const bySnapshotId = new Map(snapshotModels.map(model => [model.id, model]));
   const errors = [];
   const profiles = [];
@@ -1074,11 +1176,24 @@ export function buildEffortProfiles(snapshotModels, supported) {
     const transport = TRANSPORTS[model.id];
     const compatibility = model.compatibility ?? {};
     const map = compatibility.reasoningEffortMap;
+    const budgets = compatibility.anthropicThinkingBudgetMap;
     let levels;
     if (compatibility.supportsReasoningEffort === false) {
       // No clodex-operable effort control on this route at all. Distinct from an
       // unsupported LEVEL: there is no ladder to round along or reject against.
       levels = [];
+    } else if (isPlainObject(budgets)) {
+      // The Messages `thinking` object, emitted in the wire's own snake_case so
+      // the relay can merge it into the forwarded body verbatim.
+      levels = CANONICAL_EFFORT_LEVELS
+        .filter(level => Object.hasOwn(budgets, level))
+        .map(level => ({
+          level,
+          native: {
+            kind: 'anthropic-thinking',
+            thinking: { budget_tokens: budgets[level], type: 'enabled' },
+          },
+        }));
     } else if (isPlainObject(map)) {
       levels = CANONICAL_EFFORT_LEVELS
         .filter(level => Object.hasOwn(map, level) && map[level] !== null)
@@ -1092,7 +1207,9 @@ export function buildEffortProfiles(snapshotModels, supported) {
     }
 
     const variants = bySnapshotId.get(model.id)?.variants ?? {};
-    const levelByNative = new Map(levels.map(entry => [entry.native.value, entry.level]));
+    const levelByNative = new Map(
+      levels.map(entry => [nativeRepresentationKey(entry.native), entry.level]),
+    );
     const advertisedLevels = new Set();
     for (const variant of Object.keys(variants).sort(compareCodeUnits)) {
       const advertised = advertisedVariantRepresentation(variants[variant]);
@@ -1105,7 +1222,10 @@ export function buildEffortProfiles(snapshotModels, supported) {
         });
         continue;
       }
-      if (advertised.kind !== 'reasoning-effort') {
+      // A thinking object offered for a route clodex runs over Chat Completions
+      // still cannot be carried, whatever the resolver advertises. Only the
+      // Messages transport can execute one.
+      if (advertised.kind === 'anthropic-thinking' && transport !== 'anthropic-messages') {
         disagreements.push({
           modelId: model.id,
           variant,
@@ -1114,13 +1234,17 @@ export function buildEffortProfiles(snapshotModels, supported) {
         });
         continue;
       }
-      const level = levelByNative.get(advertised.value);
+      const level = levelByNative.get(nativeRepresentationKey(advertised));
       if (level === undefined) {
         disagreements.push({
           modelId: model.id,
           variant,
           advertised,
-          reason: 'the reviewed wire map sends this value for no global effort level',
+          reason: levels.length === 0
+            ? 'the reviewed route declares no clodex-operable effort control'
+            : advertised.kind === 'reasoning-effort'
+              ? 'the reviewed wire map sends this value for no global effort level'
+              : 'the reviewed thinking budgets send this representation for no global effort level',
         });
         continue;
       }

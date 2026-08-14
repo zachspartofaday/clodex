@@ -244,19 +244,82 @@
       "modelId": "qwen3.7-max",
       "transport": "anthropic-messages",
       "defaultLevel": null,
-      "levels": []
+      "levels": [
+        {
+          "level": "high",
+          "native": {
+            "kind": "anthropic-thinking",
+            "thinking": {
+              "budget_tokens": 16000,
+              "type": "enabled"
+            }
+          }
+        },
+        {
+          "level": "max",
+          "native": {
+            "kind": "anthropic-thinking",
+            "thinking": {
+              "budget_tokens": 31999,
+              "type": "enabled"
+            }
+          }
+        }
+      ]
     },
     {
       "modelId": "qwen3.7-plus",
       "transport": "anthropic-messages",
       "defaultLevel": null,
-      "levels": []
+      "levels": [
+        {
+          "level": "high",
+          "native": {
+            "kind": "anthropic-thinking",
+            "thinking": {
+              "budget_tokens": 16000,
+              "type": "enabled"
+            }
+          }
+        },
+        {
+          "level": "max",
+          "native": {
+            "kind": "anthropic-thinking",
+            "thinking": {
+              "budget_tokens": 31999,
+              "type": "enabled"
+            }
+          }
+        }
+      ]
     },
     {
       "modelId": "qwen3.8-max",
       "transport": "anthropic-messages",
       "defaultLevel": null,
-      "levels": []
+      "levels": [
+        {
+          "level": "high",
+          "native": {
+            "kind": "anthropic-thinking",
+            "thinking": {
+              "budget_tokens": 16000,
+              "type": "enabled"
+            }
+          }
+        },
+        {
+          "level": "max",
+          "native": {
+            "kind": "anthropic-thinking",
+            "thinking": {
+              "budget_tokens": 31999,
+              "type": "enabled"
+            }
+          }
+        }
+      ]
     }
   ],
   "disagreements": [
@@ -278,7 +341,7 @@
           "type": "disabled"
         }
       },
-      "reason": "the reviewed anthropic-messages route carries no clodex-controlled Anthropic thinking representation"
+      "reason": "the reviewed route declares no clodex-operable effort control"
     },
     {
       "modelId": "minimax-m3",
@@ -289,7 +352,7 @@
           "type": "adaptive"
         }
       },
-      "reason": "the reviewed anthropic-messages route carries no clodex-controlled Anthropic thinking representation"
+      "reason": "the reviewed route declares no clodex-operable effort control"
     },
     {
       "modelId": "qwen3.6-plus",
@@ -320,78 +383,6 @@
       "variant": null,
       "advertised": null,
       "reason": "the reviewed wire map executes low/medium/high/xhigh/max, which the resolver snapshot does not advertise"
-    },
-    {
-      "modelId": "qwen3.7-max",
-      "variant": "high",
-      "advertised": {
-        "kind": "anthropic-thinking",
-        "thinking": {
-          "budgetTokens": 16000,
-          "type": "enabled"
-        }
-      },
-      "reason": "the reviewed anthropic-messages route carries no clodex-controlled Anthropic thinking representation"
-    },
-    {
-      "modelId": "qwen3.7-max",
-      "variant": "max",
-      "advertised": {
-        "kind": "anthropic-thinking",
-        "thinking": {
-          "budgetTokens": 31999,
-          "type": "enabled"
-        }
-      },
-      "reason": "the reviewed anthropic-messages route carries no clodex-controlled Anthropic thinking representation"
-    },
-    {
-      "modelId": "qwen3.7-plus",
-      "variant": "high",
-      "advertised": {
-        "kind": "anthropic-thinking",
-        "thinking": {
-          "budgetTokens": 16000,
-          "type": "enabled"
-        }
-      },
-      "reason": "the reviewed anthropic-messages route carries no clodex-controlled Anthropic thinking representation"
-    },
-    {
-      "modelId": "qwen3.7-plus",
-      "variant": "max",
-      "advertised": {
-        "kind": "anthropic-thinking",
-        "thinking": {
-          "budgetTokens": 31999,
-          "type": "enabled"
-        }
-      },
-      "reason": "the reviewed anthropic-messages route carries no clodex-controlled Anthropic thinking representation"
-    },
-    {
-      "modelId": "qwen3.8-max",
-      "variant": "high",
-      "advertised": {
-        "kind": "anthropic-thinking",
-        "thinking": {
-          "budgetTokens": 16000,
-          "type": "enabled"
-        }
-      },
-      "reason": "the reviewed anthropic-messages route carries no clodex-controlled Anthropic thinking representation"
-    },
-    {
-      "modelId": "qwen3.8-max",
-      "variant": "max",
-      "advertised": {
-        "kind": "anthropic-thinking",
-        "thinking": {
-          "budgetTokens": 31999,
-          "type": "enabled"
-        }
-      },
-      "reason": "the reviewed anthropic-messages route carries no clodex-controlled Anthropic thinking representation"
     }
   ]
 }
