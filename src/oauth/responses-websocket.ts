@@ -696,10 +696,25 @@ function continuationMismatchDetails(
     // so the per-candidate loop cannot turn one mismatch into a trace stream.
     try { log?.(`tool argument mismatch beyond the strip rule: ${String(toolArgumentGap.tool)}`); } catch { /* ignore */ }
   }
+  // `preResponseMatch` marks a mismatch at or past the request/response
+  // boundary: the client reproduced every item of the request that
+  // established this head, sent at least one item beyond that point, and
+  // diverged only inside the stored response tail. It is a boundary marker,
+  // not a classifier on its own — a mutated echo of the response also sets
+  // it. Read together with the divergent-pair kinds it separates the two
+  // restart classes: `actual=user` here means the client DISCARDED the
+  // head's response (aborted or failed delivery) and opened a new turn from
+  // exactly the pre-response state, a continuation point the in-place head
+  // update destroyed. Both fields exist to make those classes countable
+  // from the log alone, which sizes a pre-response retention fix.
+  const requestInputItems = (entry.requestInput ?? []).length;
+  const preResponseMatch = mismatch >= requestInputItems && full.length > requestInputItems;
   return {
     fullItems: full.length,
     expectedPrefixItems: prefix.length,
     firstMismatch: mismatch,
+    requestInputItems,
+    preResponseMatch,
     expectedKind: expected === undefined ? 'none' : conversationItemKind(expected),
     actualKind: actual === undefined ? 'none' : conversationItemKind(actual),
     ...(expected !== undefined ? { expectedHash: conversationItemHash(expected) } : {}),
@@ -725,7 +740,9 @@ function continuationMismatchSummary(
 ): string {
   const details = precomputedDetails ?? continuationMismatchDetails(entry, payload, log, true);
   let summary = `full_items=${details.fullItems} expected_prefix_items=${details.expectedPrefixItems} `
-    + `first_mismatch=${details.firstMismatch} expected=${details.expectedKind} actual=${details.actualKind}`;
+    + `first_mismatch=${details.firstMismatch} request_input_items=${details.requestInputItems} `
+    + `pre_response_match=${details.preResponseMatch} `
+    + `expected=${details.expectedKind} actual=${details.actualKind}`;
   // The hashes make same-kind mismatches diagnosable from the log alone. With
   // CLODEX_MISMATCH_DUMP=1 the canonical bytes of both divergent items land in
   // the adapter debug log too. That file is written through the redacting

@@ -2190,6 +2190,38 @@ describe('createResponsesWebSocketFetch', () => {
       expect(summary).toMatch(/expected_hash=[0-9a-f]{16} actual_hash=[0-9a-f]{16}/);
     });
 
+    it('marks a discarded-response restart with the boundary and pre-response flag', async () => {
+      // The client reproduces the establishing request exactly, omits the
+      // head's response tail entirely, and opens a new user turn — the
+      // discarded-response shape (aborted or failed delivery client-side).
+      const lines = await runValueMismatch({
+        accountId: 'acct-diag-discard',
+        replayItems: input => [
+          ...input,
+          { role: 'user', content: [{ type: 'input_text', text: 'try again' }] },
+        ],
+      });
+      const summary = lines.find(line => line.includes('history mismatch starting an additional chain'));
+      expect(summary).toContain('request_input_items=1');
+      expect(summary).toContain('pre_response_match=true');
+      expect(summary).toContain('expected=function_call actual=user');
+    });
+
+    it('clears the pre-response flag when the divergence sits inside the request prefix', async () => {
+      // The establishing request itself differs, so the restart is genuine
+      // prefix churn, not a discarded response.
+      const lines = await runValueMismatch({
+        accountId: 'acct-diag-prefix-churn',
+        replayItems: () => [
+          { role: 'user', content: [{ type: 'input_text', text: 'a different opener' }] },
+          { role: 'user', content: [{ type: 'input_text', text: 'try again' }] },
+        ],
+      });
+      const summary = lines.find(line => line.includes('history mismatch starting an additional chain'));
+      expect(summary).toContain('request_input_items=1');
+      expect(summary).toContain('pre_response_match=false');
+    });
+
     it('writes no dump lines unless CLODEX_MISMATCH_DUMP=1 is set', async () => {
       const lines = await runValueMismatch({ accountId: 'acct-diag-gated' });
       expect(lines.some(line => line.includes('mismatch dump'))).toBe(false);
