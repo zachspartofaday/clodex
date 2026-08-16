@@ -10,8 +10,14 @@ All ChatGPT/Codex OAuth Responses models use a persistent WebSocket transport. C
 partitioned by provider, OAuth account, upstream model, normalized effort, and hashed Claude
 session. Completed responses become validated chain heads (exact text/tool/reasoning capture;
 function-call args compared as canonical JSON). The next request picks the longest exact-prefix head
-and sends `previous_response_id` + incremental input; any mismatch, failure, or expiry falls back
-safely to full context. `previous_response_not_found` retries once with full context before anything
+and sends `previous_response_id` + incremental input; a mismatch, failure, or expiry falls back
+safely to full context — with one retained-point exception: each head keeps the
+`previous_response_id` its latest response was built ON plus the canonical client items that id's
+context covers, and a history that strictly extends that point (a discarded response after
+aborted/failed delivery, or a mutated re-echo of it) continues from the retained id with everything
+past the point as the delta, so the abandoned response never enters server-side context. A stale
+retained id degrades to the `previous_response_not_found` full-context retry; the retry's
+replacement head clears the retained point, and a fresh full-context send retains none. `previous_response_not_found` retries once with full context before anything
 is emitted downstream. A transport failure likewise retries once **with full context** — not the
 same continuation payload — while no downstream bytes, model data, or accumulated output exist; buffered control frames do not close that safe window, but any model
 output makes the failure terminal. OAuth requires `store:false` (a `store:true` probe returns 400).
@@ -81,6 +87,9 @@ genuine rewind or branch regenerates the call under a new one. These record
   flip the verdict.
 - On a turn where no head matches, **every** abandoned idle candidate passes through the warning
   path, so a regression on an older head cannot hide behind a newer head's ordinary mismatch.
+- A pre-response continuation (retained-point match after the latest response failed to match) runs
+  the same warning-enabled analysis against the selected head before continuing and traces the
+  divergence summary, so continuing past a mutated echo cannot silence these canaries.
 
 The warning states the observation and asks for a report rather than naming a cause, since
 `equalAfterStrip` cannot tell which side diverged. This exists because the originating bug was

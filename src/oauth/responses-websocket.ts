@@ -2154,6 +2154,18 @@ export function createResponsesWebSocketFetch(
         + (selectedMatch.mode === 'omitted_reasoning' ? ' after accepting omitted reasoning' : '')
         + (selectedMatch.mode === 'pre_response' ? ' from the retained pre-response point' : ''),
       );
+      if (selectedMatch.mode === 'pre_response') {
+        // The head's LATEST response did not match, and that divergence is the
+        // surface the normalization canaries watch (strip-rule and same-blob
+        // reasoning gaps). Continuing from the retained point must not silence
+        // them, so run the same warning-enabled analysis the abandoned-head
+        // path would, and trace the divergence so the class stays countable
+        // even when no chain restarts.
+        debug(
+          'pre-response continuation; latest response diverged: '
+          + continuationMismatchSummary(selected, payload, debug, mismatchDump),
+        );
+      }
     } else if (candidates.some(entry => entry.inFlight)) {
       // Claude auxiliary requests can share a session id. Never multiplex or
       // queue a request whose lineage cannot yet include the active response.

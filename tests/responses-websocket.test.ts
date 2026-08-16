@@ -2338,7 +2338,7 @@ describe('createResponsesWebSocketFetch', () => {
     });
 
     it('continues a mutated response echo from the retained pre-response point', async () => {
-      const { socket, wsFetch } = await establishTwoTurnChain('acct-prertn-mutated');
+      const { socket, lines, wsFetch } = await establishTwoTurnChain('acct-prertn-mutated');
       // The client re-echoes resp_pr_2's answer differently than the head
       // snapshotted it; its view of the conversation is authoritative.
       const mutatedInput = [u('one'), a('alpha'), u('two'), a('beta (edited)'), u('three')];
@@ -2348,6 +2348,12 @@ describe('createResponsesWebSocketFetch', () => {
       const sent = JSON.parse(socket.send.mock.calls[2]![0] as string);
       expect(sent.previous_response_id).toBe('resp_pr_1');
       expect(sent.input).toEqual([u('two'), a('beta (edited)'), u('three')]);
+      // The warning-enabled divergence analysis still runs against the head's
+      // latest response — continuing must not silence the normalization
+      // canaries — and the traced summary keeps the class countable.
+      const diverged = lines.find(line => line.includes('pre-response continuation; latest response diverged:'));
+      expect(diverged).toContain('pre_response_match=true');
+      expect(diverged).toMatch(/first_mismatch=3/);
       emitTextResponse(socket, 'resp_pr_3m', 'gamma');
       await readAll(third);
     });
@@ -2371,6 +2377,23 @@ describe('createResponsesWebSocketFetch', () => {
       emitTextResponse(replacement, 'resp_pr_recovered', 'recovered');
       const body = await readAll(third);
       expect(body).not.toContain('previous_response_not_found');
+
+      // The replacement head must NOT inherit the rejected retained point: a
+      // later discarded-response-shaped request — one that extends the stale
+      // point's prefix but not the replacement's — starts another
+      // full-context head instead of replaying the id upstream just declined.
+      const fourth = await wsFetch('https://x', {
+        method: 'POST', headers: {},
+        body: JSON.stringify(sessionPayload([u('one'), a('alpha'), u('two'), u('three'), u('final')])),
+      });
+      expect(fakeSockets).toHaveLength(3);
+      const freshest = lastSocket();
+      freshest.emit('open');
+      const resent = JSON.parse(freshest.send.mock.calls[0]![0] as string);
+      expect(resent.previous_response_id).toBeUndefined();
+      expect(resent.input).toEqual([u('one'), a('alpha'), u('two'), u('three'), u('final')]);
+      emitTextResponse(freshest, 'resp_pr_post_fallback', 'fresh');
+      await readAll(fourth);
     });
 
     it('offers no pre-response point for a head built by a fresh full-context send', async () => {
