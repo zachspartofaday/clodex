@@ -79,6 +79,9 @@ interface RequestContext {
   instructionsSnapshot?: string;
   continued: boolean;
   retried: boolean;
+  /** The continuation point this request was dispatched from, if any; becomes
+   * the head's retained `preResponse` when the response completes. */
+  preResponse?: PreResponsePoint;
   closed: boolean;
   frameCount: number;
   responseId?: string;
@@ -128,6 +131,16 @@ interface ConnectionEntry {
   /** Memoized canonical form of the stored prefix; cleared whenever it changes. */
   canonicalPrefix?: string[];
   canonicalEchoablePrefix?: string[];
+  /**
+   * The continuation point this head's latest response was built ON: the
+   * previous_response_id its request named and the canonical client items that
+   * response id's context covers. Retained through the in-place head update so
+   * a client that DISCARDED the latest response (aborted or failed delivery)
+   * — or re-echoed it mutated — can continue from just before it instead of
+   * paying a full-history resend. Absent on a head whose latest response was a
+   * fresh full-context send: there is no response-addressable pre-point.
+   */
+  preResponse?: PreResponsePoint;
   options: Required<Pick<ResponsesWebSocketFetchOptions, 'hardTtlMs' | 'idleTtlMs' | 'nurseryIdleTtlMs' | 'maxConnections' | 'now'>>;
   debug: (message: string) => void;
 }
@@ -391,12 +404,26 @@ function arraysEqual(left: unknown[], right: unknown[]): boolean {
   return canonicalJson(normalizeToolCallJson(left)) === canonicalJson(normalizeToolCallJson(right));
 }
 
-type ContinuationMatchMode = 'exact' | 'omitted_reasoning';
+type ContinuationMatchMode = 'exact' | 'omitted_reasoning' | 'pre_response';
+
+interface PreResponsePoint {
+  responseId: string;
+  /** Canonical client items covered by `responseId`'s server-side context. */
+  canonicalPrefix: string[];
+}
 
 interface ContinuationMatch {
   delta: unknown[];
   mode: ContinuationMatchMode;
+  /** The response to continue from when it is not the head's latest (`pre_response`). */
+  responseId?: string;
 }
+
+const CONTINUATION_MODE_RANK: Record<ContinuationMatchMode, number> = {
+  exact: 0,
+  omitted_reasoning: 1,
+  pre_response: 2,
+};
 
 function conversationItemKind(value: unknown): string {
   if (!value || typeof value !== 'object') return typeof value;
@@ -814,10 +841,31 @@ function continuationMatch(
   // belongs to previous_response_id, so it is safe to continue only when the
   // remaining response items still match exactly.
   const echoedAssistant = entry.expectedAssistant.filter(item => conversationItemKind(item) !== 'reasoning');
-  if (echoedAssistant.length === entry.expectedAssistant.length) return undefined;
-  entry.canonicalEchoablePrefix ??= canonicalItemStrings([...entry.requestInput, ...echoedAssistant]);
-  if (!isStrictPrefix(entry.canonicalEchoablePrefix, clientItems)) return undefined;
-  return { delta: full.slice(entry.canonicalEchoablePrefix.length), mode: 'omitted_reasoning' };
+  if (echoedAssistant.length !== entry.expectedAssistant.length) {
+    entry.canonicalEchoablePrefix ??= canonicalItemStrings([...entry.requestInput, ...echoedAssistant]);
+    if (isStrictPrefix(entry.canonicalEchoablePrefix, clientItems)) {
+      return { delta: full.slice(entry.canonicalEchoablePrefix.length), mode: 'omitted_reasoning' };
+    }
+  }
+
+  // A client whose history extends the point the head's latest response was
+  // built ON — but not the response itself — discarded that response (aborted
+  // or failed delivery) or re-echoed it mutated. Either way its view of the
+  // conversation is authoritative, and continuing from the retained
+  // pre-response id serves exactly that view: the delta replays everything the
+  // client kept past that point, and the abandoned response never enters the
+  // server-side context. If upstream no longer addresses the older response,
+  // the previous_response_not_found retry converts this into today's
+  // full-history resend — one extra round trip, never a wrong conversation.
+  const prev = entry.preResponse;
+  if (prev && isStrictPrefix(prev.canonicalPrefix, clientItems)) {
+    return {
+      delta: full.slice(prev.canonicalPrefix.length),
+      mode: 'pre_response',
+      responseId: prev.responseId,
+    };
+  }
+  return undefined;
 }
 
 function eventType(event: unknown): string | undefined {
@@ -1552,6 +1600,10 @@ function finishInFlightPeriod(entry: ConnectionEntry): void {
 
 function resetContextForRetry(ctx: RequestContext): void {
   ctx.continued = false;
+  // The retry is a fresh full-context send; retaining the failed continuation
+  // point would let the replacement head advertise a pre-response id upstream
+  // just declined to address.
+  ctx.preResponse = undefined;
   ctx.sendPayload = ctx.originalPayload;
   ctx.pendingEvents = [];
   ctx.emittedModelData = false;
@@ -1824,6 +1876,9 @@ function handleSocketMessage(entry: ConnectionEntry, data: RawData): void {
       entry.responseId = ctx.responseId;
       entry.requestInput = inputArray(ctx.originalPayload);
       entry.expectedAssistant = expectedAssistantItems(ctx);
+      // Assigned, not preserved: a fresh full-context send has no
+      // response-addressable pre-point, so stale retention must clear here.
+      entry.preResponse = ctx.preResponse;
       entry.headRequiredToolProps = requiredToolProps(ctx.originalPayload);
       // The stored prefix just changed, so the memoized canonical form is stale.
       entry.canonicalPrefix = undefined;
@@ -2046,7 +2101,7 @@ export function createResponsesWebSocketFetch(
       .filter((candidate): candidate is { entry: ConnectionEntry; match: ContinuationMatch } => candidate.match !== undefined)
       // Prefer the longest matching history, which produces the smallest delta.
       .sort((left, right) => left.match.delta.length - right.match.delta.length
-        || (left.match.mode === right.match.mode ? 0 : left.match.mode === 'exact' ? -1 : 1));
+        || CONTINUATION_MODE_RANK[left.match.mode] - CONTINUATION_MODE_RANK[right.match.mode]);
     let selected: ConnectionEntry | undefined = matches[0]?.entry;
     const selectedMatch = matches[0]?.match;
     const selectedDelta = selectedMatch?.delta;
@@ -2069,9 +2124,21 @@ export function createResponsesWebSocketFetch(
     let decision: 'continuation' | 'parallel_isolated' | 'history_mismatch_new_head' | 'new_partition_head' | 'unpartitioned_socket';
     let candidateMismatchDetails: Map<ConnectionEntry, Record<string, unknown>> | undefined;
 
+    let continuedFrom: PreResponsePoint | undefined;
     if (selected && selectedDelta) {
-      sendPayload = { ...payload, input: selectedDelta, previous_response_id: selected.responseId };
+      const previousResponseId = selectedMatch.responseId ?? selected.responseId;
+      sendPayload = { ...payload, input: selectedDelta, previous_response_id: previousResponseId };
       continued = true;
+      // Snapshot the point this request continues FROM, in client-canonical
+      // form: the matched prefix is byte-equal to the client's own leading
+      // items for every mode, so the slice is exactly what previousResponseId's
+      // context covers. Becomes the head's retained preResponse on completion.
+      if (typeof previousResponseId === 'string') {
+        continuedFrom = {
+          responseId: previousResponseId,
+          canonicalPrefix: clientItems.slice(0, clientItems.length - selectedDelta.length),
+        };
+      }
       if (selected.generation === 'nursery') {
         evictions.push(...evictOldestIdleGeneration(
           'established',
@@ -2084,7 +2151,8 @@ export function createResponsesWebSocketFetch(
       decision = 'continuation';
       debug(
         `continuing chain with ${selectedDelta.length} incremental input item(s)`
-        + (selectedMatch.mode === 'omitted_reasoning' ? ' after accepting omitted reasoning' : ''),
+        + (selectedMatch.mode === 'omitted_reasoning' ? ' after accepting omitted reasoning' : '')
+        + (selectedMatch.mode === 'pre_response' ? ' from the retained pre-response point' : ''),
       );
     } else if (candidates.some(entry => entry.inFlight)) {
       // Claude auxiliary requests can share a session id. Never multiplex or
@@ -2197,6 +2265,7 @@ export function createResponsesWebSocketFetch(
           instructionsSnapshot,
           continued,
           retried: false,
+          preResponse: continuedFrom,
           closed: false,
           frameCount: 0,
           pendingEvents: [],

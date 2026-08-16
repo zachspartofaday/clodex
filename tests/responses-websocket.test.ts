@@ -2275,6 +2275,131 @@ describe('createResponsesWebSocketFetch', () => {
     });
   });
 
+  describe('pre-response retention', () => {
+    const u = (text: string) => ({ role: 'user', content: [{ type: 'input_text', text }] });
+    const a = (text: string) => ({ role: 'assistant', content: [{ type: 'output_text', text }] });
+
+    /** Establish a two-response chain: resp_pr_1 answers "one", resp_pr_2
+     * answers "two". The head then retains resp_pr_1 as the point resp_pr_2
+     * was built on. Returns the shared socket and debug lines. */
+    async function establishTwoTurnChain(accountId: string): Promise<{
+      socket: FakeWebSocket;
+      lines: string[];
+      wsFetch: ReturnType<typeof createResponsesWebSocketFetch>;
+    }> {
+      const lines: string[] = [];
+      const wsFetch = createResponsesWebSocketFetch(WS_URL, message => lines.push(message), { accountId });
+      const first = await wsFetch('https://x', {
+        method: 'POST', headers: {}, body: JSON.stringify(sessionPayload([u('one')])),
+      });
+      const socket = lastSocket();
+      socket.emit('open');
+      emitTextResponse(socket, 'resp_pr_1', 'alpha');
+      await readAll(first);
+
+      const second = await wsFetch('https://x', {
+        method: 'POST', headers: {},
+        body: JSON.stringify(sessionPayload([u('one'), a('alpha'), u('two')])),
+      });
+      emitTextResponse(socket, 'resp_pr_2', 'beta');
+      await readAll(second);
+      const sent = JSON.parse(socket.send.mock.calls[1]![0] as string);
+      expect(sent.previous_response_id).toBe('resp_pr_1');
+      return { socket, lines, wsFetch };
+    }
+
+    it('continues a discarded-response retry from the retained pre-response point', async () => {
+      const { socket, lines, wsFetch } = await establishTwoTurnChain('acct-prertn-discard');
+      // The client discarded resp_pr_2 (aborted delivery) and opened a new
+      // turn from the state just before it.
+      const retryInput = [u('one'), a('alpha'), u('two'), u('three')];
+      const third = await wsFetch('https://x', {
+        method: 'POST', headers: {}, body: JSON.stringify(sessionPayload(retryInput)),
+      });
+      expect(fakeSockets).toHaveLength(1);
+      const sent = JSON.parse(socket.send.mock.calls[2]![0] as string);
+      expect(sent.previous_response_id).toBe('resp_pr_1');
+      expect(sent.input).toEqual([u('two'), u('three')]);
+      expect(lines.some(line => line.includes('from the retained pre-response point'))).toBe(true);
+      emitTextResponse(socket, 'resp_pr_3', 'gamma');
+      await readAll(third);
+
+      // The updated head continues normally, and its retained point is now
+      // resp_pr_1 — the response resp_pr_3 was built on.
+      const fourth = await wsFetch('https://x', {
+        method: 'POST', headers: {},
+        body: JSON.stringify(sessionPayload([...retryInput, a('gamma'), u('four')])),
+      });
+      const next = JSON.parse(socket.send.mock.calls[3]![0] as string);
+      expect(next.previous_response_id).toBe('resp_pr_3');
+      expect(next.input).toEqual([u('four')]);
+      emitTextResponse(socket, 'resp_pr_4', 'delta');
+      await readAll(fourth);
+    });
+
+    it('continues a mutated response echo from the retained pre-response point', async () => {
+      const { socket, wsFetch } = await establishTwoTurnChain('acct-prertn-mutated');
+      // The client re-echoes resp_pr_2's answer differently than the head
+      // snapshotted it; its view of the conversation is authoritative.
+      const mutatedInput = [u('one'), a('alpha'), u('two'), a('beta (edited)'), u('three')];
+      const third = await wsFetch('https://x', {
+        method: 'POST', headers: {}, body: JSON.stringify(sessionPayload(mutatedInput)),
+      });
+      const sent = JSON.parse(socket.send.mock.calls[2]![0] as string);
+      expect(sent.previous_response_id).toBe('resp_pr_1');
+      expect(sent.input).toEqual([u('two'), a('beta (edited)'), u('three')]);
+      emitTextResponse(socket, 'resp_pr_3m', 'gamma');
+      await readAll(third);
+    });
+
+    it('falls back to a full-context resend when the pre-response id is gone upstream', async () => {
+      const { socket, wsFetch } = await establishTwoTurnChain('acct-prertn-fallback');
+      const retryInput = [u('one'), a('alpha'), u('two'), u('three')];
+      const third = await wsFetch('https://x', {
+        method: 'POST', headers: {}, body: JSON.stringify(sessionPayload(retryInput)),
+      });
+      socket.emit('message', Buffer.from(JSON.stringify({
+        type: 'error', status: 400,
+        error: { code: 'previous_response_not_found', message: 'gone' },
+      })));
+      expect(fakeSockets).toHaveLength(2);
+      const replacement = lastSocket();
+      replacement.emit('open');
+      const retried = JSON.parse(replacement.send.mock.calls[0]![0] as string);
+      expect(retried.previous_response_id).toBeUndefined();
+      expect(retried.input).toEqual(retryInput);
+      emitTextResponse(replacement, 'resp_pr_recovered', 'recovered');
+      const body = await readAll(third);
+      expect(body).not.toContain('previous_response_not_found');
+    });
+
+    it('offers no pre-response point for a head built by a fresh full-context send', async () => {
+      // Only one response on the chain: its head has no response-addressable
+      // pre-point, so a discarded-response retry starts a new chain as before.
+      const wsFetch = createResponsesWebSocketFetch(WS_URL, undefined, { accountId: 'acct-prertn-fresh' });
+      const first = await wsFetch('https://x', {
+        method: 'POST', headers: {}, body: JSON.stringify(sessionPayload([u('one')])),
+      });
+      const socket = lastSocket();
+      socket.emit('open');
+      emitTextResponse(socket, 'resp_pr_only', 'alpha');
+      await readAll(first);
+
+      const retryInput = [u('one'), u('one again')];
+      const second = await wsFetch('https://x', {
+        method: 'POST', headers: {}, body: JSON.stringify(sessionPayload(retryInput)),
+      });
+      expect(fakeSockets).toHaveLength(2);
+      const fresh = lastSocket();
+      fresh.emit('open');
+      const sent = JSON.parse(fresh.send.mock.calls[0]![0] as string);
+      expect(sent.previous_response_id).toBeUndefined();
+      expect(sent.input).toEqual(retryInput);
+      emitTextResponse(fresh, 'resp_pr_fresh', 'again');
+      await readAll(second);
+    });
+  });
+
   it('validates encrypted reasoning and exact assistant text before continuing', async () => {
     const input = [{ role: 'user', content: [{ type: 'input_text', text: 'reason' }] }];
     const wsFetch = createResponsesWebSocketFetch(WS_URL, undefined, { accountId: 'acct-reasoning' });
