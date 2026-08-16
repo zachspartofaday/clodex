@@ -2310,8 +2310,9 @@ describe('createResponsesWebSocketFetch', () => {
 
     it('continues a discarded-response retry from the retained pre-response point', async () => {
       const { socket, lines, wsFetch } = await establishTwoTurnChain('acct-prertn-discard');
-      // The client discarded resp_pr_2 (aborted delivery) and opened a new
-      // turn from the state just before it.
+      // resp_pr_2 completed upstream, but the client never kept it (delivery
+      // failed or was abandoned downstream) and opened a new turn from the
+      // state just before it.
       const retryInput = [u('one'), a('alpha'), u('two'), u('three')];
       const third = await wsFetch('https://x', {
         method: 'POST', headers: {}, body: JSON.stringify(sessionPayload(retryInput)),

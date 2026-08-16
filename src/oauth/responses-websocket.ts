@@ -135,10 +135,16 @@ interface ConnectionEntry {
    * The continuation point this head's latest response was built ON: the
    * previous_response_id its request named and the canonical client items that
    * response id's context covers. Retained through the in-place head update so
-   * a client that DISCARDED the latest response (aborted or failed delivery)
-   * — or re-echoed it mutated — can continue from just before it instead of
-   * paying a full-history resend. Absent on a head whose latest response was a
-   * fresh full-context send: there is no response-addressable pre-point.
+   * a client that DISCARDED a response that COMPLETED upstream — delivery
+   * failed or was abandoned downstream after `response.completed` — or
+   * re-echoed it mutated, can continue from just before it instead of paying a
+   * full-history resend. An abort that lands BEFORE upstream completion is out
+   * of scope by construction: it tears down the entry and its socket, and the
+   * per-connection chain dies with them, so no retained id could serve the
+   * retry (the `previous_response_not_found` recovery resends full context on
+   * a replacement socket for the same reason). Absent on a head whose latest
+   * response was a fresh full-context send: there is no response-addressable
+   * pre-point.
    */
   preResponse?: PreResponsePoint;
   options: Required<Pick<ResponsesWebSocketFetchOptions, 'hardTtlMs' | 'idleTtlMs' | 'nurseryIdleTtlMs' | 'maxConnections' | 'now'>>;
@@ -849,14 +855,15 @@ function continuationMatch(
   }
 
   // A client whose history extends the point the head's latest response was
-  // built ON — but not the response itself — discarded that response (aborted
-  // or failed delivery) or re-echoed it mutated. Either way its view of the
-  // conversation is authoritative, and continuing from the retained
-  // pre-response id serves exactly that view: the delta replays everything the
-  // client kept past that point, and the abandoned response never enters the
-  // server-side context. If upstream no longer addresses the older response,
-  // the previous_response_not_found retry converts this into today's
-  // full-history resend — one extra round trip, never a wrong conversation.
+  // built ON — but not the response itself — discarded that response after it
+  // completed upstream (delivery failed or was abandoned downstream) or
+  // re-echoed it mutated. Either way its view of the conversation is
+  // authoritative, and continuing from the retained pre-response id serves
+  // exactly that view: the delta replays everything the client kept past that
+  // point, and the abandoned response never enters the server-side context.
+  // If upstream no longer addresses the older response, the
+  // previous_response_not_found retry converts this into today's full-history
+  // resend — one extra round trip, never a wrong conversation.
   const prev = entry.preResponse;
   if (prev && isStrictPrefix(prev.canonicalPrefix, clientItems)) {
     return {

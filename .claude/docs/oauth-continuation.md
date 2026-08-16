@@ -13,11 +13,14 @@ function-call args compared as canonical JSON). The next request picks the longe
 and sends `previous_response_id` + incremental input; a mismatch, failure, or expiry falls back
 safely to full context — with one retained-point exception: each head keeps the
 `previous_response_id` its latest response was built ON plus the canonical client items that id's
-context covers, and a history that strictly extends that point (a discarded response after
-aborted/failed delivery, or a mutated re-echo of it) continues from the retained id with everything
-past the point as the delta, so the abandoned response never enters server-side context. A stale
-retained id degrades to the `previous_response_not_found` full-context retry; the retry's
-replacement head clears the retained point, and a fresh full-context send retains none. `previous_response_not_found` retries once with full context before anything
+context covers, and a history that strictly extends that point continues from the retained id with
+everything past the point as the delta, so the abandoned response never enters server-side context.
+This serves a response that **completed upstream** but was then discarded downstream (delivery
+failed or abandoned after `response.completed`) or re-echoed mutated. An abort landing **before**
+upstream completion is out of scope by construction: it deletes the entry and closes its socket,
+and the per-connection chain dies with them, so the next request starts a fresh full-context head
+as before. A stale retained id degrades to the `previous_response_not_found` full-context retry;
+the retry's replacement head clears the retained point, and a fresh full-context send retains none. `previous_response_not_found` retries once with full context before anything
 is emitted downstream. A transport failure likewise retries once **with full context** — not the
 same continuation payload — while no downstream bytes, model data, or accumulated output exist; buffered control frames do not close that safe window, but any model
 output makes the failure terminal. OAuth requires `store:false` (a `store:true` probe returns 400).
